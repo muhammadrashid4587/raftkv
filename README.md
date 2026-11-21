@@ -1,0 +1,158 @@
+# raftkv
+
+A distributed key-value store in **pure Python 3 (standard library only)**,
+built on the **Raft consensus protocol**. Three nodes form a cluster; one
+is elected leader, writes are committed to a majority before they are
+acknowledged, and if the leader dies the survivors elect a new one and
+keep serving — with no lost or divergent data.
+
+Built as a portfolio project: the interesting parts are the consensus
+logic and the failure handling, not the key-value API on top.
+
+## Features
+
+- **Raft consensus** — leader election with randomized timeouts,
+  RequestVote / AppendEntries RPCs, the log matching property, and
+  commit-index advancement restricted to current-term entries
+  (Raft §5.4.2).
+- **Durable log** — `currentTerm`, `votedFor`, and the log are persisted
+  per node (`meta.json` + `log.jsonl`, fsynced). A restarted node replays
+  its committed log and rejoins without losing data.
+- **Linearizable-ish reads** — the leader confirms leadership with a
+  heartbeat round to a majority before serving a read, so a partitioned
+  ex-leader cannot serve stale data.
+- **Leader redirects** — a write or read sent to a follower returns the
+  current leader's address; the client follows it automatically.
+- **Real failure handling** — tested end to end: kill the leader, the
+  cluster re-elects, writes continue, the old leader rejoins and
+  catches up instead of forking.
+
+## Quick start
+
+```bash
+# Start a 3-node cluster on localhost (one command)
+make demo
+
+# In another terminal:
+python3 -m raftkv.client --node 127.0.0.1:5001 set hello world
+python3 -m raftkv.client --node 127.0.0.1:5002 get hello   # -> world
+
+# Watch failover: kill the leader's process, then keep writing.
+# The remaining two nodes elect a new leader within ~a second.
+```
+
+Or start nodes manually (each in its own terminal):
+
+```bash
+python3 -m raftkv.server --id node1 --port 5001 \
+  --peers node2=127.0.0.1:5002,node3=127.0.0.1:5003 \
+  --data-dir /tmp/raftkv-demo/node1
+# ... node2 on 5002, node3 on 5003, with the other two as peers
+```
+
+## Tests
+
+```bash
+make test
+# or: python3 -m unittest discover -s tests -v
+```
+
+8 tests, all passing:
+
+| Test | What it proves |
+|---|---|
+| `test_exactly_one_leader_is_elected` | Election converges to a single leader |
+| `test_leader_stays_stable_with_no_failures` | No spurious re-elections when healthy |
+| `test_write_replicates_to_all_nodes` | Committed writes reach every node |
+| `test_write_to_follower_redirects_to_leader` | Followers redirect, client follows |
+| `test_delete_replicates` | Deletes replicate like writes |
+| `test_leader_serves_reads` | Leader reads return committed values |
+| `test_follower_restart_replays_committed_log` | Restarted node replays disk log + catches up |
+| `test_kill_leader_reelect_write_and_rejoin` | Full failover: kill leader, re-elect, write, rejoin, verify identical state on all nodes |
+
+Tests use real nodes (real TCP, real threads, real disk) on localhost —
+no mocks of the consensus path.
+
+## Benchmark
+
+Measured on this dev VM, 3-node localhost cluster, single client doing
+sequential committed writes (each write waits for majority replication
+and an fsync of the log append):
+
+```
+200 sequential committed writes in 0.54s -> ~370 writes/sec
+```
+
+This is latency-bound, not throughput-bound: every write pays a full
+round trip to a majority plus a disk fsync. Batching / pipelining and
+group commit would raise it substantially; see the roadmap.
+
+## Architecture
+
+```
+raftkv/
+  transport.py   Length-prefixed JSON framing, one-shot RPC, threaded TCP server
+  raft.py        RaftNode: elections, log replication, commit, persistence
+  store.py       KVStore: the deterministic state machine (SET/GET/DEL)
+  server.py      Node CLI: --id --port --peers --data-dir
+  client.py      Client CLI: set/get/del with leader-redirect following
+tests/
+  harness.py     In-process 3-node cluster fixture
+  test_raft.py       Election, replication, redirects, persistence
+  test_integration.py  Leader-kill failover scenario
+```
+
+**Threading.** One TCP server thread (a thread per connection), one
+timer thread driving elections/heartbeats, client requests on connection
+threads. All Raft state is guarded by a single lock, and network I/O is
+always done *outside* the lock — two nodes RPC-ing each other at the
+same time must never hold each other's lock while waiting on the
+network.
+
+**Persistence format.** Per node, in `--data-dir`:
+
+- `meta.json` — `current_term`, `voted_for`, `commit_index`, rewritten
+  atomically (tmp file + rename) on every change.
+- `log.jsonl` — one JSON object per line,
+  `{"term": n, "command": {"op": "set", "key": "k", "value": "v"}}`,
+  appended + fsynced per entry, rewritten whole after a truncation.
+
+On restart the node reloads both and re-applies the committed prefix
+to the state machine. SET/DEL are deterministic, so replay is safe.
+
+## Design decisions
+
+- **Why Raft, not a primary-backup hack.** A single leader with a
+  replicated log is the only design here that survives a leader crash
+  without losing acknowledged writes or splitting the data. Paxos is
+  harder to reason about; Raft's election + log matching gives the
+  same safety with code a reader can actually follow.
+- **Read path.** Reads go to the leader and only after a heartbeat
+  round confirms a majority still acknowledges it in the current term.
+  That closes the stale-read hole where a partitioned ex-leader keeps
+  answering from old state. (A ReadIndex-style optimization would
+  avoid the heartbeat on the hot path; see roadmap.)
+- **Commit rule.** A leader only advances `commit_index` for entries
+  from its *own* term, counting replicas — never for old-term entries
+  alone. Committing a current-term entry transitively commits
+  everything before it. This is the subtle rule that keeps Raft safe
+  across elections.
+- **Log conflict handling.** On a mismatched `prev_log_index/term` the
+  follower rejects and the leader backs `next_index` down and retries,
+  so a new leader brings stale followers up to date instead of
+  diverging.
+- **No dependencies.** Pure stdlib: `socket`, `threading`, `json`,
+  `socketserver`. Nothing to install, nothing to break.
+
+## Roadmap
+
+- Log compaction via snapshotting (snapshot the KV state + last
+  included index/term, truncate the log) so long-lived clusters don't
+  grow `log.jsonl` forever.
+- Membership changes (joint consensus) for adding/removing nodes.
+- Pre-vote to avoid disruptive re-elections when a partitioned node
+  rejoins with a stale-but-high term.
+- ReadIndex / lease-based reads to serve reads without a heartbeat
+  round on the hot path.
+- Pipelined replication and group commit for higher write throughput.
+- A benchmark script (`scripts/bench.py`) with concurrent clients.
