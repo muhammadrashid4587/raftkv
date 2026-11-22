@@ -24,6 +24,15 @@ logic and the failure handling, not the key-value API on top.
   unit. Follower-side batching does the same per AppendEntries batch.
   Concurrent write throughput more than doubled (see Benchmark); a
   lone sequential write just pays the 2ms window.
+- **Leader lease reads** — a leader that heard acks from a majority
+  within the last 100ms (shorter than any follower's 150ms minimum
+  election timeout, so no new leader can have been elected since)
+  serves reads straight from its applied state, with no heartbeat
+  round at all. Heartbeats go out every 50ms, so a healthy leader's
+  lease is almost always fresh; sequential read throughput went from
+  ~250-730 to ~1300-3500 ops/s (see Benchmark). If the lease is stale
+  the read falls back to the ReadIndex heartbeat round, and a deposed
+  leader holds no lease — stepping down clears it.
 - **ReadIndex reads** — a read records the leader's commit index,
   confirms leadership with a heartbeat round to a majority, and only
   returns once the state machine has applied up to that index, so the
@@ -101,7 +110,7 @@ make test
 # or: python3 -m unittest discover -s tests -v
 ```
 
-44 tests, plus a smoke test for the benchmark script, all passing:
+48 tests, plus a smoke test for the benchmark script, all passing:
 
 | Test | What it proves |
 |---|---|
@@ -145,6 +154,10 @@ make test
 | `test_remove_unknown_server_is_rejected` | Removing a server that is not a member is rejected |
 | `test_concurrent_membership_changes_rejected` | Two concurrent membership changes are rejected/serialized, and the cluster is not wedged afterwards |
 | `test_membership_survives_restart` | Membership persists across restarts of every node; the 4-node cluster keeps serving |
+| `test_lease_read_skips_heartbeat_round` | Five reads on a leased leader run zero confirmation rounds and return the right values |
+| `test_lease_expires_without_majority_acks` | With both followers down the lease goes stale, the read falls back to a round and errors instead of serving unconfirmed |
+| `test_step_down_clears_lease` | Stepping down clears the ack record, so a deposed leader holds no lease |
+| `test_lease_counts_only_voting_members` | Only voting members' acks extend the lease; a non-voter's fresh ack does not help |
 
 Tests use real nodes (real TCP, real threads, real disk) on localhost —
 no mocks of the consensus path.
@@ -152,14 +165,17 @@ no mocks of the consensus path.
 ## Benchmark
 
 Measured with `scripts/bench.py` (real 3-node cluster on localhost,
-200 writes, 10 threads, 32-byte values), Nov 22, 2026, on this dev VM:
+200 writes, 10 threads, 32-byte values), Nov 22, 2026, on this dev VM
+(three runs; the first two ran while ten sibling agents were pushing
+on the same box, so concurrent-write throughput dipped — the third
+run, on a quieter box, is back near the old number):
 
 ```
 $ python3 scripts/bench.py
-sequential writes          200 ops   ~105 ops/s   p50 ~8.7ms
-concurrent writes x10      200 ops   ~810 ops/s   p50 ~10.6ms
-sequential reads           200 ops   ~250-730 ops/s
-concurrent reads x10       200 ops   ~185-190 ops/s
+sequential writes          200 ops   ~104-111 ops/s   p50 ~8.6-9.1ms
+concurrent writes x10      200 ops   ~714 ops/s       p50 ~12.4ms
+sequential reads           200 ops   ~1300-3500 ops/s p50 ~0.3-0.6ms
+concurrent reads x10       200 ops   ~184-190 ops/s   p50 ~2.2-4.0ms
 ```
 
 This is latency-bound, not throughput-bound: every committed write
@@ -172,7 +188,15 @@ writes/sec. Pipelining (v0.5.0) does not raise the sequential number
 — its win is elsewhere: a lagging follower catches up in a few
 concurrent batches instead of one round trip per batch, and on a
 real network (where RTT is not ~0.2ms) the overlapped round trips
-matter.
+matter. The leader lease (v0.8.0) is what raised the sequential-read
+number: a read no longer pays a heartbeat round to a majority, it is
+served straight from the leader's applied state in ~0.3-0.6ms, so
+sequential reads went from ~250-730 to ~1300-3500 ops/s. Concurrent
+reads did not move (~185-190 ops/s either way): with ten clients
+hammering the leader the bottleneck is the per-connection TCP
+handling, not the heartbeat round — a probe of 500 concurrent reads
+showed zero confirmation rounds served from the lease, yet one read
+still took ~1s in the transport layer.
 
 ## Architecture
 
@@ -238,6 +262,13 @@ entries left in `log.jsonl` are dropped by their index on reload.
   falls back to a plain heartbeat-confirmed read of the applied state
   (on this leader apply is synchronous with commit advancement under
   the same lock, so the fallback is exactly the previous behaviour).
+  Since v0.8.0 the heartbeat round itself is usually skipped: the
+  leader holds a *lease* — a majority acked within the last 100ms,
+  shorter than any follower's 150ms minimum election timeout, so no
+  new leader can have been elected since those acks, and the read is
+  served straight from applied state. A stale lease falls back to
+  the round, and stepping down clears the lease, so a deposed leader
+  can never serve from an old one.
 - **Commit rule.** A leader only advances `commit_index` for entries
   from its *own* term, counting replicas — never for old-term entries
   alone. Committing a current-term entry transitively commits
@@ -322,3 +353,10 @@ entries left in `log.jsonl` are dropped by their index on reload.
   exactly 1 fsync, sequential writes still pay one each). Concurrent
   write throughput went from ~360 to ~810 ops/s on the benchmark.
 - ~~A benchmark script (`scripts/bench.py`) with concurrent clients~~ — done Nov 22, 2026: `scripts/bench.py` starts a real 3-node cluster, measures sequential/concurrent committed writes and ReadIndex reads with p50/p95/p99 latencies, and verifies a sample of written keys read back correctly.
+- ~~Leader lease for reads~~ — done in v0.8.0, Nov 22, 2026: a leader
+  that heard acks from a majority within 100ms (shorter than the
+  150ms minimum election timeout, so no new leader can exist) serves
+  reads straight from its applied state with no heartbeat round;
+  stale lease falls back to the ReadIndex round, step-down clears
+  the lease, only voting members' acks count. Sequential reads went
+  from ~250-730 to ~1300-3500 ops/s.

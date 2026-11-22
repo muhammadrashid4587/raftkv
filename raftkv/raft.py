@@ -55,6 +55,15 @@ HEARTBEAT_INTERVAL = 0.05
 RPC_TIMEOUT = 0.5
 CLIENT_COMMIT_TIMEOUT = 10.0
 LEADER_LEASE_TIMEOUT = 1.0
+# Leader lease for reads (Raft dissertation §6.4): how long a majority
+# ack stays fresh. Must be shorter than ELECTION_TIMEOUT_MIN (150ms):
+# a follower that acked at time T heard from the leader no later than
+# T, so it cannot start an election before T + 150ms, and any new
+# election majority overlaps the acking majority in at least one node —
+# so no new leader can be elected while this lease holds. 100ms leaves
+# 50ms of slack. Heartbeats go out every 50ms, so a healthy leader's
+# lease is almost always fresh and reads skip the heartbeat round.
+LEADER_LEASE_DURATION = 0.1
 # How long a ReadIndex read waits for the state machine to apply up to
 # its read index before falling back to a plain heartbeat-confirmed read.
 READ_INDEX_TIMEOUT = 2.0
@@ -203,6 +212,15 @@ class RaftNode:
         # _resolve_pending_reads once last_applied passes the index, or
         # by _fail_pending_reads when the node loses leadership.
         self._pending_reads: list[dict] = []
+        # Leader lease (see _lease_valid): last time each peer acked an
+        # AppendEntries (batch or heartbeat) or InstallSnapshot in our
+        # term. A deposed leader holds no lease, so this is cleared on
+        # step-down and rebuilt on every election win.
+        self._last_ack: dict[str, float] = {}
+        # How many explicit leadership-confirmation rounds _serve_read
+        # has run (lease-served reads do not count). Exposed in
+        # status() so tests can tell the two read paths apart.
+        self._confirm_rounds = 0
         # Pipelined replication state (leader only, rebuilt on every
         # election win by _become_leader). Per peer:
         # - _in_flight: {batch_start_index: {"prev", "end", "epoch"}}
@@ -637,6 +655,7 @@ class RaftNode:
             self._save_meta()
         self.role = "follower"
         self.leader_id = None
+        self._last_ack = {}
         self._fail_pending_reads()
         self._reset_election_timer()
 
@@ -728,6 +747,8 @@ class RaftNode:
                     "snapshot_index": self.snapshot_index,
                     "snapshot_term": self.snapshot_term,
                     "pending_reads": len(self._pending_reads),
+                    "lease_valid": self._lease_valid(),
+                    "confirm_rounds": self._confirm_rounds,
                     "config": sorted(self.config),
                     "peers": sorted(self.peers),
                     "removed": self._is_removed(),
@@ -1309,8 +1330,13 @@ class RaftNode:
         """ReadIndex read (Raft dissertation §6.4).
 
         1. Record read_index = commit_index while leader in this term.
-        2. Confirm leadership with a heartbeat round to a majority —
-           a partitioned ex-leader cannot get those acks.
+        2. Confirm leadership — with a heartbeat round to a majority,
+           unless the leader lease is still valid: a majority acked
+           within LEADER_LEASE_DURATION, which is shorter than any
+           follower's election timeout, so no new leader can have been
+           elected since. A partitioned ex-leader holds no lease (its
+           acks stopped arriving), so it still falls through to the
+           round and is caught there.
         3. Wait until the state machine has applied up to read_index;
            only then is the local state guaranteed to include every
            write committed before the read started. The wait registers
@@ -1330,7 +1356,8 @@ class RaftNode:
                 return self._redirect()
             term = self.current_term
             read_index = self.commit_index
-        if not self._confirm_leadership(term):
+            lease_ok = self._lease_valid()
+        if not lease_ok and not self._confirm_leadership(term):
             with self.lock:
                 if self.role != "leader":
                     return self._redirect()
@@ -1371,6 +1398,30 @@ class RaftNode:
             value = self.sm.get(key)
         return {"type": "client_response", "status": "ok", "value": value}
 
+    def _lease_valid(self) -> bool:
+        """True if a majority of voters acked us within
+        LEADER_LEASE_DURATION. Lock held.
+
+        The leader itself counts as one. A peer counts only if it is a
+        voting member — a server being added may ack, but it is not a
+        voter yet. Safe because the lease is shorter than the minimum
+        election timeout: a follower that acked at time T cannot start
+        an election before T + ELECTION_TIMEOUT_MIN, and any majority
+        that could elect a new leader overlaps the acking majority in
+        at least one node, so no new leader can exist while the lease
+        holds. A single-node cluster is trivially leased (majority 1).
+        """
+        if self.role != "leader":
+            return False
+        now = time.monotonic()
+        count = 1  # the leader itself
+        count += sum(
+            1 for p in self.config
+            if p != self.id
+            and now - self._last_ack.get(p, 0.0) <= LEADER_LEASE_DURATION
+        )
+        return count >= self._majority()
+
     def _confirm_leadership(self, term: int) -> bool:
         """Heartbeat round: succeed only if a majority acks in this term.
         Only voting members count — a server being added may ack too,
@@ -1392,6 +1443,7 @@ class RaftNode:
         for t in threads:
             t.join(timeout=max(0.0, deadline - time.monotonic()))
         with self.lock:
+            self._confirm_rounds += 1
             still_leader = self.role == "leader" and self.current_term == term
             voting_acks = sum(1 for p, ok in acks.items()
                               if ok and p in self.config)
@@ -1497,6 +1549,11 @@ class RaftNode:
             # prev_log_index it does not have, so an ack for a later
             # batch implies the earlier ones landed too — which is
             # what lets out-of-order acks advance match_index safely.
+            # It also refreshes this peer's share of the leader lease:
+            # the follower heard from us just before it acked, so it
+            # cannot time out and elect a new leader before the lease
+            # (shorter than its election timeout) runs out.
+            self._last_ack[peer] = time.monotonic()
             self.match_index[peer] = max(
                 self.match_index.get(peer, 0), end)
             self.next_index[peer] = self.match_index[peer] + 1
@@ -1771,6 +1828,7 @@ class RaftNode:
             if self.role != "leader" or resp_term != self.current_term:
                 return False
             if resp.get("success"):
+                self._last_ack[peer] = time.monotonic()
                 self.match_index[peer] = int(
                     resp.get("match_index", self.snapshot_index))
                 self.next_index[peer] = self.match_index[peer] + 1
@@ -1800,6 +1858,7 @@ class RaftNode:
             self._max_in_flight = {}
             self._peer_retry_after = {}
             self._pipeline_failures = {}
+            self._last_ack = {}
             for p in self.peers:
                 if p in self._non_voting:
                     # A server still catching up for an add starts from
