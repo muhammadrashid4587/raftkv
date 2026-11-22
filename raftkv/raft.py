@@ -20,12 +20,20 @@ Persistence
 Per node, in ``data_dir``:
 - ``meta.json`` — current_term, voted_for, commit_index (rewritten
   atomically via tmp file + rename whenever it changes).
-- ``log.jsonl`` — one JSON object per line, {"term": n, "command": {...}}.
-  Appended + fsynced on every new entry; rewritten whole when the log is
-  truncated by a conflicting AppendEntries.
+- ``log.jsonl`` — one JSON object per line,
+  {"term": n, "index": g, "command": {...}}. Appended + fsynced on
+  every new entry; rewritten whole when the log is truncated by a
+  conflicting AppendEntries or compacted by a snapshot. Each entry
+  carries its global log index so a restart can tell a pre-snapshot
+  entry (index <= snapshot_index) from a live one.
+- ``snapshot.json`` — {"last_included_index": n, "last_included_term": t,
+  "state": {...}}, the compacted state machine as of index n, written
+  atomically. The in-memory log holds only entries *after* the
+  snapshot; global index of log[k] is snapshot_index + k + 1.
 
-On restart the node reloads term/vote/log and re-applies the committed
-prefix to the state machine, so it rejoins with the same state it had.
+On restart the node loads the snapshot into the state machine, then
+replays the remaining committed log entries, so it rejoins with the
+same state it had — without replaying the whole history.
 """
 
 from __future__ import annotations
@@ -47,6 +55,11 @@ HEARTBEAT_INTERVAL = 0.05
 RPC_TIMEOUT = 0.5
 CLIENT_COMMIT_TIMEOUT = 10.0
 LEADER_LEASE_TIMEOUT = 1.0
+# Compact the log once it holds more than this many post-snapshot
+# entries. 1000 is large enough that compaction is rare in normal use
+# but still bounds log.jsonl on a long-lived cluster. Tests pass a
+# much smaller value to force snapshots quickly.
+SNAPSHOT_THRESHOLD = 1000
 
 
 class RaftNode:
@@ -56,18 +69,22 @@ class RaftNode:
         peers: dict[str, tuple[str, int]],
         data_dir: str | os.PathLike,
         state_machine,
+        snapshot_threshold: int = SNAPSHOT_THRESHOLD,
     ) -> None:
         """
         node_id: this node's id, e.g. "node1".
         peers:   {peer_id: (host, port)} for every *other* node in the cluster.
         data_dir: directory holding meta.json + log.jsonl for this node.
         state_machine: object with an ``apply(command: dict)`` method.
+        snapshot_threshold: compact the log once it holds more than this
+            many post-snapshot entries (see SNAPSHOT_THRESHOLD).
         """
         self.id = node_id
         self.peers = dict(peers)
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.sm = state_machine
+        self.snapshot_threshold = snapshot_threshold
 
         self.lock = threading.RLock()
         self.commit_cond = threading.Condition(self.lock)
@@ -75,7 +92,11 @@ class RaftNode:
         # Persistent state (must survive restarts).
         self.current_term = 0
         self.voted_for: str | None = None
-        self.log: list[dict] = []  # {"term": int, "command": dict}
+        # self.log holds only entries AFTER snapshot_index; the global
+        # index of log[k] is snapshot_index + k + 1.
+        self.log: list[dict] = []  # {"term": int, "index": int, "command": dict}
+        self.snapshot_index = 0
+        self.snapshot_term = 0
 
         # Volatile state.
         self.commit_index = 0
@@ -108,6 +129,10 @@ class RaftNode:
     def _log_path(self) -> Path:
         return self.data_dir / "log.jsonl"
 
+    @property
+    def _snapshot_path(self) -> Path:
+        return self.data_dir / "snapshot.json"
+
     def _load_persistent_state(self) -> None:
         if self._meta_path.exists():
             with open(self._meta_path, "r", encoding="utf-8") as f:
@@ -115,16 +140,43 @@ class RaftNode:
             self.current_term = int(meta.get("current_term", 0))
             self.voted_for = meta.get("voted_for")
             self.commit_index = int(meta.get("commit_index", 0))
+        # The snapshot comes first: it defines the state machine's
+        # starting point and which log indices are already covered.
+        if self._snapshot_path.exists():
+            with open(self._snapshot_path, "r", encoding="utf-8") as f:
+                snap = json.load(f)
+            self.snapshot_index = int(snap.get("last_included_index", 0))
+            self.snapshot_term = int(snap.get("last_included_term", 0))
+            self.sm.load(snap.get("state") or {})
         if self._log_path.exists():
+            expected = 1
             with open(self._log_path, "r", encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
-                    if line:
-                        self.log.append(json.loads(line))
-        # Re-apply the committed prefix so the state machine matches what
-        # this node had before the restart. SET/DEL are deterministic, so
-        # replaying the committed prefix is always safe.
-        self.last_applied = 0
+                    if not line:
+                        continue
+                    entry = json.loads(line)
+                    # Log files written before snapshots existed have no
+                    # "index" field; their entries are 1..N in order.
+                    idx = entry.get("index")
+                    if idx is None:
+                        idx = expected
+                        entry["index"] = idx
+                    expected = idx + 1
+                    # A crash between writing snapshot.json and rewriting
+                    # log.jsonl leaves covered entries in the file; the
+                    # snapshot already holds their effect, so drop them.
+                    if idx <= self.snapshot_index:
+                        continue
+                    self.log.append(entry)
+        # The snapshot covers committed state, so the commit index can
+        # never be behind it, even if meta.json was saved before the
+        # snapshot landed.
+        self.commit_index = max(self.commit_index, self.snapshot_index)
+        # Re-apply the committed entries after the snapshot so the state
+        # machine matches what this node had before the restart. SET/DEL
+        # are deterministic, so replaying the committed suffix is safe.
+        self.last_applied = self.snapshot_index
         self._apply_committed()
 
     def _save_meta(self) -> None:
@@ -157,6 +209,49 @@ class RaftNode:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, self._log_path)
+
+    def _append_entry(self, entry: dict) -> int:
+        """Append one entry to the in-memory log and log.jsonl, stamping
+        it with its global log index. Call with the lock held. Returns
+        the entry's global index."""
+        index = self.snapshot_index + len(self.log) + 1
+        entry["index"] = index
+        self.log.append(entry)
+        self._append_log_entry(entry)
+        return index
+
+    def _write_snapshot_file(self) -> None:
+        """Write snapshot.json atomically from the current snapshot
+        index/term and state machine. Call with the lock held."""
+        snap = {
+            "last_included_index": self.snapshot_index,
+            "last_included_term": self.snapshot_term,
+            "state": self.sm.items(),
+        }
+        tmp = self._snapshot_path.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(snap, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, self._snapshot_path)
+
+    def _take_snapshot(self, index: int) -> None:
+        """Compact the log up to ``index``. Only correct when ``index``
+        equals ``last_applied``: the state machine then holds exactly
+        the state as of that index, so the covered prefix can be
+        discarded. Writes snapshot.json *before* truncating the log,
+        so a crash mid-compaction is recoverable on reload (covered
+        entries left in log.jsonl are dropped by their index). Lock held.
+        """
+        if index <= self.snapshot_index or index != self.last_applied:
+            return
+        term = self._term_at(index)
+        cut = index - self.snapshot_index
+        self.snapshot_index = index
+        self.snapshot_term = term
+        self._write_snapshot_file()
+        del self.log[:cut]
+        self._rewrite_log()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -206,10 +301,20 @@ class RaftNode:
         self._election_timeout = self._random_timeout()
 
     def _last_log_index(self) -> int:
-        return len(self.log)
+        return self.snapshot_index + len(self.log)
 
     def _last_log_term(self) -> int:
-        return self.log[-1]["term"] if self.log else 0
+        return self.log[-1]["term"] if self.log else self.snapshot_term
+
+    def _term_at(self, index: int) -> int:
+        """Term of the entry at global log ``index``. Index 0 has term 0;
+        anything at or below the snapshot is covered by the snapshot, so
+        it reports the snapshot term. Call with the lock held."""
+        if index <= 0:
+            return 0
+        if index <= self.snapshot_index:
+            return self.snapshot_term
+        return self.log[index - self.snapshot_index - 1]["term"]
 
     def _majority(self) -> int:
         return (len(self.peers) + 1) // 2 + 1
@@ -225,12 +330,22 @@ class RaftNode:
         self._reset_election_timer()
 
     def _apply_committed(self) -> None:
-        """Apply every committed-but-unapplied entry, in order. Lock held."""
+        """Apply every committed-but-unapplied entry, in order. Lock held.
+
+        Entries are addressed by global index; the in-memory log starts
+        just after the snapshot, so the position of index ``i`` is
+        ``i - snapshot_index - 1``. Once the applied prefix grows past
+        the threshold, compact it into a snapshot so the log (and the
+        replay on the next restart) stays bounded.
+        """
         while self.last_applied < self.commit_index:
             self.last_applied += 1
-            entry = self.log[self.last_applied - 1]
+            entry = self.log[self.last_applied - self.snapshot_index - 1]
             self.sm.apply(entry["command"])
         self._save_meta()
+        if (self.last_applied > self.snapshot_index
+                and len(self.log) > self.snapshot_threshold):
+            self._take_snapshot(self.last_applied)
 
     def _advance_commit(self) -> None:
         """Leader only: advance commit_index when a majority has an entry
@@ -244,7 +359,7 @@ class RaftNode:
         if self.role != "leader":
             return
         for n in range(self._last_log_index(), self.commit_index, -1):
-            if self.log[n - 1]["term"] != self.current_term:
+            if self._term_at(n) != self.current_term:
                 continue
             count = 1  # the leader itself has it
             count += sum(1 for m in self.match_index.values() if m >= n)
@@ -263,6 +378,8 @@ class RaftNode:
             return self._on_request_vote(msg)
         if msg_type == "append_entries":
             return self._on_append_entries(msg)
+        if msg_type == "install_snapshot":
+            return self._on_install_snapshot(msg)
         if msg_type == "client":
             return self._on_client(msg)
         if msg_type == "status":
@@ -276,6 +393,8 @@ class RaftNode:
                     "commit_index": self.commit_index,
                     "last_applied": self.last_applied,
                     "log_length": len(self.log),
+                    "snapshot_index": self.snapshot_index,
+                    "snapshot_term": self.snapshot_term,
                 }
         return {"type": "error", "error": f"unknown message type: {msg_type!r}"}
 
@@ -334,30 +453,43 @@ class RaftNode:
 
             # Log matching property: the log must contain an entry at
             # prev_log_index with term prev_log_term, or the RPC fails
-            # and the leader backs up and retries.
+            # and the leader backs up and retries. Entries at or below
+            # our snapshot are already compacted: if the snapshot covers
+            # prev_log_index, the prefix matches by construction — a
+            # snapshot only ever covers committed entries, and committed
+            # entries cannot differ between nodes.
             if prev_index > 0:
                 if prev_index > self._last_log_index():
                     return {"type": "append_entries_response",
                             "term": self.current_term, "success": False,
                             "match_index": self._last_log_index()}
-                if self.log[prev_index - 1]["term"] != prev_term:
-                    return {"type": "append_entries_response",
-                            "term": self.current_term, "success": False,
-                            "match_index": prev_index - 1}
+                if prev_index > self.snapshot_index:
+                    if self.log[prev_index - self.snapshot_index - 1]["term"] != prev_term:
+                        return {"type": "append_entries_response",
+                                "term": self.current_term, "success": False,
+                                "match_index": prev_index - 1}
+                elif prev_index == self.snapshot_index:
+                    if prev_term != self.snapshot_term:
+                        return {"type": "append_entries_response",
+                                "term": self.current_term, "success": False,
+                                "match_index": prev_index - 1}
 
             # Append new entries, deleting anything that conflicts.
+            # Entries at or below the snapshot are already applied here,
+            # so they are skipped, not re-appended.
             idx = prev_index
             for entry in entries:
                 idx += 1
-                if idx <= self._last_log_index():
-                    if self.log[idx - 1]["term"] != entry["term"]:
-                        del self.log[idx - 1:]
+                if idx <= self.snapshot_index:
+                    continue
+                pos = idx - self.snapshot_index - 1
+                if pos < len(self.log):
+                    if self.log[pos]["term"] != entry["term"]:
+                        del self.log[pos:]
                         self._rewrite_log()
-                        self.log.append(entry)
-                        self._append_log_entry(entry)
+                        self._append_entry(entry)
                 else:
-                    self.log.append(entry)
-                    self._append_log_entry(entry)
+                    self._append_entry(entry)
 
             if leader_commit > self.commit_index:
                 self.commit_index = min(leader_commit, self._last_log_index())
@@ -366,6 +498,61 @@ class RaftNode:
             return {"type": "append_entries_response",
                     "term": self.current_term, "success": True,
                     "match_index": self._last_log_index()}
+
+    # ------------------------------------------------------------------
+    # InstallSnapshot
+    # ------------------------------------------------------------------
+    def _on_install_snapshot(self, msg: dict) -> dict:
+        """Install a snapshot from the leader (Raft §7).
+
+        Sent when a follower is so far behind that the leader has
+        already compacted away the entries it is missing — AppendEntries
+        can no longer bring it up to date. The follower replaces its
+        state machine with the snapshot's state, discards its log up to
+        the snapshot's last included index, and keeps any log entries
+        after that index whose prefix still matches.
+        """
+        term = int(msg["term"])
+        leader_id = msg["leader_id"]
+        last_included_index = int(msg["last_included_index"])
+        last_included_term = int(msg["last_included_term"])
+        data = msg.get("data") or {}
+        with self.lock:
+            if term < self.current_term:
+                return {"type": "install_snapshot_response",
+                        "term": self.current_term, "success": False,
+                        "match_index": self._last_log_index()}
+            if term > self.current_term:
+                self._step_down(term)
+            self.role = "follower"
+            self.leader_id = leader_id
+            self._reset_election_timer()
+
+            if last_included_index <= self.snapshot_index:
+                # We already have this snapshot (or a newer one).
+                return {"type": "install_snapshot_response",
+                        "term": self.current_term, "success": True,
+                        "match_index": self._last_log_index()}
+
+            # Keep log entries after last_included_index only if the
+            # entry at that index still matches the snapshot's term;
+            # otherwise the whole log is stale and goes.
+            if (last_included_index <= self._last_log_index()
+                    and self._term_at(last_included_index) == last_included_term):
+                self.log = self.log[last_included_index - self.snapshot_index:]
+            else:
+                self.log = []
+            self.snapshot_index = last_included_index
+            self.snapshot_term = last_included_term
+            self.sm.load(data)
+            self._write_snapshot_file()
+            self._rewrite_log()
+            self.commit_index = max(self.commit_index, last_included_index)
+            self.last_applied = max(self.last_applied, last_included_index)
+            self._save_meta()
+            return {"type": "install_snapshot_response",
+                    "term": self.current_term, "success": True,
+                    "match_index": last_included_index}
 
     # ------------------------------------------------------------------
     # Client protocol
@@ -395,9 +582,7 @@ class RaftNode:
             if self.role != "leader":
                 return self._redirect()
             entry = {"term": self.current_term, "command": command}
-            self.log.append(entry)
-            self._append_log_entry(entry)
-            index = self._last_log_index()
+            index = self._append_entry(entry)
             peers = list(self.peers)
 
         # Replicate in parallel; each thread updates match/next and may
@@ -478,8 +663,8 @@ class RaftNode:
             return None
         next_idx = self.next_index.get(peer, self._last_log_index() + 1)
         prev_index = next_idx - 1
-        prev_term = self.log[prev_index - 1]["term"] if prev_index > 0 else 0
-        entries = self.log[next_idx - 1:]
+        prev_term = self._term_at(prev_index)
+        entries = self.log[next_idx - self.snapshot_index - 1:]
         return {
             "type": "append_entries",
             "term": self.current_term,
@@ -501,11 +686,23 @@ class RaftNode:
             with self.lock:
                 if self.role != "leader":
                     return False
-                msg = self._build_append_entries(peer)
-                if msg is None:
-                    return False
-                sent_entries = len(msg["entries"])
-                sent_prev = msg["prev_log_index"]
+                # If the peer is behind our snapshot, AppendEntries
+                # cannot help it: the entries it needs no longer exist
+                # in our log. Send the snapshot instead.
+                if self.next_index.get(peer, 1) <= self.snapshot_index:
+                    send_snapshot = True
+                    msg = None
+                    sent_entries = 0
+                    sent_prev = 0
+                else:
+                    send_snapshot = False
+                    msg = self._build_append_entries(peer)
+                    if msg is None:
+                        return False
+                    sent_entries = len(msg["entries"])
+                    sent_prev = msg["prev_log_index"]
+            if send_snapshot:
+                return self._send_install_snapshot(peer)
             resp = send_rpc(host, port, msg, timeout=RPC_TIMEOUT)
             with self.lock:
                 if resp is None:
@@ -524,6 +721,40 @@ class RaftNode:
                 # Log mismatch: back up and retry with an earlier prefix.
                 hint = int(resp.get("match_index", sent_prev - 1))
                 self.next_index[peer] = max(1, min(self.next_index.get(peer, 1), hint + 1))
+        return False
+
+    def _send_install_snapshot(self, peer: str) -> bool:
+        """Send this node's snapshot to a lagging peer. Network I/O
+        happens outside the lock; the reply is applied under it.
+        Returns True if the peer installed the snapshot in our term."""
+        host, port = self.peers[peer]
+        with self.lock:
+            if self.role != "leader":
+                return False
+            msg = {
+                "type": "install_snapshot",
+                "term": self.current_term,
+                "leader_id": self.id,
+                "last_included_index": self.snapshot_index,
+                "last_included_term": self.snapshot_term,
+                "data": self.sm.items(),
+            }
+        resp = send_rpc(host, port, msg, timeout=RPC_TIMEOUT)
+        with self.lock:
+            if resp is None:
+                return False
+            resp_term = int(resp.get("term", 0))
+            if resp_term > self.current_term:
+                self._step_down(resp_term)
+                return False
+            if self.role != "leader" or resp_term != self.current_term:
+                return False
+            if resp.get("success"):
+                self.match_index[peer] = int(
+                    resp.get("match_index", self.snapshot_index))
+                self.next_index[peer] = self.match_index[peer] + 1
+                self._advance_commit()
+                return True
         return False
 
     def _become_leader(self) -> None:

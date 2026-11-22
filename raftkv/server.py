@@ -54,13 +54,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--data-dir", required=True,
                         help="directory for meta.json + log.jsonl")
+    parser.add_argument("--snapshot-threshold", type=int, default=1000,
+                        help="compact the log past this many post-snapshot "
+                             "entries (default 1000)")
     args = parser.parse_args(argv)
 
     peers = parse_peers(args.peers)
     if args.id in peers:
         parser.error("--peers must list only the *other* nodes, not this node")
 
-    node = RaftNode(args.id, peers, args.data_dir, KVStore())
+    node = RaftNode(args.id, peers, args.data_dir, KVStore(),
+                    snapshot_threshold=args.snapshot_threshold)
     node.start(args.host, args.port)
     print(
         f"[{args.id}] listening on {args.host}:{args.port} "

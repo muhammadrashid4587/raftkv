@@ -21,6 +21,13 @@ logic and the failure handling, not the key-value API on top.
 - **Linearizable-ish reads** — the leader confirms leadership with a
   heartbeat round to a majority before serving a read, so a partitioned
   ex-leader cannot serve stale data.
+- **Log compaction via snapshotting** — once the log grows past a
+  threshold (default 1000 entries), a node snapshots its state
+  machine (`snapshot.json`: state + last included index/term) and
+  discards the covered log prefix. A follower too far behind to catch
+  up by AppendEntries receives the snapshot via InstallSnapshot
+  (Raft §7) instead. A restarted node loads its snapshot and replays
+  only the remaining log suffix.
 - **Leader redirects** — a write or read sent to a follower returns the
   current leader's address; the client follows it automatically.
 - **Real failure handling** — tested end to end: kill the leader, the
@@ -57,7 +64,7 @@ make test
 # or: python3 -m unittest discover -s tests -v
 ```
 
-8 tests, all passing:
+11 tests, all passing:
 
 | Test | What it proves |
 |---|---|
@@ -69,6 +76,9 @@ make test
 | `test_leader_serves_reads` | Leader reads return committed values |
 | `test_follower_restart_replays_committed_log` | Restarted node replays disk log + catches up |
 | `test_kill_leader_reelect_write_and_rejoin` | Full failover: kill leader, re-elect, write, rejoin, verify identical state on all nodes |
+| `test_snapshot_compacts_log_and_survives_restart` | Log compacts past the threshold; restarted node resumes from snapshot + suffix |
+| `test_lagging_follower_catches_up_via_install_snapshot` | Follower behind the leader's snapshot catches up via InstallSnapshot |
+| `test_restart_loads_snapshot_without_a_cluster` | Node restarted alone reloads snapshotted state from disk |
 
 Tests use real nodes (real TCP, real threads, real disk) on localhost —
 no mocks of the consensus path.
@@ -114,11 +124,21 @@ network.
 - `meta.json` — `current_term`, `voted_for`, `commit_index`, rewritten
   atomically (tmp file + rename) on every change.
 - `log.jsonl` — one JSON object per line,
-  `{"term": n, "command": {"op": "set", "key": "k", "value": "v"}}`,
-  appended + fsynced per entry, rewritten whole after a truncation.
+  `{"term": n, "index": g, "command": {"op": "set", "key": "k", "value": "v"}}`,
+  appended + fsynced per entry, rewritten whole after a truncation or
+  a snapshot. Each entry carries its global log index, so a restart can
+  tell a pre-snapshot entry from a live one.
+- `snapshot.json` — `{"last_included_index": n, "last_included_term": t,
+  "state": {...}}`, the state machine as of index `n`, written
+  atomically (tmp file + rename) when the log is compacted or a
+  snapshot is installed. The in-memory log holds only entries after
+  the snapshot.
 
-On restart the node reloads both and re-applies the committed prefix
-to the state machine. SET/DEL are deterministic, so replay is safe.
+On restart the node loads its snapshot into the state machine, then
+re-applies the committed entries after the snapshot. SET/DEL are
+deterministic, so replay is safe. A snapshot is written *before* the
+log is truncated, so a crash mid-compaction is recoverable: covered
+entries left in `log.jsonl` are dropped by their index on reload.
 
 ## Design decisions
 
@@ -146,9 +166,10 @@ to the state machine. SET/DEL are deterministic, so replay is safe.
 
 ## Roadmap
 
-- Log compaction via snapshotting (snapshot the KV state + last
-  included index/term, truncate the log) so long-lived clusters don't
-  grow `log.jsonl` forever.
+- ~~Log compaction via snapshotting~~ — done in v0.2.0: snapshot the
+  KV state + last included index/term, truncate the log, InstallSnapshot
+  RPC for lagging followers, automatic compaction past 1000 entries,
+  snapshot loading on restart.
 - Membership changes (joint consensus) for adding/removing nodes.
 - Pre-vote to avoid disruptive re-elections when a partitioned node
   rejoins with a stale-but-high term.

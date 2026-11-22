@@ -27,6 +27,12 @@ class KVStore:
     def get(self, key: str) -> str | None:
         return self._data.get(key)
 
+    def load(self, state: dict[str, str]) -> None:
+        """Replace the whole state with ``state`` (used when installing
+        a snapshot: the snapshot *is* the state as of its last included
+        index, so anything the store held before is discarded)."""
+        self._data = dict(state)
+
     def items(self) -> dict[str, str]:
         return dict(self._data)
 
