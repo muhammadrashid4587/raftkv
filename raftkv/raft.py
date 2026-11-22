@@ -74,6 +74,12 @@ PIPELINE_BATCH_SIZE = 32
 # dead peer would spin the window as fast as connections fail.
 PIPELINE_RETRY_BACKOFF = 0.1
 PIPELINE_MISMATCH_BACKOFF = 0.05
+# Membership changes: how long the leader waits for a server being
+# added to catch up with the log before appending the config entry
+# that makes it a voting member. 5s is generous on localhost (catch-up
+# is normally well under a second); tests pass a shorter value to make
+# a down server fail fast.
+MEMBERSHIP_CATCHUP_TIMEOUT = 5.0
 
 
 class RaftNode:
@@ -86,6 +92,7 @@ class RaftNode:
         snapshot_threshold: int = SNAPSHOT_THRESHOLD,
         pipeline_window: int = PIPELINE_WINDOW,
         pipeline_batch_size: int = PIPELINE_BATCH_SIZE,
+        membership_catchup_timeout: float = MEMBERSHIP_CATCHUP_TIMEOUT,
     ) -> None:
         """
         node_id: this node's id, e.g. "node1".
@@ -99,6 +106,9 @@ class RaftNode:
             sequential replication; tests use it to compare against.
         pipeline_batch_size: at most this many entries per
             AppendEntries batch (see PIPELINE_BATCH_SIZE).
+        membership_catchup_timeout: how long an add waits for the new
+            server to catch up before giving up (see
+            MEMBERSHIP_CATCHUP_TIMEOUT).
         """
         self.id = node_id
         self.peers = dict(peers)
@@ -108,6 +118,43 @@ class RaftNode:
         self.snapshot_threshold = snapshot_threshold
         self.pipeline_window = pipeline_window
         self.pipeline_batch_size = pipeline_batch_size
+        self.membership_catchup_timeout = membership_catchup_timeout
+
+        # Membership (Raft §6). ``config`` is the voting configuration:
+        # every server that counts toward a majority, mapped to its
+        # address (this node's own address is None until start() records
+        # it). ``peers`` is the wider address book — every node this one
+        # sends RPCs to, which is the config minus itself plus any
+        # non-voting server currently catching up for an add. The two
+        # are kept in sync by _apply_config_entry and _load; the
+        # distinction matters because a server being added must receive
+        # log entries before it may vote, and a vote or a commit must
+        # never count a non-voting server.
+        self.config: dict[str, tuple[str, int] | None] = {
+            p: addr for p, addr in self.peers.items()
+        }
+        self.config[self.id] = None
+        # Peers being added: in self.peers (so they get replicated to)
+        # but not yet in self.config (so they cannot vote or count
+        # toward commit). Cleared when the add's config entry commits.
+        self._non_voting: set[str] = set()
+        # The membership change currently being driven by this leader,
+        # {"op", "server_id", "index" (or None until appended)} — or
+        # None. Only one change at a time: a second request is rejected
+        # while one is in flight (see _membership_change_in_progress).
+        self._membership_change: dict | None = None
+        # Removal in progress: peer -> index of the remove_server
+        # entry. The leader keeps replicating to a removed peer until
+        # that peer's commit index reaches the entry — otherwise the
+        # peer never learns it was removed (the leader would stop
+        # sending heartbeats the moment it applied the entry, and the
+        # peer would sit there election-timing-out forever). The peer
+        # is already out of self.config, so it cannot vote or count
+        # toward a majority while it catches up on its own removal.
+        self._removal_pending: dict[str, int] = {}
+        # This node's own address once start() runs; recorded into the
+        # config so other members learn it from the log/snapshot.
+        self._self_addr: tuple[str, int] | None = None
 
         self.lock = threading.RLock()
         self.commit_cond = threading.Condition(self.lock)
@@ -201,12 +248,24 @@ class RaftNode:
         return self.data_dir / "snapshot.json"
 
     def _load_persistent_state(self) -> None:
+        meta_config = False
         if self._meta_path.exists():
             with open(self._meta_path, "r", encoding="utf-8") as f:
                 meta = json.load(f)
             self.current_term = int(meta.get("current_term", 0))
             self.voted_for = meta.get("voted_for")
             self.commit_index = int(meta.get("commit_index", 0))
+            # The config as of the last applied prefix (see _save_meta):
+            # newest first, so it wins over the snapshot's older one.
+            # meta.json written before membership changes existed has no
+            # "config" key; then the snapshot's config (or the initial
+            # constructor config) stands.
+            if meta.get("config") is not None:
+                meta_config = True
+                self.config = {
+                    str(mid): (tuple(addr) if addr else None)
+                    for mid, addr in meta["config"]
+                }
         # The snapshot comes first: it defines the state machine's
         # starting point and which log indices are already covered.
         if self._snapshot_path.exists():
@@ -215,6 +274,21 @@ class RaftNode:
             self.snapshot_index = int(snap.get("last_included_index", 0))
             self.snapshot_term = int(snap.get("last_included_term", 0))
             self.sm.load(snap.get("state") or {})
+            # A snapshot only ever covers committed entries, so a config
+            # entry compacted into it is committed state too: adopt the
+            # config it was written with, unless meta.json (newer)
+            # already supplied one above. Snapshot files written before
+            # membership changes existed have no "config" key.
+            if snap.get("config") is not None and not meta_config:
+                self.config = {
+                    str(mid): (tuple(addr) if addr else None)
+                    for mid, addr in snap["config"]
+                }
+        # The address book follows the config: every voting member
+        # except this node. A stale --peers list on the command line
+        # cannot resurrect a removed server, and a server added since
+        # this node last ran is learned from the persisted config.
+        self._rebuild_peers_from_config()
         if self._log_path.exists():
             expected = 1
             with open(self._log_path, "r", encoding="utf-8") as f:
@@ -247,11 +321,13 @@ class RaftNode:
         self._apply_committed()
 
     def _save_meta(self) -> None:
-        """Persist term/vote/commit atomically. Call with the lock held."""
+        """Persist term/vote/commit/config atomically. Call with the lock
+        held."""
         meta = {
             "current_term": self.current_term,
             "voted_for": self.voted_for,
             "commit_index": self.commit_index,
+            "config": self._config_list(),
         }
         tmp = self._meta_path.with_suffix(".json.tmp")
         with open(tmp, "w", encoding="utf-8") as f:
@@ -294,6 +370,7 @@ class RaftNode:
             "last_included_index": self.snapshot_index,
             "last_included_term": self.snapshot_term,
             "state": self.sm.items(),
+            "config": self._config_list(),
         }
         tmp = self._snapshot_path.with_suffix(".json.tmp")
         with open(tmp, "w", encoding="utf-8") as f:
@@ -321,6 +398,128 @@ class RaftNode:
         self._rewrite_log()
 
     # ------------------------------------------------------------------
+    # Membership helpers (Raft §6; call with the lock held unless noted)
+    # ------------------------------------------------------------------
+    def _config_list(self) -> list:
+        """The voting config as JSON: [[id, [host, port] | null], ...]
+        in sorted id order, so meta.json and snapshot.json agree."""
+        return [[mid, (list(addr) if addr else None)]
+                for mid, addr in sorted(self.config.items())]
+
+    def _is_removed(self) -> bool:
+        """True once this node has applied a config entry removing it:
+        it is no longer a voting member, so it must not vote, run for
+        election, or serve client requests. Derived from the config, so
+        a restart of a removed node stays removed."""
+        return self.id not in self.config
+
+    def _rebuild_peers_from_config(self) -> None:
+        """Reset the address book from the voting config (every member
+        except this node). Non-voting catch-up peers are re-added by
+        the leader when it drives an add; a plain restart never
+        resurrects a removed server from a stale --peers list."""
+        self.peers = {mid: addr for mid, addr in self.config.items()
+                      if mid != self.id and addr is not None}
+
+    def _apply_config_entry(self, command: dict) -> None:
+        """Apply one committed membership command to the config. Lock
+        held. Called from _apply_committed instead of the KV state
+        machine: membership is Raft state, not key-value data."""
+        op = command.get("op")
+        server_id = command.get("server_id")
+        if op == "add_server":
+            addr = command.get("addr")
+            self.config[server_id] = tuple(addr) if addr else None
+            if server_id != self.id and addr is not None:
+                self.peers[server_id] = tuple(addr)
+            self._non_voting.discard(server_id)
+        elif op == "remove_server":
+            self.config.pop(server_id, None)
+            self._non_voting.discard(server_id)
+            if server_id == self.id:
+                # This node was removed: stop participating at once. It
+                # keeps its server socket (a status query still answers)
+                # but it will not vote, run for election, or serve
+                # client requests, and a leader that removed itself
+                # steps down here — the removal entry is committed, so
+                # the cluster has already agreed on it.
+                self.role = "follower"
+                self.leader_id = None
+                self._fail_pending_reads()
+                self._reset_election_timer()
+            if self.role == "leader":
+                # This node is the leader and the removed server is
+                # someone else: keep replicating to it until its commit
+                # index reaches this entry (see _apply_append_reply),
+                # so it actually learns it was removed. Dropping it
+                # from self.peers here would cut off the heartbeats
+                # that carry the commit index, and the removed server
+                # would election-time-out forever. It is already out of
+                # self.config, so it cannot vote or count toward a
+                # majority in the meantime. self.last_applied is this
+                # entry's index: _apply_committed increments it before
+                # calling here.
+                self._removal_pending[server_id] = self.last_applied
+            else:
+                # Follower (or a node that just stepped down): it does
+                # not replicate, so the peer can leave the address book
+                # and the leader-state tables at once.
+                self.peers.pop(server_id, None)
+                for table in (self.next_index, self.match_index):
+                    table.pop(server_id, None)
+                self._in_flight.pop(server_id, None)
+                self._next_to_send.pop(server_id, None)
+                self._pipeline_epoch.pop(server_id, None)
+                self._pipeline_acks.pop(server_id, None)
+                self._max_in_flight.pop(server_id, None)
+                self._peer_retry_after.pop(server_id, None)
+                self._pipeline_failures.pop(server_id, None)
+                self._replicating.discard(server_id)
+
+    def _has_uncommitted_config_entry(self) -> bool:
+        """True if the log holds a membership entry past the commit
+        index. Lock held. Used alongside the in-flight flag so a new
+        leader that inherited an uncommitted config entry still
+        enforces one change at a time."""
+        return any(
+            entry["index"] > self.commit_index
+            and entry["command"].get("op") in ("add_server", "remove_server")
+            for entry in self.log
+        )
+
+    def _membership_change_in_progress(self) -> bool:
+        """True while a membership change is being driven or sits
+        uncommitted in the log. Lock held. A flag whose entry has
+        since committed is stale — the change is done, so clear it
+        and let the next change through."""
+        flag = self._membership_change
+        if flag is not None:
+            idx = flag.get("index")
+            if idx is None or idx > self.commit_index:
+                return True
+            self._membership_change = None
+        return self._has_uncommitted_config_entry()
+
+    def _init_peer_state(self, peer: str, next_index: int) -> None:
+        """(Re)initialize all per-peer leader state for ``peer``. Lock
+        held. Used by _become_leader for the whole cluster and when a
+        server is added mid-term: the new peer starts with next_index 1
+        so the leader replicates the whole log to it (or sends it a
+        snapshot if the prefix is already compacted), instead of
+        assuming — as for an established follower — that it is caught
+        up to the log end."""
+        self.next_index[peer] = next_index
+        self.match_index[peer] = 0
+        self._in_flight[peer] = {}
+        self._next_to_send[peer] = next_index
+        self._pipeline_epoch[peer] = 0
+        self._pipeline_acks[peer] = 0
+        self._max_in_flight[peer] = 0
+        self._peer_retry_after[peer] = 0.0
+        self._pipeline_failures[peer] = 0
+        self._replicating.discard(peer)
+
+    # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
     def start(self, host: str, port: int) -> None:
@@ -328,6 +527,13 @@ class RaftNode:
             if self._running:
                 return
             self._running = True
+            # Record our own address in the config so the other members
+            # learn it from the log/snapshot, and so a restart on the
+            # same port keeps a config that names us correctly.
+            self._self_addr = (host, port)
+            if self.config.get(self.id) != (host, port):
+                self.config[self.id] = (host, port)
+                self._save_meta()
         self._server = serve_in_background(host, port, self.handle_rpc)
         self._timer_thread = threading.Thread(
             target=self._timer_loop, name=f"raft-timer-{self.id}", daemon=True
@@ -384,7 +590,10 @@ class RaftNode:
         return self.log[index - self.snapshot_index - 1]["term"]
 
     def _majority(self) -> int:
-        return (len(self.peers) + 1) // 2 + 1
+        """Majority of the *voting* config. A server being added does
+        not count until its config entry commits; a removed server
+        stops counting as soon as its removal commits."""
+        return len(self.config) // 2 + 1
 
     def _step_down(self, term: int) -> None:
         """Move to follower at a newer term. Lock held."""
@@ -409,7 +618,18 @@ class RaftNode:
         while self.last_applied < self.commit_index:
             self.last_applied += 1
             entry = self.log[self.last_applied - self.snapshot_index - 1]
-            self.sm.apply(entry["command"])
+            # Membership commands are Raft state, not key-value data:
+            # they update the config (and the address book) instead of
+            # the state machine. A "noop" entry (appended by a new
+            # leader to commit earlier terms) changes no state at all.
+            # Everything else applies to the KV store exactly as before.
+            op = entry["command"].get("op")
+            if op in ("add_server", "remove_server"):
+                self._apply_config_entry(entry["command"])
+            elif op == "noop":
+                pass
+            else:
+                self.sm.apply(entry["command"])
         self._save_meta()
         if (self.last_applied > self.snapshot_index
                 and len(self.log) > self.snapshot_threshold):
@@ -433,7 +653,12 @@ class RaftNode:
             if self._term_at(n) != self.current_term:
                 continue
             count = 1  # the leader itself has it
-            count += sum(1 for m in self.match_index.values() if m >= n)
+            # Only voting members count: a server being added may hold
+            # the entry too, but it is not a voter until its config
+            # entry commits, so its match_index must not advance the
+            # commit index.
+            count += sum(1 for pid, m in self.match_index.items()
+                         if m >= n and pid in self.config)
             if count >= self._majority():
                 self.commit_index = n
                 self._apply_committed()
@@ -469,6 +694,9 @@ class RaftNode:
                     "snapshot_index": self.snapshot_index,
                     "snapshot_term": self.snapshot_term,
                     "pending_reads": len(self._pending_reads),
+                    "config": sorted(self.config),
+                    "peers": sorted(self.peers),
+                    "removed": self._is_removed(),
                 }
         return {"type": "error", "error": f"unknown message type: {msg_type!r}"}
 
@@ -479,6 +707,10 @@ class RaftNode:
         term = int(msg["term"])
         candidate = msg["candidate_id"]
         with self.lock:
+            if self._is_removed():
+                # No longer a member: our vote must not count anywhere.
+                return {"type": "request_vote_response",
+                        "term": self.current_term, "vote_granted": False}
             if term < self.current_term:
                 return {"type": "request_vote_response",
                         "term": self.current_term, "vote_granted": False}
@@ -527,6 +759,9 @@ class RaftNode:
         term = int(msg["term"])
         candidate = msg["candidate_id"]
         with self.lock:
+            if self._is_removed():
+                return {"type": "request_pre_vote_response",
+                        "term": self.current_term, "pre_vote_granted": False}
             if term <= self.current_term:
                 return {"type": "request_pre_vote_response",
                         "term": self.current_term, "pre_vote_granted": False}
@@ -558,6 +793,12 @@ class RaftNode:
         entries = msg.get("entries") or []
         leader_commit = int(msg["leader_commit"])
         with self.lock:
+            if self._is_removed():
+                # No longer a member: do not accept log entries from a
+                # leader that has not learned of our removal yet.
+                return {"type": "append_entries_response",
+                        "term": self.current_term, "success": False,
+                        "match_index": self._last_log_index()}
             if term < self.current_term:
                 return {"type": "append_entries_response",
                         "term": self.current_term, "success": False,
@@ -619,6 +860,10 @@ class RaftNode:
 
             return {"type": "append_entries_response",
                     "term": self.current_term, "success": True,
+                    # The follower's commit index, so the leader can
+                    # tell when a removed peer has applied its own
+                    # removal entry (see _apply_append_reply).
+                    "commit_index": self.commit_index,
                     "match_index": self._last_log_index()}
 
     # ------------------------------------------------------------------
@@ -640,6 +885,10 @@ class RaftNode:
         last_included_term = int(msg["last_included_term"])
         data = msg.get("data") or {}
         with self.lock:
+            if self._is_removed():
+                return {"type": "install_snapshot_response",
+                        "term": self.current_term, "success": False,
+                        "match_index": self._last_log_index()}
             if term < self.current_term:
                 return {"type": "install_snapshot_response",
                         "term": self.current_term, "success": False,
@@ -669,6 +918,16 @@ class RaftNode:
             self.snapshot_index = last_included_index
             self.snapshot_term = last_included_term
             self.sm.load(data)
+            # The snapshot covers committed entries, so it covers
+            # committed config changes too: adopt the config it was
+            # written with (snapshots from before membership changes
+            # carry no "config" key and leave ours alone).
+            if msg.get("config") is not None:
+                self.config = {
+                    str(mid): (tuple(addr) if addr else None)
+                    for mid, addr in msg["config"]
+                }
+                self._rebuild_peers_from_config()
             self._write_snapshot_file()
             self._rewrite_log()
             self.commit_index = max(self.commit_index, last_included_index)
@@ -683,16 +942,184 @@ class RaftNode:
     # ------------------------------------------------------------------
     def _on_client(self, msg: dict) -> dict:
         op = msg.get("op")
+        if op in ("add_server", "remove_server"):
+            return self._on_membership_request(msg)
         key = msg.get("key")
         if op not in ("set", "get", "del") or key is None:
             return {"type": "client_response", "status": "error",
                     "error": "op must be set/get/del with a key"}
+        if self._is_removed():
+            return {"type": "client_response", "status": "error",
+                    "error": "this node was removed from the cluster"}
         if op == "get":
             return self._serve_read(key)
         command = {"op": op, "key": key}
         if op == "set":
             command["value"] = msg.get("value")
         return self._submit_write(command)
+
+    # ------------------------------------------------------------------
+    # Membership changes (Raft §6, single-server)
+    # ------------------------------------------------------------------
+    def _on_membership_request(self, msg: dict) -> dict:
+        """Handle a client add_server / remove_server request.
+
+        Only the leader drives a change, and only one change at a time
+        (see _membership_change_in_progress). An add first replicates
+        the log to the new server as a non-voting peer and waits for it
+        to catch up; only then is the config entry appended, so the
+        cluster's majority never depends on a server that does not
+        have the log yet. A remove appends the entry straight away; a
+        leader that removes itself steps down as soon as the entry
+        commits (in _apply_config_entry). Runs on a connection thread;
+        the catch-up and commit waits happen outside the lock.
+        """
+        op = msg.get("op")
+        server_id = msg.get("server_id")
+        if not server_id:
+            return {"type": "client_response", "status": "error",
+                    "error": "server_id is required"}
+        with self.lock:
+            if self._is_removed():
+                return {"type": "client_response", "status": "error",
+                        "error": "this node was removed from the cluster"}
+            if self.role != "leader":
+                return self._redirect()
+            if self._membership_change_in_progress():
+                return {"type": "client_response", "status": "error",
+                        "error": "a membership change is already in progress"}
+            if op == "add_server":
+                addr = msg.get("addr")
+                if not addr or len(addr) != 2:
+                    return {"type": "client_response", "status": "error",
+                            "error": "addr [host, port] is required"}
+                if server_id in self.config:
+                    return {"type": "client_response", "status": "error",
+                            "error": f"{server_id} is already a member"}
+                if any(a == (addr[0], int(addr[1]))
+                       for a in self.peers.values()) or (
+                        self._self_addr is not None
+                        and self._self_addr == (addr[0], int(addr[1]))):
+                    return {"type": "client_response", "status": "error",
+                            "error": f"address {addr} is already in use"}
+                self._membership_change = {
+                    "op": op, "server_id": server_id, "index": None}
+            else:  # remove_server
+                if server_id not in self.config:
+                    return {"type": "client_response", "status": "error",
+                            "error": f"{server_id} is not a member"}
+                if len(self.config) <= 1:
+                    return {"type": "client_response", "status": "error",
+                            "error": "cannot remove the last member"}
+                self._membership_change = {
+                    "op": op, "server_id": server_id, "index": None}
+        try:
+            if op == "add_server":
+                return self._add_server(server_id, (addr[0], int(addr[1])))
+            return self._remove_server(server_id)
+        finally:
+            with self.lock:
+                # The change is over (committed, timed out, or failed):
+                # clear the flag so the next change can start. The
+                # in-progress check also clears a flag whose entry has
+                # committed, so a stale flag can never wedge the
+                # cluster if this finally block is somehow skipped.
+                if (self._membership_change is not None
+                        and self._membership_change.get("server_id") == server_id
+                        and self._membership_change.get("op") == op):
+                    self._membership_change = None
+
+    def _add_server(self, server_id: str, addr: tuple[str, int]) -> dict:
+        """Add one server: catch it up as a non-voting peer, then commit
+        the config entry that makes it a voter. Caller holds no lock
+        (the flag is already set)."""
+        with self.lock:
+            target = self._last_log_index()
+            self.peers[server_id] = addr
+            self._non_voting.add(server_id)
+            self._init_peer_state(server_id, 1)
+        # Drive replication to the new peer right away instead of
+        # waiting for the next heartbeat; heartbeats keep driving it
+        # afterwards through _send_heartbeats.
+        threading.Thread(target=self._replicate_to_peer, args=(server_id,),
+                         daemon=True).start()
+        deadline = time.monotonic() + self.membership_catchup_timeout
+        while time.monotonic() < deadline:
+            with self.lock:
+                if self.role != "leader":
+                    self._drop_catchup_peer(server_id)
+                    return {"type": "client_response", "status": "error",
+                            "error": "lost leadership while adding server"}
+                if self.match_index.get(server_id, 0) >= target:
+                    break
+            time.sleep(0.02)
+        else:
+            with self.lock:
+                self._drop_catchup_peer(server_id)
+            return {"type": "client_response", "status": "error",
+                    "error": f"{server_id} did not catch up in time"}
+        command = {"op": "add_server", "server_id": server_id,
+                   "addr": [addr[0], addr[1]]}
+        return self._submit_config_entry(command)
+
+    def _drop_catchup_peer(self, server_id: str) -> None:
+        """Forget a server whose add failed before its config entry was
+        appended: it never became a member, so remove it from the
+        address book and the leader state. Lock held."""
+        self.peers.pop(server_id, None)
+        self._non_voting.discard(server_id)
+        for table in (self.next_index, self.match_index):
+            table.pop(server_id, None)
+        self._in_flight.pop(server_id, None)
+        self._next_to_send.pop(server_id, None)
+        self._pipeline_epoch.pop(server_id, None)
+        self._pipeline_acks.pop(server_id, None)
+        self._max_in_flight.pop(server_id, None)
+        self._peer_retry_after.pop(server_id, None)
+        self._pipeline_failures.pop(server_id, None)
+        self._replicating.discard(server_id)
+
+    def _remove_server(self, server_id: str) -> dict:
+        """Remove one server: append the config entry and wait for it to
+        commit. The entry is replicated to the removed server too (it
+        is still a peer until the entry is applied), so it learns of
+        its own removal and stops participating. Caller holds no lock."""
+        command = {"op": "remove_server", "server_id": server_id}
+        return self._submit_config_entry(command)
+
+    def _submit_config_entry(self, command: dict) -> dict:
+        """Append a membership command to the log, replicate it, wait
+        for commit — like _submit_write, except success is judged by
+        the commit alone: a leader that removes itself steps down as
+        soon as the entry commits, and that must still report success
+        to the client (the removal did happen)."""
+        with self.lock:
+            if self.role != "leader":
+                return self._redirect()
+            entry = {"term": self.current_term, "command": command}
+            index = self._append_entry(entry)
+            if self._membership_change is not None:
+                self._membership_change["index"] = index
+            peers = list(self.peers)
+
+        threads = [
+            threading.Thread(target=self._replicate_to_peer, args=(p,), daemon=True)
+            for p in peers
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=RPC_TIMEOUT * 4)
+
+        deadline = time.monotonic() + CLIENT_COMMIT_TIMEOUT
+        with self.commit_cond:
+            while self.commit_index < index:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return {"type": "client_response", "status": "timeout",
+                            "error": "membership change did not commit in time"}
+                self.commit_cond.wait(timeout=remaining)
+        return {"type": "client_response", "status": "ok"}
 
     def _redirect(self) -> dict:
         leader_id, addr = self.leader_info()
@@ -840,15 +1267,17 @@ class RaftNode:
         return {"type": "client_response", "status": "ok", "value": value}
 
     def _confirm_leadership(self, term: int) -> bool:
-        """Heartbeat round: succeed only if a majority acks in this term."""
+        """Heartbeat round: succeed only if a majority acks in this term.
+        Only voting members count — a server being added may ack too,
+        but it is not a voter until its config entry commits."""
         peers = list(self.peers)
-        acks: list[bool] = []
+        acks: dict[str, bool] = {}
         ack_lock = threading.Lock()
 
         def _ping(peer: str) -> None:
             ok = self._replicate_to_peer(peer)
             with ack_lock:
-                acks.append(ok)
+                acks[peer] = ok
 
         threads = [threading.Thread(target=_ping, args=(p,), daemon=True)
                    for p in peers]
@@ -859,7 +1288,9 @@ class RaftNode:
             t.join(timeout=max(0.0, deadline - time.monotonic()))
         with self.lock:
             still_leader = self.role == "leader" and self.current_term == term
-        return still_leader and (1 + sum(acks)) >= self._majority()
+            voting_acks = sum(1 for p, ok in acks.items()
+                              if ok and p in self.config)
+        return still_leader and (1 + voting_acks) >= self._majority()
 
     # ------------------------------------------------------------------
     # Leader replication
@@ -967,6 +1398,26 @@ class RaftNode:
             self._pipeline_acks[peer] = self._pipeline_acks.get(peer, 0) + 1
             self._pipeline_failures[peer] = 0
             self._advance_commit()
+            # A removed peer just reported a commit index at or past
+            # its removal entry: it has applied the removal, so it
+            # knows it is out. Stop replicating to it now — keeping it
+            # in self.peers past this point would mean heartbeating a
+            # server that refuses every AppendEntries.
+            pending = self._removal_pending.get(peer)
+            if (pending is not None
+                    and int(resp.get("commit_index", 0)) >= pending):
+                del self._removal_pending[peer]
+                self.peers.pop(peer, None)
+                for table in (self.next_index, self.match_index):
+                    table.pop(peer, None)
+                self._in_flight.pop(peer, None)
+                self._next_to_send.pop(peer, None)
+                self._pipeline_epoch.pop(peer, None)
+                self._pipeline_acks.pop(peer, None)
+                self._max_in_flight.pop(peer, None)
+                self._peer_retry_after.pop(peer, None)
+                self._pipeline_failures.pop(peer, None)
+                self._replicating.discard(peer)
             return
         # Log mismatch: back up and retry from the follower's hint.
         # Bump the epoch and clear the window — every other batch in
@@ -986,7 +1437,10 @@ class RaftNode:
         """Send one pipelined AppendEntries batch and apply its reply.
         Runs on its own thread; network I/O outside the lock, the
         reply applied under it by _apply_append_reply."""
-        host, port = self.peers[peer]
+        addr = self.peers.get(peer)
+        if addr is None:
+            return  # Peer was removed while this batch was in flight.
+        host, port = addr
         resp = send_rpc(host, port, msg, timeout=RPC_TIMEOUT)
         with self.lock:
             self._apply_append_reply(peer, resp, prev, end, start, epoch)
@@ -1057,7 +1511,10 @@ class RaftNode:
         peer that has been dead for a while fails fast on the first
         fresh attempt instead of paying five more rounds.
         """
-        host, port = self.peers[peer]
+        addr = self.peers.get(peer)
+        if addr is None:
+            return False  # Peer was removed while this call was queued.
+        host, port = addr
         deadline = time.monotonic() + RPC_TIMEOUT * 4
         tried_this_call = False
         while time.monotonic() < deadline:
@@ -1134,9 +1591,20 @@ class RaftNode:
                             next_to_send += count
                         self._next_to_send[peer] = next_to_send
                     # Caught up and the window is empty: one empty
-                    # AppendEntries as the heartbeat.
-                    if (not in_flight and next_to_send > last
-                            and self.match_index.get(peer, 0) >= last):
+                    # AppendEntries as the heartbeat. There is nothing
+                    # left to send (next_to_send is past the log end),
+                    # so the peer is caught up as far as this leader
+                    # knows — send the heartbeat even if match_index is
+                    # still 0. A leader elected with a non-empty log
+                    # starts with match_index 0 for every peer, and
+                    # requiring match_index >= last here meant it never
+                    # sent anything at all until a write arrived: the
+                    # followers heard nothing, timed out, and elected a
+                    # new leader with the same problem, forever. The
+                    # heartbeat is what keeps followers from timing
+                    # out, so it must not depend on an ack that can
+                    # only arrive after a heartbeat.
+                    if not in_flight and next_to_send > last:
                         msg = self._build_append_entries(
                             peer, start_index=last + 1, max_entries=0)
                         if msg is not None:
@@ -1171,7 +1639,10 @@ class RaftNode:
         """Send this node's snapshot to a lagging peer. Network I/O
         happens outside the lock; the reply is applied under it.
         Returns True if the peer installed the snapshot in our term."""
-        host, port = self.peers[peer]
+        addr = self.peers.get(peer)
+        if addr is None:
+            return False  # Peer was removed while this call was queued.
+        host, port = addr
         with self.lock:
             if self.role != "leader":
                 return False
@@ -1182,6 +1653,7 @@ class RaftNode:
                 "last_included_index": self.snapshot_index,
                 "last_included_term": self.snapshot_term,
                 "data": self.sm.items(),
+                "config": self._config_list(),
             }
         resp = send_rpc(host, port, msg, timeout=RPC_TIMEOUT)
         with self.lock:
@@ -1209,17 +1681,41 @@ class RaftNode:
             self.role = "leader"
             self.leader_id = self.id
             last = self._last_log_index()
-            self.next_index = {p: last + 1 for p in self.peers}
-            self.match_index = {p: 0 for p in self.peers}
+            self.next_index = {}
+            self.match_index = {}
             # Fresh pipeline state for this term: no batches in flight,
             # nothing dispatched yet, no acks counted, no backoff.
-            self._in_flight = {p: {} for p in self.peers}
-            self._next_to_send = {p: last + 1 for p in self.peers}
-            self._pipeline_epoch = {p: 0 for p in self.peers}
-            self._pipeline_acks = {p: 0 for p in self.peers}
-            self._max_in_flight = {p: 0 for p in self.peers}
-            self._peer_retry_after = {p: 0.0 for p in self.peers}
-            self._pipeline_failures = {p: 0 for p in self.peers}
+            # Established followers start at last+1 (assumed caught up);
+            # a non-voting server still catching up keeps the state it
+            # already has instead of being reset.
+            self._in_flight = {}
+            self._next_to_send = {}
+            self._pipeline_epoch = {}
+            self._pipeline_acks = {}
+            self._max_in_flight = {}
+            self._peer_retry_after = {}
+            self._pipeline_failures = {}
+            for p in self.peers:
+                if p in self._non_voting:
+                    # A server still catching up for an add starts from
+                    # index 1, so the whole log is replicated to it
+                    # (or a snapshot, if the prefix is compacted) —
+                    # unlike an established follower, it is not assumed
+                    # caught up to the log end.
+                    self._init_peer_state(p, 1)
+                else:
+                    self._init_peer_state(p, last + 1)
+            # Append a no-op entry in this term. The commit rule only
+            # counts current-term entries (Raft section 5.4.2), so
+            # without one, committed entries from earlier terms would
+            # sit unapplied — and invisible to reads — until the next
+            # client write arrived. The no-op commits as soon as a
+            # majority acks it, and committing it transitively commits
+            # everything before it. It changes no state: _apply_committed
+            # skips it. (next_index was set from the pre-append last, so
+            # the no-op is exactly the one entry left to dispatch.)
+            self._append_entry({"term": self.current_term,
+                                "command": {"op": "noop"}})
         # Assert leadership immediately so followers learn about it and
         # the commit index starts flowing.
         self._send_heartbeats()
@@ -1260,15 +1756,22 @@ class RaftNode:
         grants: set[str] = {self.id}
         grant_lock = threading.Lock()
         max_term = [term_before]
+        with self.lock:
+            voters = set(self.config)
 
         def _ask(peer: str) -> None:
-            host, port = self.peers[peer]
+            addr = self.peers.get(peer)
+            if addr is None:
+                return  # Peer was removed while this round was running.
+            host, port = addr
             resp = send_rpc(host, port, msg, timeout=RPC_TIMEOUT)
             if resp is None:
                 return
             with grant_lock:
                 max_term[0] = max(max_term[0], int(resp.get("term", 0)))
-                if resp.get("pre_vote_granted"):
+                # Only a voting member's grant counts: a server being
+                # added may answer, but it is not a voter yet.
+                if resp.get("pre_vote_granted") and peer in voters:
                     grants.add(peer)
 
         threads = [threading.Thread(target=_ask, args=(p,), daemon=True)
@@ -1297,13 +1800,15 @@ class RaftNode:
             if (
                 not granted
                 or self.role == "leader"
+                or self._is_removed()
                 or self.current_term != term_before
                 or self._last_heartbeat != heartbeat_mark
             ):
                 # No mandate, or something changed while we asked: a
                 # leader contacted us, we stepped down to a newer term,
-                # or we granted a vote. Back off and try again after a
-                # fresh randomized timeout instead of spinning.
+                # we were removed from the cluster, or we granted a
+                # vote. Back off and try again after a fresh randomized
+                # timeout instead of spinning.
                 self._reset_election_timer()
                 return
             self.current_term += 1
@@ -1325,11 +1830,16 @@ class RaftNode:
         }
 
         def _ask(peer: str) -> None:
-            host, port = self.peers[peer]
+            addr = self.peers.get(peer)
+            if addr is None:
+                return  # Peer was removed while this round was running.
+            host, port = addr
             resp = send_rpc(host, port, msg, timeout=RPC_TIMEOUT)
             if resp and resp.get("vote_granted") and int(resp.get("term", 0)) == term:
                 with self.lock:
-                    self.votes.add(peer)
+                    # Only a voting member's vote counts.
+                    if peer in self.config:
+                        self.votes.add(peer)
 
         threads = [threading.Thread(target=_ask, args=(p,), daemon=True)
                    for p in self.peers]
@@ -1357,15 +1867,25 @@ class RaftNode:
             with self.lock:
                 if not self._running:
                     return
-                role = self.role
-                now = time.monotonic()
-                timed_out = now - self._last_heartbeat > self._election_timeout
-                heartbeat_due = (
-                    role == "leader"
-                    and now - self._last_heartbeat_sent >= HEARTBEAT_INTERVAL
-                )
-                if heartbeat_due:
-                    self._last_heartbeat_sent = now
+                if self._is_removed():
+                    # Removed from the cluster: never run for election
+                    # or send heartbeats again. The loop keeps polling
+                    # so a (hypothetical) re-add could resume it, but
+                    # nothing in this node drives that — rejoining goes
+                    # through a fresh add_server.
+                    role = "follower"
+                    timed_out = False
+                    heartbeat_due = False
+                else:
+                    role = self.role
+                    now = time.monotonic()
+                    timed_out = now - self._last_heartbeat > self._election_timeout
+                    heartbeat_due = (
+                        role == "leader"
+                        and now - self._last_heartbeat_sent >= HEARTBEAT_INTERVAL
+                    )
+                    if heartbeat_due:
+                        self._last_heartbeat_sent = now
             if role == "leader" and heartbeat_due:
                 self._send_heartbeats()
             elif role != "leader" and timed_out:

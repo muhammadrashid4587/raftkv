@@ -123,11 +123,13 @@ class TestSnapshotting(unittest.TestCase):
             self.assertEqual(node.sm.items(),
                              {f"s{i}": f"v{i}" for i in range(12)})
             self.assertGreater(node.snapshot_index, 0)
-            # All 12 committed entries are applied: the snapshot covers
-            # the first 10 and the remaining 2 replay from the log.
-            self.assertEqual(node.last_applied, 12)
-            self.assertEqual(node.commit_index, 12)
-            self.assertLess(len(node.log), 12)
+            # All committed entries are applied: the 12 writes plus
+            # the leader's no-op entry on election (13 total). The
+            # snapshot covers the early prefix and the tail replays
+            # from the log.
+            self.assertEqual(node.last_applied, 13)
+            self.assertEqual(node.commit_index, 13)
+            self.assertLess(len(node.log), 13)
         finally:
             cluster.stop_all()
 

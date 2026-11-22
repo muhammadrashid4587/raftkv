@@ -23,10 +23,12 @@ class Cluster:
 
     def __init__(self, n: int = 3, base_dir: str | None = None,
                  snapshot_threshold: int = 1000,
-                 pipeline_window: int = 10):
+                 pipeline_window: int = 10,
+                 membership_catchup_timeout: float = 5.0):
         self.n = n
         self.snapshot_threshold = snapshot_threshold
         self.pipeline_window = pipeline_window
+        self.membership_catchup_timeout = membership_catchup_timeout
         self.tmp = tempfile.TemporaryDirectory(prefix="raftkv-test-")
         self.base = Path(base_dir) if base_dir else Path(self.tmp.name)
         self.nodes: dict[str, RaftNode] = {}
@@ -39,7 +41,8 @@ class Cluster:
             data_dir = self.base / node_id
             node = RaftNode(node_id, peers, data_dir, KVStore(),
                             snapshot_threshold=snapshot_threshold,
-                            pipeline_window=pipeline_window)
+                            pipeline_window=pipeline_window,
+                            membership_catchup_timeout=membership_catchup_timeout)
             self.nodes[node_id] = node
             self.addrs[node_id] = ("127.0.0.1", ports[node_id])
 
@@ -64,12 +67,49 @@ class Cluster:
         peers = {p: self.addrs[p] for p in self.nodes if p != node_id}
         node = RaftNode(node_id, peers, self.base / node_id, KVStore(),
                         snapshot_threshold=self.snapshot_threshold,
-                        pipeline_window=self.pipeline_window)
+                        pipeline_window=self.pipeline_window,
+                        membership_catchup_timeout=self.membership_catchup_timeout)
         self.nodes[node_id] = node
         host, port = self.addrs[node_id]
         node.start(host, port)
         self.live.add(node_id)
         return node
+
+    def add_node(self, node_id: str,
+                 membership_catchup_timeout: float | None = None) -> RaftNode:
+        """Start a brand-new node that is not yet a member of the
+        cluster, with the current nodes as its peers. It sits idle
+        (pre-vote refuses it while the cluster has a live leader)
+        until the leader adds it with an add_server client request."""
+        port = free_port()
+        peers = {p: self.addrs[p] for p in self.nodes}
+        kwargs: dict = {"snapshot_threshold": self.snapshot_threshold,
+                        "pipeline_window": self.pipeline_window}
+        if membership_catchup_timeout is not None:
+            kwargs["membership_catchup_timeout"] = membership_catchup_timeout
+        node = RaftNode(node_id, peers, self.base / node_id, KVStore(), **kwargs)
+        self.nodes[node_id] = node
+        self.addrs[node_id] = ("127.0.0.1", port)
+        node.start("127.0.0.1", port)
+        self.live.add(node_id)
+        return node
+
+    def status(self, node_id: str) -> dict:
+        """Ask one node for its status RPC (role, term, config, ...)."""
+        host, port = self.addrs[node_id]
+        return send_rpc(host, port, {"type": "status"},
+                        timeout=2.0) or {}
+
+    def wait_for_config(self, node_id: str, members: list[str],
+                        timeout: float = 5.0) -> bool:
+        """Poll a node's status until its voting config is ``members``."""
+        deadline = time.monotonic() + timeout
+        want = sorted(members)
+        while time.monotonic() < deadline:
+            if sorted(self.status(node_id).get("config", [])) == want:
+                return True
+            time.sleep(0.05)
+        return False
 
     def wait_for_leader(self, timeout: float = 10.0) -> RaftNode:
         deadline = time.monotonic() + timeout
@@ -83,6 +123,46 @@ class Cluster:
             f"no single leader after {timeout}s: "
             + ", ".join(f"{i}={n.role}" for i, n in self.nodes.items())
         )
+
+    def wait_for_stable_leader(self, stable_for: float = 0.5,
+                               timeout: float = 10.0) -> RaftNode:
+        """Like wait_for_leader, but only returns once the same node has
+        been the single leader for ``stable_for`` seconds. After rapid
+        restarts the cluster churns through elections (a candidate that
+        already bumped its term can still depose the leader
+        wait_for_leader just saw), so a single sighting is not enough
+        to know the cluster has settled."""
+        deadline = time.monotonic() + timeout
+        seen_id: str | None = None
+        seen_since = time.monotonic()
+        while time.monotonic() < deadline:
+            leaders = [self.nodes[i] for i in self.live
+                       if self.nodes[i].is_leader]
+            if len(leaders) == 1 and leaders[0].id == seen_id:
+                if time.monotonic() - seen_since >= stable_for:
+                    return leaders[0]
+            elif len(leaders) == 1:
+                seen_id = leaders[0].id
+                seen_since = time.monotonic()
+            else:
+                seen_id = None
+            time.sleep(0.05)
+        raise AssertionError(
+            f"no stable leader after {timeout}s: "
+            + ", ".join(f"{i}={n.role}" for i, n in self.nodes.items())
+        )
+
+    def wait_for_removed(self, node_id: str, timeout: float = 5.0) -> bool:
+        """Poll a node's status until it reports removed=True. A
+        removed follower only learns of its removal on the next
+        heartbeat carrying the new commit index, so the flag lags the
+        leader's ok by a heartbeat or two."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.status(node_id).get("removed"):
+                return True
+            time.sleep(0.05)
+        return False
 
     def leader(self) -> RaftNode | None:
         leaders = [self.nodes[i] for i in self.live if self.nodes[i].is_leader]

@@ -50,10 +50,25 @@ def main(argv: list[str] | None = None) -> int:
     p_get.add_argument("key")
     p_del = sub.add_parser("del")
     p_del.add_argument("key")
+    p_add = sub.add_parser("add-server",
+                           help="add a server to the cluster (Raft §6)")
+    p_add.add_argument("server_id")
+    p_add.add_argument("addr", help="the new server as host:port")
+    p_remove = sub.add_parser("remove-server",
+                              help="remove a server from the cluster")
+    p_remove.add_argument("server_id")
     args = parser.parse_args(argv)
 
     host, _, port = args.node.rpartition(":")
-    msg: dict = {"type": "client", "op": args.op, "key": args.key}
+    msg: dict = {"type": "client", "op": args.op}
+    if args.op in ("set", "get", "del"):
+        msg["key"] = args.key
+    elif args.op == "add_server":
+        msg["server_id"] = args.server_id
+        ahost, _, aport = args.addr.rpartition(":")
+        msg["addr"] = [ahost, int(aport)]
+    elif args.op == "remove_server":
+        msg["server_id"] = args.server_id
     if args.op == "set":
         msg["value"] = args.value
     resp = request((host, int(port)), msg, timeout=args.timeout)

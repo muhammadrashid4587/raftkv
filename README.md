@@ -49,6 +49,16 @@ logic and the failure handling, not the key-value API on top.
   current-term entries advance the commit index. A five-timeout
   failure budget keeps a dead peer from stalling writes, and at most
   one replication driver runs per peer.
+- **Membership changes** — a client can add or remove a server while
+  the cluster is live (`python3 -m raftkv.client add-server node4
+  127.0.0.1:5004`, `remove-server node4`). Single-server changes, one
+  at a time (Raft dissertation §6): the change is a log entry, the
+  config is persisted with it, a new server replicates the whole log
+  via AppendEntries/InstallSnapshot before it starts voting, and a
+  removed server stops participating. A leader that removes itself
+  steps down. The leader keeps replicating to a removed server until
+  that server's commit index reaches the removal entry, so the removed
+  server actually learns it was removed instead of timing out forever.
 - **Leader redirects** — a write or read sent to a follower returns the
   current leader's address; the client follows it automatically.
 - **Real failure handling** — tested end to end: kill the leader, the
@@ -85,7 +95,7 @@ make test
 # or: python3 -m unittest discover -s tests -v
 ```
 
-30 tests, all passing:
+38 tests, all passing:
 
 | Test | What it proves |
 |---|---|
@@ -119,6 +129,14 @@ make test
 | `test_pipeline_window_bounds_in_flight_batches` | Catching up 200 entries has >1 batch in flight at once and never more than the window (10) |
 | `test_pipeline_window_one_is_sequential` | With window=1 at most one batch is ever in flight and replication is still correct |
 | `test_lagging_follower_catches_up_quickly` | 200 entries to a down follower replicate and apply well inside 5s |
+| `test_add_fourth_node_catches_up_and_serves_reads` | A 4th node added to a live cluster catches up and serves reads |
+| `test_add_server_already_a_member_is_rejected` | Adding a server that is already a member is rejected |
+| `test_remove_node_cluster_keeps_working` | Removing a node leaves a working 2-node cluster; the removed node stops participating |
+| `test_remove_leader_triggers_new_election` | Removing the leader triggers a new election and writes continue |
+| `test_add_then_remove_keeps_three_nodes_and_survives_leader_loss` | Add then remove keeps 3 nodes and survives losing the leader afterwards |
+| `test_remove_unknown_server_is_rejected` | Removing a server that is not a member is rejected |
+| `test_concurrent_membership_changes_rejected` | Two concurrent membership changes are rejected/serialized, and the cluster is not wedged afterwards |
+| `test_membership_survives_restart` | Membership persists across restarts of every node; the 4-node cluster keeps serving |
 
 Tests use real nodes (real TCP, real threads, real disk) on localhost —
 no mocks of the consensus path.
@@ -158,6 +176,7 @@ tests/
   test_raft.py       Election, replication, redirects, persistence
   test_integration.py  Leader-kill failover scenario
   test_readindex.py    ReadIndex reads, pending-read registry, deposed leader
+  test_membership.py   Add/remove server, serialization, persistence
 ```
 
 **Threading.** One TCP server thread (a thread per connection), one
@@ -210,7 +229,19 @@ entries left in `log.jsonl` are dropped by their index on reload.
   from its *own* term, counting replicas — never for old-term entries
   alone. Committing a current-term entry transitively commits
   everything before it. This is the subtle rule that keeps Raft safe
-  across elections.
+  across elections. A new leader therefore appends a **no-op entry in
+  its own term** on election: it commits as soon as a majority acks
+  it, which commits the whole prefix — without it, committed entries
+  from earlier terms would sit unapplied (and invisible to reads)
+  until the next client write arrived.
+- **Heartbeat liveness.** The replication driver sends an empty
+  AppendEntries as the heartbeat whenever the window is empty and
+  there is nothing left to send — it must not depend on the peer's
+  `match_index`, which starts at 0 for a fresh leader. Requiring an
+  ack before the first heartbeat meant a leader elected with a
+  non-empty log never sent anything at all until a write arrived, and
+  the followers timed out and elected a new leader with the same
+  problem, forever.
 - **Log conflict handling.** On a mismatched `prev_log_index/term` the
   follower rejects and the leader backs `next_index` down and retries,
   so a new leader brings stale followers up to date instead of
@@ -224,6 +255,19 @@ entries left in `log.jsonl` are dropped by their index on reload.
   grants and failed attempts too, so reusing it for the voter rule
   would make nodes that just attempted an election keep rejecting
   each other, and a fresh cluster could never elect a leader at all.
+- **Membership changes.** Single-server changes, one at a time, no
+  joint consensus — old and new majorities overlap by one server, so
+  two leaders in the same term are impossible. The config lives in
+  the log (and in `meta.json` / `snapshot.json`), so a restart never
+  resurrects a removed server or forgets an added one. A new server
+  is added to the address book as non-voting first and only joins
+  the config once its config entry commits, after it has caught up.
+  A removed server is dropped from the config at once (so it cannot
+  vote or count toward a majority), but the leader keeps replicating
+  to it until its commit index reaches the removal entry — the
+  AppendEntries response carries the follower's commit index for
+  exactly that check. Removing the last member and removing a server
+  that is not a member are both rejected.
 - **No dependencies.** Pure stdlib: `socket`, `threading`, `json`,
   `socketserver`. Nothing to install, nothing to break.
 
@@ -233,7 +277,13 @@ entries left in `log.jsonl` are dropped by their index on reload.
   KV state + last included index/term, truncate the log, InstallSnapshot
   RPC for lagging followers, automatic compaction past 1000 entries,
   snapshot loading on restart.
-- Membership changes (joint consensus) for adding/removing nodes.
+- ~~Membership changes~~ — done in v0.6.0: single-server add/remove
+  as log entries (one change at a time, no joint consensus), config
+  persisted in the log/meta/snapshot, new servers catch up before
+  voting, removed servers stop participating, a leader that removes
+  itself steps down; plus the two liveness fixes the work exposed —
+  a no-op entry on election so prior-term entries commit, and a
+  heartbeat that does not wait for an ack first.
 - Pre-vote to avoid disruptive re-elections when a partitioned node
   rejoins with a stale-but-high term — done in v0.3.0: RequestPreVote
   round before every election, voters refuse when they are the leader
