@@ -46,10 +46,19 @@ def main(argv: list[str] | None = None) -> int:
     p_set = sub.add_parser("set")
     p_set.add_argument("key")
     p_set.add_argument("value")
+    p_set.add_argument("--client-id", default=None,
+                       help="session id for at-most-once writes: a retry "
+                            "with the same client id + request id returns "
+                            "the first attempt's result instead of writing "
+                            "twice")
+    p_set.add_argument("--request-id", default=None,
+                       help="id of this write within the client session")
     p_get = sub.add_parser("get")
     p_get.add_argument("key")
     p_del = sub.add_parser("del")
     p_del.add_argument("key")
+    p_del.add_argument("--client-id", default=None)
+    p_del.add_argument("--request-id", default=None)
     p_add = sub.add_parser("add-server",
                            help="add a server to the cluster (Raft §6)")
     p_add.add_argument("server_id")
@@ -71,6 +80,12 @@ def main(argv: list[str] | None = None) -> int:
         msg["server_id"] = args.server_id
     if args.op == "set":
         msg["value"] = args.value
+    if args.op in ("set", "del") and args.request_id:
+        # A request id without an explicit client id still dedups
+        # within the default "cli" session; the same id retried from
+        # another session is a different write.
+        msg["client_id"] = args.client_id or "cli"
+        msg["request_id"] = args.request_id
     resp = request((host, int(port)), msg, timeout=args.timeout)
     status = resp.get("status")
     if status == "ok":

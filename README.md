@@ -76,6 +76,17 @@ logic and the failure handling, not the key-value API on top.
   server actually learns it was removed instead of timing out forever.
 - **Leader redirects** — a write or read sent to a follower returns the
   current leader's address; the client follows it automatically.
+- **Client session deduplication** — a write may carry a
+  `(client_id, request_id)` session id (`--client-id` / `--request-id`
+  on the CLI). The leader records the pair when the entry applies, and
+  a retry with the same pair — after a lost response, after a leader
+  change, or while the first attempt is still in flight — returns the
+  first attempt's result instead of appending a second log entry, so
+  clients get at-most-once writes. The table is derived from the
+  applied log, so a new leader rebuilds it by replay and a snapshot
+  carries it; it is bounded (10,000 entries, oldest evicted first)
+  and deterministic, so every node's table stays identical. Writes
+  without a session id behave exactly as before.
 - **Real failure handling** — tested end to end: kill the leader, the
   cluster re-elects, writes continue, the old leader rejoins and
   catches up instead of forking.
@@ -110,7 +121,7 @@ make test
 # or: python3 -m unittest discover -s tests -v
 ```
 
-48 tests, plus a smoke test for the benchmark script, all passing:
+54 tests, plus a smoke test for the benchmark script, all passing:
 
 | Test | What it proves |
 |---|---|
@@ -158,6 +169,12 @@ make test
 | `test_lease_expires_without_majority_acks` | With both followers down the lease goes stale, the read falls back to a round and errors instead of serving unconfirmed |
 | `test_step_down_clears_lease` | Stepping down clears the ack record, so a deposed leader holds no lease |
 | `test_lease_counts_only_voting_members` | Only voting members' acks extend the lease; a non-voter's fresh ack does not help |
+| `test_retry_with_same_request_id_appends_once` | A retried write returns ok and appends no second log entry |
+| `test_concurrent_duplicate_writes_append_once` | Five identical concurrent writes produce exactly one log entry |
+| `test_different_request_ids_are_distinct_writes` | Different request ids are distinct writes |
+| `test_retry_after_leader_change_is_deduped` | A retry after killing the leader is still deduped by the new leader |
+| `test_dedup_survives_snapshot_and_restart` | Dedup survives log compaction and a leader restart via the snapshot |
+| `test_delete_with_request_id_is_deduped` | Deletes dedup like sets |
 
 Tests use real nodes (real TCP, real threads, real disk) on localhost —
 no mocks of the consensus path.
@@ -213,6 +230,7 @@ tests/
   test_integration.py  Leader-kill failover scenario
   test_readindex.py    ReadIndex reads, pending-read registry, deposed leader
   test_membership.py   Add/remove server, serialization, persistence
+  test_dedup.py        Client session deduplication
 ```
 
 **Threading.** One TCP server thread (a thread per connection), one
@@ -235,7 +253,9 @@ network.
 - `snapshot.json` — `{"last_included_index": n, "last_included_term": t,
   "state": {...}}`, the state machine as of index `n`, written
   atomically (tmp file + rename) when the log is compacted or a
-  snapshot is installed. The in-memory log holds only entries after
+  snapshot is installed. It also carries the voting config and the
+  client-dedup keys covered by the compacted prefix, so neither is
+  lost to compaction. The in-memory log holds only entries after
   the snapshot.
 
 On restart the node loads its snapshot into the state machine, then
@@ -312,6 +332,22 @@ entries left in `log.jsonl` are dropped by their index on reload.
   AppendEntries response carries the follower's commit index for
   exactly that check. Removing the last member and removing a server
   that is not a member are both rejected.
+- **Client session deduplication.** The dedup table is derived from
+  the applied log, not from leader memory: the `(client_id,
+  request_id)` pair rides in the log entry and is recorded when the
+  entry applies, so a new leader rebuilds the table by replay and a
+  snapshot carries it — a retry after a leader change dedups exactly
+  like one on the same leader. The in-flight half is the subtle part:
+  a write that is appended but not yet committed registers its pair
+  in `_dedup_inflight`, so a retry arriving before the first attempt
+  commits joins the same waiter instead of appending a second entry.
+  The inflight claim is dropped only when the waiter is woken, and by
+  then the entry is committed (so the dedup table already holds it —
+  apply runs before the commit notification) or the batch failed (so
+  nothing was appended). A retry that arrives after a client-side
+  timeout but before commit therefore still dedups, and one that
+  arrives after a failed attempt appends fresh, which is correct: the
+  first write never took effect.
 - **No dependencies.** Pure stdlib: `socket`, `threading`, `json`,
   `socketserver`. Nothing to install, nothing to break.
 
@@ -360,3 +396,13 @@ entries left in `log.jsonl` are dropped by their index on reload.
   stale lease falls back to the ReadIndex round, step-down clears
   the lease, only voting members' acks count. Sequential reads went
   from ~250-730 to ~1300-3500 ops/s.
+- ~~Client session deduplication for at-most-once writes~~ — done in
+  v0.9.0, Nov 22, 2026: a write carrying a `(client_id, request_id)`
+  session id is recorded when it applies, and a retry with the same
+  pair returns the cached result instead of appending a second log
+  entry — after a lost response, after a leader change (the new
+  leader rebuilds the table by replay), or while the first attempt
+  is still in flight (the retry joins its waiter). The table is
+  bounded at 10,000 entries with deterministic oldest-first eviction
+  and is carried in snapshots, so compaction and restart do not lose
+  it. The CLI takes `--client-id` / `--request-id` on `set`/`del`.

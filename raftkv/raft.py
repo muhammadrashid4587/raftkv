@@ -29,7 +29,9 @@ Per node, in ``data_dir``:
 - ``snapshot.json`` — {"last_included_index": n, "last_included_term": t,
   "state": {...}}, the compacted state machine as of index n, written
   atomically. The in-memory log holds only entries *after* the
-  snapshot; global index of log[k] is snapshot_index + k + 1.
+  snapshot; global index of log[k] is snapshot_index + k + 1. The
+  snapshot also carries the voting config and the client-dedup keys
+  covered by the compacted prefix, so neither is lost to compaction.
 
 On restart the node loads the snapshot into the state machine, then
 replays the remaining committed log entries, so it rejoins with the
@@ -95,6 +97,23 @@ MEMBERSHIP_CATCHUP_TIMEOUT = 5.0
 # that a lone sequential write barely notices it — it pays one window
 # instead of one fsync per write either way.
 GROUP_COMMIT_WINDOW = 0.002
+# Client session deduplication (at-most-once writes): how many applied
+# (client_id, request_id) pairs the dedup table keeps. 10000 is far
+# above what a retry window needs, and evicting the oldest is
+# deterministic — every node applies the same log in the same order,
+# so every node's table stays identical.
+DEDUP_MAX_ENTRIES = 10000
+
+
+def _dedup_key(command: dict) -> tuple[str, str] | None:
+    """The dedup key for a client write command, or None when the
+    client sent no session id (old clients, and internal entries like
+    no-ops and membership changes, are never deduplicated)."""
+    client_id = command.get("client_id")
+    request_id = command.get("request_id")
+    if client_id is None or request_id is None:
+        return None
+    return (str(client_id), str(request_id))
 
 
 class RaftNode:
@@ -258,6 +277,19 @@ class RaftNode:
         # its flusher: it waits GROUP_COMMIT_WINDOW for joiners, then
         # appends the whole batch with a single fsync.
         self._write_batch: list[dict] | None = None
+        # Client session deduplication (at-most-once writes): applied
+        # (client_id, request_id) -> cached {"status": "ok"} result.
+        # A retry of a write whose response was lost returns the cached
+        # result instead of appending a second log entry. The table is
+        # derived from the applied log (see _apply_committed), so a new
+        # leader rebuilds it by replay and a snapshot carries it (see
+        # _write_snapshot_file). Insertion-ordered and bounded (see
+        # DEDUP_MAX_ENTRIES). _dedup_inflight maps a key to the waiter
+        # of a write that is appended but not yet committed, so a retry
+        # arriving mid-commit joins the same waiter instead of
+        # appending a duplicate.
+        self._dedup: dict[tuple[str, str], dict] = {}
+        self._dedup_inflight: dict[tuple[str, str], dict] = {}
         self._running = False
         self._server = None
         self._timer_thread: threading.Thread | None = None
@@ -306,6 +338,14 @@ class RaftNode:
             self.snapshot_index = int(snap.get("last_included_index", 0))
             self.snapshot_term = int(snap.get("last_included_term", 0))
             self.sm.load(snap.get("state") or {})
+            # The dedup table for entries the snapshot covers: without
+            # it a retry of a compacted-away write would append a
+            # duplicate. The result is always ok once committed, so
+            # only the keys need storing, in insertion order.
+            self._dedup = {
+                (str(c), str(r)): {"type": "client_response", "status": "ok"}
+                for c, r in (snap.get("dedup") or [])
+            }
             # A snapshot only ever covers committed entries, so a config
             # entry compacted into it is committed state too: adopt the
             # config it was written with, unless meta.json (newer)
@@ -423,6 +463,7 @@ class RaftNode:
             "last_included_term": self.snapshot_term,
             "state": self.sm.items(),
             "config": self._config_list(),
+            "dedup": [[c, r] for (c, r) in self._dedup],
         }
         tmp = self._snapshot_path.with_suffix(".json.tmp")
         with open(tmp, "w", encoding="utf-8") as f:
@@ -683,6 +724,7 @@ class RaftNode:
                 pass
             else:
                 self.sm.apply(entry["command"])
+                self._record_dedup(entry["command"])
         self._save_meta()
         if (self.last_applied > self.snapshot_index
                 and len(self.log) > self.snapshot_threshold):
@@ -690,6 +732,27 @@ class RaftNode:
         # Applying advanced: any ReadIndex read waiting on an index now
         # covered by the state machine can be served.
         self._resolve_pending_reads()
+
+    def _record_dedup(self, command: dict) -> None:
+        """Record an applied client write in the dedup table. Lock held.
+        The result is always ok once committed, so only the key is
+        stored. Evicting the oldest entry when the table is full is
+        deterministic — every node applies the same log in the same
+        order, so every node's table stays identical."""
+        key = _dedup_key(command)
+        if key is None:
+            return
+        self._dedup[key] = {"type": "client_response", "status": "ok"}
+        while len(self._dedup) > DEDUP_MAX_ENTRIES:
+            self._dedup.pop(next(iter(self._dedup)))
+
+    def _clear_inflight(self, waiter: dict) -> None:
+        """Drop a waiter's dedup-inflight claim. Lock held. Only clears
+        it when it still points at this waiter — a retry that arrived
+        after a timeout may have replaced it with a fresh waiter."""
+        key = _dedup_key(waiter["command"])
+        if key is not None and self._dedup_inflight.get(key) is waiter:
+            del self._dedup_inflight[key]
 
     def _advance_commit(self) -> None:
         """Leader only: advance commit_index when a majority has an entry
@@ -747,6 +810,7 @@ class RaftNode:
                     "snapshot_index": self.snapshot_index,
                     "snapshot_term": self.snapshot_term,
                     "pending_reads": len(self._pending_reads),
+                    "dedup_entries": len(self._dedup),
                     "lease_valid": self._lease_valid(),
                     "confirm_rounds": self._confirm_rounds,
                     "config": sorted(self.config),
@@ -1018,6 +1082,11 @@ class RaftNode:
         command = {"op": op, "key": key}
         if op == "set":
             command["value"] = msg.get("value")
+        # Client session id, when the client sent one: it rides in the
+        # log entry so every node records the same dedup key on apply.
+        for field in ("client_id", "request_id"):
+            if msg.get(field):
+                command[field] = msg[field]
         return self._submit_write(command)
 
     # ------------------------------------------------------------------
@@ -1200,18 +1269,38 @@ class RaftNode:
         one each; a lone sequential write just pays the 2ms window.
         Membership entries bypass this — they are rare, and their
         caller tracks the entry's index directly.
+
+        Deduplication: a write carrying a (client_id, request_id) that
+        is already applied returns the cached result without appending
+        anything, and one whose first attempt is still in flight joins
+        that attempt's waiter instead of appending a duplicate — so a
+        client that retries after a lost response gets at-most-once
+        semantics.
         """
+        join_waiter: dict | None = None
+        key: tuple[str, str] | None = None
+        flush_batch = False
         with self.lock:
             if self.role != "leader":
                 return self._redirect()
-            waiter = {"command": command, "index": None,
-                      "event": threading.Event(), "result": None}
-            if self._write_batch is None:
-                self._write_batch = [waiter]
-                flush_batch = True
+            key = _dedup_key(command)
+            if key is not None:
+                if key in self._dedup:
+                    # Already applied: the retry is a no-op.
+                    return dict(self._dedup[key])
+                join_waiter = self._dedup_inflight.get(key)
+            if join_waiter is None:
+                waiter = {"command": command, "index": None,
+                          "event": threading.Event(), "result": None}
+                if key is not None:
+                    self._dedup_inflight[key] = waiter
+                if self._write_batch is None:
+                    self._write_batch = [waiter]
+                    flush_batch = True
+                else:
+                    self._write_batch.append(waiter)
             else:
-                self._write_batch.append(waiter)
-                flush_batch = False
+                waiter = join_waiter
         if flush_batch:
             # Wait outside the lock so concurrent writes can join the
             # batch, then flush it: one append (one fsync) for all of
@@ -1222,8 +1311,13 @@ class RaftNode:
         result = waiter["result"]
         if result is None:
             # The flusher never woke us (it crashed or lost leadership
-            # without failing the batch): report a timeout rather than
-            # hanging the client past its deadline.
+            # without failing the batch): drop our inflight claim so a
+            # retry with the same id can proceed, then report a timeout
+            # rather than hanging the client past its deadline.
+            with self.lock:
+                if (key is not None
+                        and self._dedup_inflight.get(key) is waiter):
+                    del self._dedup_inflight[key]
             return {"type": "client_response", "status": "timeout",
                     "error": "write did not commit in time"}
         return result
@@ -1242,6 +1336,7 @@ class RaftNode:
                 # Leadership was lost while the batch was forming: fail
                 # every waiter so it redirects instead of hanging.
                 for w in batch:
+                    self._clear_inflight(w)
                     w["result"] = {"type": "client_response",
                                    "status": "error",
                                    "error": "lost leadership while committing"}
@@ -1282,9 +1377,16 @@ class RaftNode:
             else:
                 result = {"type": "client_response", "status": "timeout",
                           "error": "write did not commit in time"}
-        for w in batch:
-            w["result"] = result
-            w["event"].set()
+        # Wake every waiter — and only now drop their inflight claims:
+        # by the time a waiter is woken the entry is committed (so the
+        # dedup table already holds it via _apply_committed) or the
+        # batch failed (so nothing was appended), and a retry arriving
+        # after this point takes the _dedup path or appends fresh.
+        with self.lock:
+            for w in batch:
+                w["result"] = result
+                w["event"].set()
+                self._clear_inflight(w)
 
     # ------------------------------------------------------------------
     # ReadIndex pending reads
