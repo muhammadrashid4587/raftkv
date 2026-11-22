@@ -39,6 +39,16 @@ logic and the failure handling, not the key-value API on top.
   or when the candidate's log is stale — and granting one changes no
   state. A partitioned node can therefore never inflate its term, so
   rejoining it cannot disrupt the leader or force a re-election.
+- **Pipelined replication** — the leader keeps up to 10 AppendEntries
+  batches in flight per follower (at most 32 entries each) instead of
+  waiting for one reply before sending the next, so a lagging follower
+  catches up in a few concurrent batches. Replies are applied as they
+  arrive; a rejected batch backs `next_index` down from the follower's
+  hint, bumps an epoch that invalidates stale in-flight replies, and
+  re-dispatches from there. Commit advancement is unchanged — only
+  current-term entries advance the commit index. A five-timeout
+  failure budget keeps a dead peer from stalling writes, and at most
+  one replication driver runs per peer.
 - **Leader redirects** — a write or read sent to a follower returns the
   current leader's address; the client follows it automatically.
 - **Real failure handling** — tested end to end: kill the leader, the
@@ -75,7 +85,7 @@ make test
 # or: python3 -m unittest discover -s tests -v
 ```
 
-25 tests, all passing:
+30 tests, all passing:
 
 | Test | What it proves |
 |---|---|
@@ -104,6 +114,11 @@ make test
 | `test_read_served_with_one_follower_down` | Reads keep working with a majority of two |
 | `test_pending_read_resolves_when_apply_catches_up` | Pending reads resolve once the apply index passes them, fail on leadership loss |
 | `test_step_down_fails_pending_reads` | Stepping down wakes pending reads so they redirect instead of hanging |
+| `test_many_entries_replicate_with_pipelining` | A follower down for 60 writes catches up: every entry lands, in order, no duplicates |
+| `test_rejected_batch_backs_off_and_retries_without_duplicates` | A new leader's first batch to a lagging follower is rejected, backs off, retries; log ends up identical, commit index at the end |
+| `test_pipeline_window_bounds_in_flight_batches` | Catching up 200 entries has >1 batch in flight at once and never more than the window (10) |
+| `test_pipeline_window_one_is_sequential` | With window=1 at most one batch is ever in flight and replication is still correct |
+| `test_lagging_follower_catches_up_quickly` | 200 entries to a down follower replicate and apply well inside 5s |
 
 Tests use real nodes (real TCP, real threads, real disk) on localhost —
 no mocks of the consensus path.
@@ -119,8 +134,15 @@ and an fsync of the log append):
 ```
 
 This is latency-bound, not throughput-bound: every write pays a full
-round trip to a majority plus a disk fsync. Batching / pipelining and
-group commit would raise it substantially; see the roadmap.
+round trip to a majority plus a disk fsync. Pipelining (v0.5.0) does
+not raise that number on localhost — 200 concurrent writes from 10
+threads measure ~350-400 writes/sec, the same ballpark, because the
+leader and followers fsync every entry under their locks and the
+fsyncs serialize the work. Pipelining's win is elsewhere: a lagging
+follower catches up in a few concurrent batches instead of one round
+trip per batch, and on a real network (where RTT is not ~0.2ms) the
+overlapped round trips matter. Group commit — batching the fsyncs —
+is what would raise write throughput; see the roadmap.
 
 ## Architecture
 
@@ -222,5 +244,10 @@ entries left in `log.jsonl` are dropped by their index on reload.
   for the state machine to apply up to that index, with a pending-read
   registry resolved by the apply path, redirect on leadership loss,
   and a heartbeat-confirmed fallback after a timeout.
-- Pipelined replication and group commit for higher write throughput.
+- ~~Pipelined replication~~ — done in v0.5.0: up to 10 AppendEntries
+  batches in flight per follower (32 entries each), in-flight
+  tracking with an epoch that invalidates stale replies, retry from
+  the follower's hint on rejection, one active driver per peer, and
+  a five-timeout failure budget so a dead peer fails fast.
+- Group commit for higher write throughput (batch the fsyncs).
 - A benchmark script (`scripts/bench.py`) with concurrent clients.

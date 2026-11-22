@@ -63,6 +63,17 @@ READ_INDEX_TIMEOUT = 2.0
 # but still bounds log.jsonl on a long-lived cluster. Tests pass a
 # much smaller value to force snapshots quickly.
 SNAPSHOT_THRESHOLD = 1000
+# Pipelined replication: at most this many AppendEntries batches in
+# flight per follower, each carrying at most PIPELINE_BATCH_SIZE
+# entries. 10 x 32 = 320 entries can be outstanding, which is plenty
+# on a LAN and still bounds memory and threads per peer.
+PIPELINE_WINDOW = 10
+PIPELINE_BATCH_SIZE = 32
+# Backoff before re-dispatching to a peer whose batches timed out
+# (unknown outcome) or were rejected for a log mismatch. Without it a
+# dead peer would spin the window as fast as connections fail.
+PIPELINE_RETRY_BACKOFF = 0.1
+PIPELINE_MISMATCH_BACKOFF = 0.05
 
 
 class RaftNode:
@@ -73,6 +84,8 @@ class RaftNode:
         data_dir: str | os.PathLike,
         state_machine,
         snapshot_threshold: int = SNAPSHOT_THRESHOLD,
+        pipeline_window: int = PIPELINE_WINDOW,
+        pipeline_batch_size: int = PIPELINE_BATCH_SIZE,
     ) -> None:
         """
         node_id: this node's id, e.g. "node1".
@@ -81,6 +94,11 @@ class RaftNode:
         state_machine: object with an ``apply(command: dict)`` method.
         snapshot_threshold: compact the log once it holds more than this
             many post-snapshot entries (see SNAPSHOT_THRESHOLD).
+        pipeline_window: at most this many AppendEntries batches in
+            flight per follower (see PIPELINE_WINDOW). 1 means strictly
+            sequential replication; tests use it to compare against.
+        pipeline_batch_size: at most this many entries per
+            AppendEntries batch (see PIPELINE_BATCH_SIZE).
         """
         self.id = node_id
         self.peers = dict(peers)
@@ -88,6 +106,8 @@ class RaftNode:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.sm = state_machine
         self.snapshot_threshold = snapshot_threshold
+        self.pipeline_window = pipeline_window
+        self.pipeline_batch_size = pipeline_batch_size
 
         self.lock = threading.RLock()
         self.commit_cond = threading.Condition(self.lock)
@@ -130,6 +150,35 @@ class RaftNode:
         # _resolve_pending_reads once last_applied passes the index, or
         # by _fail_pending_reads when the node loses leadership.
         self._pending_reads: list[dict] = []
+        # Pipelined replication state (leader only, rebuilt on every
+        # election win by _become_leader). Per peer:
+        # - _in_flight: {batch_start_index: {"prev", "end", "epoch"}}
+        #   for AppendEntries batches sent but not yet answered.
+        # - _next_to_send: next log index not yet dispatched.
+        # - _pipeline_epoch: bumped on every log-mismatch backoff, so
+        #   replies from superseded batches are ignored.
+        # - _pipeline_acks: successful AppendEntries acks this term.
+        # - _max_in_flight: high-water mark of concurrent batches.
+        # - _peer_retry_after: monotonic time before which no new batch
+        #   is dispatched (backoff after timeouts / mismatches).
+        # - _pipeline_failures: consecutive AppendEntries timeouts /
+        #   refusals per peer since the last ack. A driver gives up
+        #   after 5 fresh failures in one call (the old code retried 5
+        #   times) instead of spinning until its deadline — otherwise
+        #   every write while a follower is down would cost the full
+        #   2s driver deadline.
+        # - _replicating: peers with an active replication driver; a
+        #   second caller for the same peer waits for an ack instead of
+        #   driving a second window, so a dead peer cannot spin up a
+        #   driver per heartbeat.
+        self._in_flight: dict[str, dict[int, dict]] = {}
+        self._next_to_send: dict[str, int] = {}
+        self._pipeline_epoch: dict[str, int] = {}
+        self._pipeline_acks: dict[str, int] = {}
+        self._max_in_flight: dict[str, int] = {}
+        self._peer_retry_after: dict[str, float] = {}
+        self._pipeline_failures: dict[str, int] = {}
+        self._replicating: set[str] = set()
         self._running = False
         self._server = None
         self._timer_thread: threading.Thread | None = None
@@ -815,15 +864,29 @@ class RaftNode:
     # ------------------------------------------------------------------
     # Leader replication
     # ------------------------------------------------------------------
-    def _build_append_entries(self, peer: str) -> dict | None:
-        """Build the next AppendEntries for a peer. Lock held. Returns
-        None if this node is no longer the leader."""
+    def _build_append_entries(self, peer: str, start_index: int | None = None,
+                              max_entries: int | None = None) -> dict | None:
+        """Build an AppendEntries for a peer. Lock held. Returns None if
+        this node is no longer the leader, or if the start index is at
+        or below the snapshot (the caller must send InstallSnapshot
+        instead — those entries no longer exist in the log).
+
+        start_index defaults to next_index[peer] (the oldest entry the
+        follower is not known to have); max_entries caps the batch so
+        the pipelined driver can send several batches at once instead
+        of one message carrying the whole suffix.
+        """
         if self.role != "leader":
             return None
-        next_idx = self.next_index.get(peer, self._last_log_index() + 1)
+        next_idx = (start_index if start_index is not None
+                    else self.next_index.get(peer, self._last_log_index() + 1))
+        if next_idx <= self.snapshot_index:
+            return None
         prev_index = next_idx - 1
         prev_term = self._term_at(prev_index)
         entries = self.log[next_idx - self.snapshot_index - 1:]
+        if max_entries is not None:
+            entries = entries[:max_entries]
         return {
             "type": "append_entries",
             "term": self.current_term,
@@ -834,53 +897,275 @@ class RaftNode:
             "leader_commit": self.commit_index,
         }
 
-    def _replicate_to_peer(self, peer: str) -> bool:
-        """Send AppendEntries until the peer catches up or we give up.
-        Returns True if the peer acked an AppendEntries in our term.
-        Network I/O happens outside the lock; responses are applied
-        under it. Retries back the peer's next_index down on mismatch,
-        which is how a new leader brings a stale follower up to date."""
+    def pipeline_stats(self) -> dict[str, dict]:
+        """Per-peer pipelining state, for tests and debugging: the
+        current in-flight window, its high-water mark, acks this term,
+        and where the leader thinks the peer is."""
+        with self.lock:
+            return {
+                p: {
+                    "in_flight": len(self._in_flight.get(p, {})),
+                    "max_in_flight": self._max_in_flight.get(p, 0),
+                    "acks": self._pipeline_acks.get(p, 0),
+                    "next_to_send": self._next_to_send.get(p, 0),
+                    "next_index": self.next_index.get(p, 0),
+                    "match_index": self.match_index.get(p, 0),
+                }
+                for p in self.peers
+            }
+
+    def _apply_append_reply(self, peer: str, resp: dict | None,
+                            prev: int, end: int, start: int | None,
+                            epoch: int) -> None:
+        """Apply one AppendEntries reply. Lock held.
+
+        ``start`` is the batch's start index, or None for a heartbeat
+        (a zero-entry batch, not tracked in the window). A reply is
+        only applied if its batch is still tracked at the same epoch:
+        a log-mismatch backoff bumps the epoch and clears the window,
+        so replies from superseded batches are ignored instead of
+        clobbering the new next_index. The commit rule is unchanged —
+        _advance_commit only counts current-term entries.
+        """
+        if start is not None:
+            tracked = self._in_flight.get(peer, {}).get(start)
+            if tracked is None or tracked["epoch"] != epoch:
+                return
+            del self._in_flight[peer][start]
+        if resp is None:
+            # Outcome unknown — the batch may or may not have landed.
+            # Count it against this peer's failure budget either way:
+            # five fresh timeouts in one call means the peer is not
+            # answering, and the driver should give up instead of
+            # spinning until its deadline.
+            self._pipeline_failures[peer] = (
+                self._pipeline_failures.get(peer, 0) + 1)
+            if start is not None:
+                # Requeue it from its start index; AppendEntries is
+                # idempotent, so a re-send is safe either way. Back
+                # off briefly so a dead peer does not spin the window.
+                self._next_to_send[peer] = min(
+                    self._next_to_send.get(peer, start), start)
+                self._peer_retry_after[peer] = (
+                    time.monotonic() + PIPELINE_RETRY_BACKOFF)
+            return
+        resp_term = int(resp.get("term", 0))
+        if resp_term > self.current_term:
+            self._step_down(resp_term)
+            return
+        if self.role != "leader" or resp_term != self.current_term:
+            return
+        if resp.get("success"):
+            # A successful batch proves the follower holds the whole
+            # prefix up to its end: the follower rejects a batch whose
+            # prev_log_index it does not have, so an ack for a later
+            # batch implies the earlier ones landed too — which is
+            # what lets out-of-order acks advance match_index safely.
+            self.match_index[peer] = max(
+                self.match_index.get(peer, 0), end)
+            self.next_index[peer] = self.match_index[peer] + 1
+            self._pipeline_acks[peer] = self._pipeline_acks.get(peer, 0) + 1
+            self._pipeline_failures[peer] = 0
+            self._advance_commit()
+            return
+        # Log mismatch: back up and retry from the follower's hint.
+        # Bump the epoch and clear the window — every other batch in
+        # flight was built on the old prefix, so their replies are
+        # stale; they are re-dispatched from the backed-off index.
+        hint = int(resp.get("match_index", prev - 1))
+        self._pipeline_epoch[peer] = self._pipeline_epoch.get(peer, 0) + 1
+        self._in_flight.get(peer, {}).clear()
+        self.next_index[peer] = max(
+            1, min(self.next_index.get(peer, 1), hint + 1))
+        self._next_to_send[peer] = self.next_index[peer]
+        self._peer_retry_after[peer] = (
+            time.monotonic() + PIPELINE_MISMATCH_BACKOFF)
+
+    def _send_pipeline_batch(self, peer: str, msg: dict, start: int,
+                             prev: int, end: int, epoch: int) -> None:
+        """Send one pipelined AppendEntries batch and apply its reply.
+        Runs on its own thread; network I/O outside the lock, the
+        reply applied under it by _apply_append_reply."""
         host, port = self.peers[peer]
-        for _attempt in range(5):
+        resp = send_rpc(host, port, msg, timeout=RPC_TIMEOUT)
+        with self.lock:
+            self._apply_append_reply(peer, resp, prev, end, start, epoch)
+
+    def _wait_for_ack(self, peer: str, acks_at_entry: int) -> bool:
+        """Another driver is already driving this peer; wait for it to
+        get an ack in our term instead of opening a second window.
+        Bail out early if the peer has five consecutive timeouts and
+        no ack since — it is not answering, and waiting out the full
+        deadline would stall the caller for nothing. (Bailing never
+        stops future attempts: the next heartbeat drives a fresh
+        call.)"""
+        deadline = time.monotonic() + RPC_TIMEOUT * 4
+        while time.monotonic() < deadline:
             with self.lock:
                 if self.role != "leader":
                     return False
+                if self._pipeline_acks.get(peer, 0) > acks_at_entry:
+                    return True
+                if self._pipeline_failures.get(peer, 0) >= 5:
+                    return False
+            time.sleep(0.005)
+        return False
+
+    def _replicate_to_peer(self, peer: str) -> bool:
+        """Replicate to one peer; returns True if the peer acked an
+        AppendEntries in our term during this call.
+
+        At most one driver per peer is active: if another driver is
+        already driving this peer, this call just waits for an ack.
+        Otherwise this call drives the window itself (see
+        _drive_replication)."""
+        with self.lock:
+            acks_at_entry = self._pipeline_acks.get(peer, 0)
+            if peer in self._replicating:
+                already_active = True
+            else:
+                self._replicating.add(peer)
+                already_active = False
+        if already_active:
+            return self._wait_for_ack(peer, acks_at_entry)
+        try:
+            return self._drive_replication(peer, acks_at_entry)
+        finally:
+            with self.lock:
+                self._replicating.discard(peer)
+
+    def _drive_replication(self, peer: str, acks_at_entry: int) -> bool:
+        """Drive pipelined replication to one peer: keep up to
+        pipeline_window AppendEntries batches in flight, each carrying
+        at most pipeline_batch_size entries, and return True once the
+        peer acks one in our term.
+
+        The old code sent one batch, waited for its reply, then sent
+        the next — a lagging follower stalled the pipeline for a round
+        trip per batch. Here batches are dispatched concurrently and
+        acks are applied as they arrive; a rejected batch backs
+        next_index down (via _apply_append_reply) and the window is
+        re-dispatched from there. When the peer is caught up and the
+        window is empty, one empty AppendEntries goes out as the
+        heartbeat, sent synchronously like the old path.
+
+        Give up after the peer has five consecutive timeouts and this
+        call has tried at least once — the old code retried five
+        times, and spinning until the deadline would make every write
+        while a follower is down cost the full 2s. The budget is
+        persistent across calls (it resets on the next ack), so a
+        peer that has been dead for a while fails fast on the first
+        fresh attempt instead of paying five more rounds.
+        """
+        host, port = self.peers[peer]
+        deadline = time.monotonic() + RPC_TIMEOUT * 4
+        tried_this_call = False
+        while time.monotonic() < deadline:
+            send_snapshot = False
+            heartbeat_msg = None
+            heartbeat_meta = None
+            with self.lock:
+                if self.role != "leader":
+                    return False
+                if self._pipeline_acks.get(peer, 0) > acks_at_entry:
+                    return True
+                last = self._last_log_index()
+                in_flight = self._in_flight.setdefault(peer, {})
                 # If the peer is behind our snapshot, AppendEntries
                 # cannot help it: the entries it needs no longer exist
-                # in our log. Send the snapshot instead.
-                if self.next_index.get(peer, 1) <= self.snapshot_index:
+                # in our log. Send the snapshot instead — but only
+                # once the window is empty, so no batch is in flight
+                # when the snapshot lands.
+                if (self.next_index.get(peer, 1) <= self.snapshot_index
+                        and not in_flight):
                     send_snapshot = True
-                    msg = None
-                    sent_entries = 0
-                    sent_prev = 0
                 else:
-                    send_snapshot = False
-                    msg = self._build_append_entries(peer)
-                    if msg is None:
+                    # next_index is the oldest index not known to be
+                    # replicated; anything below it is already on the
+                    # follower (a later batch's ack proves the whole
+                    # prefix), so never re-dispatch below it — a
+                    # timed-out batch requeued behind a newer ack is
+                    # skipped, not re-sent.
+                    next_to_send = max(
+                        self._next_to_send.get(peer, last + 1),
+                        self.next_index.get(peer, 1))
+                    if ((time.monotonic()
+                            >= self._peer_retry_after.get(peer, 0.0)
+                            # A peer already known dead (five
+                            # consecutive timeouts) fails fast: bypass
+                            # the backoff so the call can try once and
+                            # give up, instead of paying a backoff
+                            # period on every write while it is down.
+                            or self._pipeline_failures.get(peer, 0) >= 5)
+                            and next_to_send > self.snapshot_index):
+                        while (len(in_flight) < self.pipeline_window
+                                and next_to_send <= last):
+                            if next_to_send in in_flight:
+                                # Already dispatched (a timed-out batch
+                                # was requeued behind a batch still in
+                                # flight): skip past it instead of
+                                # double-sending.
+                                next_to_send = (
+                                    in_flight[next_to_send]["end"] + 1)
+                                continue
+                            count = min(self.pipeline_batch_size,
+                                        last - next_to_send + 1)
+                            msg = self._build_append_entries(
+                                peer, start_index=next_to_send,
+                                max_entries=self.pipeline_batch_size)
+                            if msg is None:
+                                break
+                            epoch = self._pipeline_epoch.get(peer, 0)
+                            in_flight[next_to_send] = {
+                                "prev": msg["prev_log_index"],
+                                "end": next_to_send + count - 1,
+                                "epoch": epoch,
+                            }
+                            tried_this_call = True
+                            self._max_in_flight[peer] = max(
+                                self._max_in_flight.get(peer, 0),
+                                len(in_flight))
+                            threading.Thread(
+                                target=self._send_pipeline_batch,
+                                args=(peer, msg, next_to_send,
+                                      msg["prev_log_index"],
+                                      next_to_send + count - 1, epoch),
+                                daemon=True).start()
+                            next_to_send += count
+                        self._next_to_send[peer] = next_to_send
+                    # Caught up and the window is empty: one empty
+                    # AppendEntries as the heartbeat.
+                    if (not in_flight and next_to_send > last
+                            and self.match_index.get(peer, 0) >= last):
+                        msg = self._build_append_entries(
+                            peer, start_index=last + 1, max_entries=0)
+                        if msg is not None:
+                            heartbeat_msg = msg
+                            heartbeat_meta = (
+                                msg["prev_log_index"], last,
+                                self._pipeline_epoch.get(peer, 0))
+                    # Five consecutive timeouts, this call has tried
+                    # at least once, the window is empty, and work is
+                    # still pending: the peer is not answering. Give
+                    # up now instead of spinning until the deadline;
+                    # the next heartbeat retries from a clean call.
+                    if (not in_flight and next_to_send <= last
+                            and tried_this_call
+                            and self._pipeline_failures.get(peer, 0) >= 5):
                         return False
-                    sent_entries = len(msg["entries"])
-                    sent_prev = msg["prev_log_index"]
             if send_snapshot:
                 return self._send_install_snapshot(peer)
-            resp = send_rpc(host, port, msg, timeout=RPC_TIMEOUT)
-            with self.lock:
-                if resp is None:
-                    return False
-                resp_term = int(resp.get("term", 0))
-                if resp_term > self.current_term:
-                    self._step_down(resp_term)
-                    return False
-                if self.role != "leader" or resp_term != self.current_term:
-                    return False
-                if resp.get("success"):
-                    self.match_index[peer] = sent_prev + sent_entries
-                    self.next_index[peer] = self.match_index[peer] + 1
-                    self._advance_commit()
-                    return True
-                # Log mismatch: back up and retry with an earlier prefix.
-                hint = int(resp.get("match_index", sent_prev - 1))
-                self.next_index[peer] = max(1, min(self.next_index.get(peer, 1), hint + 1))
-        return False
+            if heartbeat_msg is not None:
+                resp = send_rpc(host, port, heartbeat_msg,
+                                timeout=RPC_TIMEOUT)
+                with self.lock:
+                    prev, end, epoch = heartbeat_meta
+                    self._apply_append_reply(peer, resp, prev, end,
+                                             None, epoch)
+                continue
+            time.sleep(0.005)
+        with self.lock:
+            return self._pipeline_acks.get(peer, 0) > acks_at_entry
 
     def _send_install_snapshot(self, peer: str) -> bool:
         """Send this node's snapshot to a lagging peer. Network I/O
@@ -912,6 +1197,9 @@ class RaftNode:
                 self.match_index[peer] = int(
                     resp.get("match_index", self.snapshot_index))
                 self.next_index[peer] = self.match_index[peer] + 1
+                self._next_to_send[peer] = self.next_index[peer]
+                self._pipeline_acks[peer] = self._pipeline_acks.get(peer, 0) + 1
+                self._pipeline_failures[peer] = 0
                 self._advance_commit()
                 return True
         return False
@@ -923,6 +1211,15 @@ class RaftNode:
             last = self._last_log_index()
             self.next_index = {p: last + 1 for p in self.peers}
             self.match_index = {p: 0 for p in self.peers}
+            # Fresh pipeline state for this term: no batches in flight,
+            # nothing dispatched yet, no acks counted, no backoff.
+            self._in_flight = {p: {} for p in self.peers}
+            self._next_to_send = {p: last + 1 for p in self.peers}
+            self._pipeline_epoch = {p: 0 for p in self.peers}
+            self._pipeline_acks = {p: 0 for p in self.peers}
+            self._max_in_flight = {p: 0 for p in self.peers}
+            self._peer_retry_after = {p: 0.0 for p in self.peers}
+            self._pipeline_failures = {p: 0 for p in self.peers}
         # Assert leadership immediately so followers learn about it and
         # the commit index starts flowing.
         self._send_heartbeats()

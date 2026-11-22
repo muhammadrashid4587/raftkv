@@ -22,9 +22,11 @@ class Cluster:
     """A throwaway N-node cluster running in-process on localhost."""
 
     def __init__(self, n: int = 3, base_dir: str | None = None,
-                 snapshot_threshold: int = 1000):
+                 snapshot_threshold: int = 1000,
+                 pipeline_window: int = 10):
         self.n = n
         self.snapshot_threshold = snapshot_threshold
+        self.pipeline_window = pipeline_window
         self.tmp = tempfile.TemporaryDirectory(prefix="raftkv-test-")
         self.base = Path(base_dir) if base_dir else Path(self.tmp.name)
         self.nodes: dict[str, RaftNode] = {}
@@ -36,7 +38,8 @@ class Cluster:
             peers = {p: ("127.0.0.1", ports[p]) for p in ids if p != node_id}
             data_dir = self.base / node_id
             node = RaftNode(node_id, peers, data_dir, KVStore(),
-                            snapshot_threshold=snapshot_threshold)
+                            snapshot_threshold=snapshot_threshold,
+                            pipeline_window=pipeline_window)
             self.nodes[node_id] = node
             self.addrs[node_id] = ("127.0.0.1", ports[node_id])
 
@@ -60,7 +63,8 @@ class Cluster:
         """Restart a stopped node with the same id, peers and data dir."""
         peers = {p: self.addrs[p] for p in self.nodes if p != node_id}
         node = RaftNode(node_id, peers, self.base / node_id, KVStore(),
-                        snapshot_threshold=self.snapshot_threshold)
+                        snapshot_threshold=self.snapshot_threshold,
+                        pipeline_window=self.pipeline_window)
         self.nodes[node_id] = node
         host, port = self.addrs[node_id]
         node.start(host, port)
