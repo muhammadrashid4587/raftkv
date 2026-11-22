@@ -55,6 +55,9 @@ HEARTBEAT_INTERVAL = 0.05
 RPC_TIMEOUT = 0.5
 CLIENT_COMMIT_TIMEOUT = 10.0
 LEADER_LEASE_TIMEOUT = 1.0
+# How long a ReadIndex read waits for the state machine to apply up to
+# its read index before falling back to a plain heartbeat-confirmed read.
+READ_INDEX_TIMEOUT = 2.0
 # Compact the log once it holds more than this many post-snapshot
 # entries. 1000 is large enough that compaction is rare in normal use
 # but still bounds log.jsonl on a long-lived cluster. Tests pass a
@@ -121,6 +124,12 @@ class RaftNode:
         # a leader at all. None means "never heard from a leader".
         self._last_leader_contact: float | None = None
         self._last_heartbeat_sent = 0.0
+        # ReadIndex reads waiting for the state machine to apply up to
+        # their read index. Each entry is {"read_index": int,
+        # "term": int, "event": threading.Event}; the event is set by
+        # _resolve_pending_reads once last_applied passes the index, or
+        # by _fail_pending_reads when the node loses leadership.
+        self._pending_reads: list[dict] = []
         self._running = False
         self._server = None
         self._timer_thread: threading.Thread | None = None
@@ -336,6 +345,7 @@ class RaftNode:
             self._save_meta()
         self.role = "follower"
         self.leader_id = None
+        self._fail_pending_reads()
         self._reset_election_timer()
 
     def _apply_committed(self) -> None:
@@ -355,6 +365,9 @@ class RaftNode:
         if (self.last_applied > self.snapshot_index
                 and len(self.log) > self.snapshot_threshold):
             self._take_snapshot(self.last_applied)
+        # Applying advanced: any ReadIndex read waiting on an index now
+        # covered by the state machine can be served.
+        self._resolve_pending_reads()
 
     def _advance_commit(self) -> None:
         """Leader only: advance commit_index when a majority has an entry
@@ -406,6 +419,7 @@ class RaftNode:
                     "log_length": len(self.log),
                     "snapshot_index": self.snapshot_index,
                     "snapshot_term": self.snapshot_term,
+                    "pending_reads": len(self._pending_reads),
                 }
         return {"type": "error", "error": f"unknown message type: {msg_type!r}"}
 
@@ -506,6 +520,7 @@ class RaftNode:
             # candidate in the same term.
             self.role = "follower"
             self.leader_id = leader_id
+            self._fail_pending_reads()
             self._reset_election_timer()
             self._last_leader_contact = time.monotonic()
 
@@ -584,6 +599,7 @@ class RaftNode:
                 self._step_down(term)
             self.role = "follower"
             self.leader_id = leader_id
+            self._fail_pending_reads()
             self._reset_election_timer()
             self._last_leader_contact = time.monotonic()
 
@@ -668,18 +684,100 @@ class RaftNode:
                         "error": "lost leadership while committing"}
         return {"type": "client_response", "status": "ok"}
 
-    def _serve_read(self, key: str) -> dict:
-        """Leader-only read with a leadership check.
+    # ------------------------------------------------------------------
+    # ReadIndex pending reads
+    # ------------------------------------------------------------------
+    def _register_pending_read(self, read_index: int, term: int) -> threading.Event:
+        """Register a read waiting for the state machine to apply up to
+        ``read_index``. Lock held. Returns an event that is set once the
+        read can be served (apply caught up) or the node loses
+        leadership — the waiter re-checks both itself after waking."""
+        event = threading.Event()
+        self._pending_reads.append(
+            {"read_index": read_index, "term": term, "event": event})
+        return event
 
-        A leader that is partitioned from the cluster must not serve stale
-        reads, so before reading it sends a heartbeat round and waits for
-        a majority to acknowledge it in the current term. Only then is
-        the local (fully applied) state safe to read.
+    def _unregister_pending_read(self, event: threading.Event) -> None:
+        """Drop a pending read (timed out, or served after its event was
+        set). Lock held. A no-op if the read was already resolved or
+        failed, since those paths remove it from the list themselves."""
+        self._pending_reads = [p for p in self._pending_reads
+                               if p["event"] is not event]
+
+    def _resolve_pending_reads(self) -> None:
+        """Wake every pending read whose index the state machine has now
+        applied. Lock held; called from _apply_committed after
+        last_applied advances. Reads still ahead of the applied prefix
+        stay registered and keep waiting."""
+        ready, waiting = [], []
+        for p in self._pending_reads:
+            (ready if p["read_index"] <= self.last_applied else waiting).append(p)
+        self._pending_reads = waiting
+        for p in ready:
+            p["event"].set()
+
+    def _fail_pending_reads(self) -> None:
+        """Wake all pending reads because leadership changed. Lock held.
+        Waiters re-check role/term after waking and return a redirect
+        instead of serving from a deposed leader."""
+        for p in self._pending_reads:
+            p["event"].set()
+        self._pending_reads = []
+
+    def _serve_read(self, key: str) -> dict:
+        """ReadIndex read (Raft dissertation §6.4).
+
+        1. Record read_index = commit_index while leader in this term.
+        2. Confirm leadership with a heartbeat round to a majority —
+           a partitioned ex-leader cannot get those acks.
+        3. Wait until the state machine has applied up to read_index;
+           only then is the local state guaranteed to include every
+           write committed before the read started. The wait registers
+           a pending read, resolved by _apply_committed once the apply
+           index catches up — no log entry is written for the read.
+        4. If leadership is lost mid-read, redirect (the client follows
+           it to the new leader) — never serve from a deposed leader.
+           If apply stalls past READ_INDEX_TIMEOUT while we are still
+           leader in this term, fall back to the old heartbeat-confirmed
+           read of whatever is applied: on this leader apply is
+           synchronous with commit advancement under the same lock, so
+           last_applied == commit_index whenever we hold leadership,
+           and the fallback is exactly the previous behaviour.
         """
         with self.lock:
             if self.role != "leader":
                 return self._redirect()
             term = self.current_term
+            read_index = self.commit_index
+        if not self._confirm_leadership(term):
+            with self.lock:
+                if self.role != "leader":
+                    return self._redirect()
+            return {"type": "client_response", "status": "error",
+                    "error": "could not confirm leadership"}
+        # Wait for the state machine to catch up to the read index.
+        deadline = time.monotonic() + READ_INDEX_TIMEOUT
+        while True:
+            with self.lock:
+                if self.role != "leader" or self.current_term != term:
+                    return self._redirect()
+                if self.last_applied >= read_index:
+                    value = self.sm.get(key)
+                    return {"type": "client_response", "status": "ok",
+                            "value": value}
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                event = self._register_pending_read(read_index, term)
+            # Wait outside the lock; _apply_committed resolves the event
+            # once the state machine catches up, _step_down (and the
+            # follower transitions) fail it on leadership loss.
+            event.wait(timeout=remaining)
+            with self.lock:
+                self._unregister_pending_read(event)
+        # Fallback: apply stalled past the timeout, but we are still
+        # leader in this term — re-confirm leadership and read whatever
+        # is applied, exactly like the old heartbeat-confirmed read.
         if not self._confirm_leadership(term):
             with self.lock:
                 if self.role != "leader":
@@ -687,6 +785,8 @@ class RaftNode:
             return {"type": "client_response", "status": "error",
                     "error": "could not confirm leadership"}
         with self.lock:
+            if self.role != "leader" or self.current_term != term:
+                return self._redirect()
             value = self.sm.get(key)
         return {"type": "client_response", "status": "ok", "value": value}
 

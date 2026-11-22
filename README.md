@@ -18,9 +18,13 @@ logic and the failure handling, not the key-value API on top.
 - **Durable log** — `currentTerm`, `votedFor`, and the log are persisted
   per node (`meta.json` + `log.jsonl`, fsynced). A restarted node replays
   its committed log and rejoins without losing data.
-- **Linearizable-ish reads** — the leader confirms leadership with a
-  heartbeat round to a majority before serving a read, so a partitioned
-  ex-leader cannot serve stale data.
+- **ReadIndex reads** — a read records the leader's commit index,
+  confirms leadership with a heartbeat round to a majority, and only
+  returns once the state machine has applied up to that index, so the
+  read is linearizable without writing a log entry. Pending reads
+  register in a list resolved by the apply path; losing leadership
+  mid-read fails them to a redirect, and a stalled apply falls back
+  to a heartbeat-confirmed read after a timeout.
 - **Log compaction via snapshotting** — once the log grows past a
   threshold (default 1000 entries), a node snapshots its state
   machine (`snapshot.json`: state + last included index/term) and
@@ -71,7 +75,7 @@ make test
 # or: python3 -m unittest discover -s tests -v
 ```
 
-17 tests, all passing:
+25 tests, all passing:
 
 | Test | What it proves |
 |---|---|
@@ -92,6 +96,14 @@ make test
 | `test_prevote_rejected_when_leader_recently_heard` | A follower with a live leader refuses a pre-vote |
 | `test_partitioned_node_rejoin_does_not_disrupt_leader` | A rejoined node cannot force a re-election or a term jump |
 | `test_election_still_works_after_leader_failure` | Pre-vote does not stop a genuine failover election |
+| `test_readindex_returns_latest_committed_value` | ReadIndex read returns the latest committed value and writes no log entry |
+| `test_read_after_write_sees_the_write` | A read after a committed write sees it, including after overwrite and delete |
+| `test_read_across_leader_change_never_returns_stale_data` | Reads across a leader change never return the pre-change value |
+| `test_deposed_leader_does_not_serve_stale_reads` | A deposed ex-leader redirects instead of serving its stale state |
+| `test_concurrent_reads_are_all_correct` | Concurrent reads during a write only ever see committed values |
+| `test_read_served_with_one_follower_down` | Reads keep working with a majority of two |
+| `test_pending_read_resolves_when_apply_catches_up` | Pending reads resolve once the apply index passes them, fail on leadership loss |
+| `test_step_down_fails_pending_reads` | Stepping down wakes pending reads so they redirect instead of hanging |
 
 Tests use real nodes (real TCP, real threads, real disk) on localhost —
 no mocks of the consensus path.
@@ -123,6 +135,7 @@ tests/
   harness.py     In-process 3-node cluster fixture
   test_raft.py       Election, replication, redirects, persistence
   test_integration.py  Leader-kill failover scenario
+  test_readindex.py    ReadIndex reads, pending-read registry, deposed leader
 ```
 
 **Threading.** One TCP server thread (a thread per connection), one
@@ -160,11 +173,17 @@ entries left in `log.jsonl` are dropped by their index on reload.
   without losing acknowledged writes or splitting the data. Paxos is
   harder to reason about; Raft's election + log matching gives the
   same safety with code a reader can actually follow.
-- **Read path.** Reads go to the leader and only after a heartbeat
-  round confirms a majority still acknowledges it in the current term.
-  That closes the stale-read hole where a partitioned ex-leader keeps
-  answering from old state. (A ReadIndex-style optimization would
-  avoid the heartbeat on the hot path; see roadmap.)
+- **Read path.** Reads go to the leader as ReadIndex reads
+  (dissertation §6.4): record the commit index, confirm leadership
+  with a heartbeat round to a majority, then wait until the state
+  machine has applied up to that index. That closes the stale-read
+  hole where a partitioned ex-leader keeps answering from old state,
+  without writing a log entry per read. Pending reads register in a
+  list that the apply path resolves and leadership loss fails; if
+  apply stalls past a timeout while leadership still holds, the read
+  falls back to a plain heartbeat-confirmed read of the applied state
+  (on this leader apply is synchronous with commit advancement under
+  the same lock, so the fallback is exactly the previous behaviour).
 - **Commit rule.** A leader only advances `commit_index` for entries
   from its *own* term, counting replicas — never for old-term entries
   alone. Committing a current-term entry transitively commits
@@ -197,7 +216,11 @@ entries left in `log.jsonl` are dropped by their index on reload.
   rejoins with a stale-but-high term — done in v0.3.0: RequestPreVote
   round before every election, voters refuse when they are the leader
   or heard from a live leader recently, granting changes no state.
-- ReadIndex / lease-based reads to serve reads without a heartbeat
-  round on the hot path.
+- ~~ReadIndex / lease-based reads to serve reads without a heartbeat
+  round on the hot path~~ — done in v0.4.0: ReadIndex reads record the
+  commit index, confirm leadership with a heartbeat round, and wait
+  for the state machine to apply up to that index, with a pending-read
+  registry resolved by the apply path, redirect on leadership loss,
+  and a heartbeat-confirmed fallback after a timeout.
 - Pipelined replication and group commit for higher write throughput.
 - A benchmark script (`scripts/bench.py`) with concurrent clients.
