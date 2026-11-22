@@ -48,6 +48,7 @@ import time
 from pathlib import Path
 
 from .transport import send_rpc, serve_in_background
+from .watch import WatchManager
 
 # Randomized election timeout. Short values keep the test suite and the
 # demo snappy; 150-300 ms is comfortably above localhost RTT.
@@ -149,6 +150,11 @@ class RaftNode:
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.sm = state_machine
+        # Watch/subscribe registry (v0.11.0): callbacks registered here
+        # fire from _apply_committed whenever a committed entry
+        # changes a watched key. Local to this node, in-memory only —
+        # not replicated, not persisted, not rebuilt on restart.
+        self.watch = WatchManager()
         self.snapshot_threshold = snapshot_threshold
         self.pipeline_window = pipeline_window
         self.pipeline_batch_size = pipeline_batch_size
@@ -753,6 +759,19 @@ class RaftNode:
                 # outcome is always ok.
                 result = self.sm.apply(entry["command"])
                 self._record_dedup(entry["command"], result)
+                # Watches fire on committed changes only, in log
+                # order, from the apply path — so a watcher on any
+                # node sees exactly the changes that committed, and a
+                # failed CAS (no state change) fires nothing.
+                if op == "set":
+                    self.watch.notify(entry["command"]["key"],
+                                      entry["command"]["value"], "set")
+                elif op == "del":
+                    self.watch.notify(entry["command"]["key"], None, "del")
+                elif (op == "cas" and result is not None
+                        and result.get("status") == "ok"):
+                    self.watch.notify(entry["command"]["key"],
+                                      entry["command"]["value"], "set")
                 if (op == "cas" and result is not None
                         and self.role == "leader"):
                     self._apply_results[self.last_applied] = result

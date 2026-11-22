@@ -99,6 +99,18 @@ logic and the failure handling, not the key-value API on top.
   first attempt's exact result — success or failure — instead of
   re-executing, and the result survives snapshots and leader changes
   with the dedup table.
+- **Watch/subscribe** — `node.watch.watch(key, callback)` (or
+  `prefix=True` for a key prefix) fires the callback with
+  `{"key", "value", "op"}` whenever a *committed* log entry changes
+  that key: a set fires with the new value, a delete with
+  `value=None`, a successful CAS like a set, and a failed CAS fires
+  nothing. Notification happens in the apply path, so it fires
+  exactly once per committed change, in log order, on every node
+  that applies the entry — leader and followers alike. Watches are
+  local to one node and in-memory only: not replicated, not
+  persisted, not rebuilt on restart; a watcher re-registers after
+  reconnecting. Callbacks run synchronously on the applying thread,
+  so keep them short and non-blocking.
 - **Real failure handling** — tested end to end: kill the leader, the
   cluster re-elects, writes continue, the old leader rejoins and
   catches up instead of forking.
@@ -453,3 +465,11 @@ entries left in `log.jsonl` are dropped by their index on reload.
   InstallSnapshot), so a retry with the same session id returns the
   first attempt's exact result. The CLI takes `cas` with
   `--client-id` / `--request-id` like `set`/`del`.
+- ~~Watch/subscribe primitive~~ — done in v0.11.0, Nov 22, 2026:
+  `WatchManager` (`raftkv/watch.py`, `node.watch`): register a
+  callback on a key or key prefix, fired from the apply path with
+  the new value (or `None` on delete) exactly once per committed
+  change, in log order, on every node that applies the entry; a
+  failed CAS fires nothing, a raising callback cannot break the
+  apply path or other watchers. Watches are local and in-memory
+  only for now — no replication, persistence, or watch RPC yet.

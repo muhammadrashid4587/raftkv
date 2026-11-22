@@ -2,6 +2,7 @@
 
 from .raft import RaftNode
 from .store import KVStore
+from .watch import WatchManager
 
-__all__ = ["RaftNode", "KVStore"]
-__version__ = "0.9.0"
+__all__ = ["RaftNode", "KVStore", "WatchManager"]
+__version__ = "0.11.0"
