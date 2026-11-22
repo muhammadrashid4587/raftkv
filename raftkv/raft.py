@@ -80,6 +80,12 @@ PIPELINE_MISMATCH_BACKOFF = 0.05
 # is normally well under a second); tests pass a shorter value to make
 # a down server fail fast.
 MEMBERSHIP_CATCHUP_TIMEOUT = 5.0
+# Leader-side group commit: how long the first writer in a batch waits
+# for concurrent client writes to join it before flushing. 2ms is
+# long enough for threads woken together to pile in, and short enough
+# that a lone sequential write barely notices it — it pays one window
+# instead of one fsync per write either way.
+GROUP_COMMIT_WINDOW = 0.002
 
 
 class RaftNode:
@@ -226,6 +232,14 @@ class RaftNode:
         self._peer_retry_after: dict[str, float] = {}
         self._pipeline_failures: dict[str, int] = {}
         self._replicating: set[str] = set()
+        # Leader-side group commit (see _submit_write): client writes
+        # arriving while a batch is open join it instead of appending
+        # on their own, so one fsync covers several client requests.
+        # A batch is a list of {"command", "index", "event", "result"};
+        # None means no batch is open. The first writer in a batch is
+        # its flusher: it waits GROUP_COMMIT_WINDOW for joiners, then
+        # appends the whole batch with a single fsync.
+        self._write_batch: list[dict] | None = None
         self._running = False
         self._server = None
         self._timer_thread: threading.Thread | None = None
@@ -1155,12 +1169,68 @@ class RaftNode:
                 "leader_addr": list(addr) if addr else None}
 
     def _submit_write(self, command: dict) -> dict:
-        """Append a command to the log, replicate it, wait for commit."""
+        """Append a command to the log, replicate it, wait for commit.
+
+        Leader-side group commit: a write does not append on its own.
+        It joins the currently open batch (or opens one, becoming its
+        flusher), and the flusher appends the whole batch with a single
+        fsync once the batch window closes. Concurrent client writes
+        in the same window therefore share one fsync instead of paying
+        one each; a lone sequential write just pays the 2ms window.
+        Membership entries bypass this — they are rare, and their
+        caller tracks the entry's index directly.
+        """
         with self.lock:
             if self.role != "leader":
                 return self._redirect()
-            entry = {"term": self.current_term, "command": command}
-            index = self._append_entry(entry)
+            waiter = {"command": command, "index": None,
+                      "event": threading.Event(), "result": None}
+            if self._write_batch is None:
+                self._write_batch = [waiter]
+                flush_batch = True
+            else:
+                self._write_batch.append(waiter)
+                flush_batch = False
+        if flush_batch:
+            # Wait outside the lock so concurrent writes can join the
+            # batch, then flush it: one append (one fsync) for all of
+            # them, and one commit wait for the batch's last index.
+            time.sleep(GROUP_COMMIT_WINDOW)
+            self._flush_write_batch()
+        waiter["event"].wait(timeout=CLIENT_COMMIT_TIMEOUT)
+        result = waiter["result"]
+        if result is None:
+            # The flusher never woke us (it crashed or lost leadership
+            # without failing the batch): report a timeout rather than
+            # hanging the client past its deadline.
+            return {"type": "client_response", "status": "timeout",
+                    "error": "write did not commit in time"}
+        return result
+
+    def _flush_write_batch(self) -> None:
+        """Flush the open client-write batch: append every entry with
+        one fsync, replicate, wait for the batch's last index to
+        commit, then wake every waiter with the shared result. Runs
+        on the thread of the first writer in the batch."""
+        with self.lock:
+            batch = self._write_batch
+            self._write_batch = None
+            if not batch:
+                return
+            if self.role != "leader":
+                # Leadership was lost while the batch was forming: fail
+                # every waiter so it redirects instead of hanging.
+                for w in batch:
+                    w["result"] = {"type": "client_response",
+                                   "status": "error",
+                                   "error": "lost leadership while committing"}
+                    w["event"].set()
+                return
+            entries = [{"term": self.current_term, "command": w["command"]}
+                       for w in batch]
+            last_index = self._append_entries(entries)
+            for i, w in enumerate(batch):
+                w["index"] = last_index - len(batch) + 1 + i
             peers = list(self.peers)
 
         # Replicate in parallel; each thread updates match/next and may
@@ -1176,16 +1246,24 @@ class RaftNode:
 
         deadline = time.monotonic() + CLIENT_COMMIT_TIMEOUT
         with self.commit_cond:
-            while self.commit_index < index:
+            while self.commit_index < last_index:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    return {"type": "client_response", "status": "timeout",
-                            "error": "write did not commit in time"}
+                    break
                 self.commit_cond.wait(timeout=remaining)
-            if self.role != "leader":
-                return {"type": "client_response", "status": "error",
-                        "error": "lost leadership while committing"}
-        return {"type": "client_response", "status": "ok"}
+            if self.commit_index >= last_index:
+                if self.role != "leader":
+                    result: dict = {"type": "client_response",
+                                    "status": "error",
+                                    "error": "lost leadership while committing"}
+                else:
+                    result = {"type": "client_response", "status": "ok"}
+            else:
+                result = {"type": "client_response", "status": "timeout",
+                          "error": "write did not commit in time"}
+        for w in batch:
+            w["result"] = result
+            w["event"].set()
 
     # ------------------------------------------------------------------
     # ReadIndex pending reads

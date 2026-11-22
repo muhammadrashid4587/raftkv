@@ -18,6 +18,12 @@ logic and the failure handling, not the key-value API on top.
 - **Durable log** — `currentTerm`, `votedFor`, and the log are persisted
   per node (`meta.json` + `log.jsonl`, fsynced). A restarted node replays
   its committed log and rejoins without losing data.
+- **Group commit** — concurrent client writes in the same 2ms window
+  share a single fsync on the leader: the first writer opens a batch,
+  joiners pile in, and the batch is appended and replicated as one
+  unit. Follower-side batching does the same per AppendEntries batch.
+  Concurrent write throughput more than doubled (see Benchmark); a
+  lone sequential write just pays the 2ms window.
 - **ReadIndex reads** — a read records the leader's commit index,
   confirms leadership with a heartbeat round to a majority, and only
   returns once the state machine has applied up to that index, so the
@@ -95,7 +101,7 @@ make test
 # or: python3 -m unittest discover -s tests -v
 ```
 
-38 tests, plus a smoke test for the benchmark script, all passing:
+44 tests, plus a smoke test for the benchmark script, all passing:
 
 | Test | What it proves |
 |---|---|
@@ -129,6 +135,8 @@ make test
 | `test_pipeline_window_bounds_in_flight_batches` | Catching up 200 entries has >1 batch in flight at once and never more than the window (10) |
 | `test_pipeline_window_one_is_sequential` | With window=1 at most one batch is ever in flight and replication is still correct |
 | `test_lagging_follower_catches_up_quickly` | 200 entries to a down follower replicate and apply well inside 5s |
+| `test_concurrent_writes_share_one_leader_fsync` | 5 concurrent client writes cost the leader's log exactly 1 fsync, and all 5 replicate to every node |
+| `test_sequential_writes_each_fsync_once` | Sequential writes each pay their own fsync — batching only merges real concurrency |
 | `test_add_fourth_node_catches_up_and_serves_reads` | A 4th node added to a live cluster catches up and serves reads |
 | `test_add_server_already_a_member_is_rejected` | Adding a server that is already a member is rejected |
 | `test_remove_node_cluster_keeps_working` | Removing a node leaves a working 2-node cluster; the removed node stops participating |
@@ -148,22 +156,23 @@ Measured with `scripts/bench.py` (real 3-node cluster on localhost,
 
 ```
 $ python3 scripts/bench.py
-sequential writes          200 ops    ~80 ops/s   p50 ~8.6ms
-concurrent writes x10      200 ops   ~360 ops/s   p50 ~20ms
-sequential reads           200 ops   ~250-380 ops/s
-concurrent reads x10       200 ops   ~185 ops/s
+sequential writes          200 ops   ~105 ops/s   p50 ~8.7ms
+concurrent writes x10      200 ops   ~810 ops/s   p50 ~10.6ms
+sequential reads           200 ops   ~250-730 ops/s
+concurrent reads x10       200 ops   ~185-190 ops/s
 ```
 
 This is latency-bound, not throughput-bound: every committed write
 pays a full round trip to a majority plus a disk fsync, ~8-9ms each
-on this VM, so a single sequential client manages ~80 writes/sec.
-Concurrency overlaps the fsyncs and reaches ~360 writes/sec.
-Pipelining (v0.5.0) does not raise the sequential number — its win
-is elsewhere: a lagging follower catches up in a few concurrent
-batches instead of one round trip per batch, and on a real network
-(where RTT is not ~0.2ms) the overlapped round trips matter. Group
-commit — batching the fsyncs — is what would raise write
-throughput; see the roadmap.
+on this VM, so a single sequential client manages ~105 writes/sec.
+Group commit (v0.7.0) is what raised the concurrent number: ten
+clients writing at once now share one fsync per batch instead of
+one per write, so concurrent throughput went from ~360 to ~810
+writes/sec. Pipelining (v0.5.0) does not raise the sequential number
+— its win is elsewhere: a lagging follower catches up in a few
+concurrent batches instead of one round trip per batch, and on a
+real network (where RTT is not ~0.2ms) the overlapped round trips
+matter.
 
 ## Architecture
 
@@ -303,11 +312,13 @@ entries left in `log.jsonl` are dropped by their index on reload.
   tracking with an epoch that invalidates stale replies, retry from
   the follower's hint on rejection, one active driver per peer, and
   a five-timeout failure budget so a dead peer fails fast.
-- Group commit for higher write throughput (batch the fsyncs) — in
-  progress: follower-side batching done Nov 22, 2026 — one
-  AppendEntries batch is written to `log.jsonl` with a single fsync
-  (`_append_entries`, tested: 5 entries share 1 fsync, a conflicting
-  batch truncates then appends in 2 fsyncs, a duplicate batch costs
-  0). Still open: batching the leader's own appends across concurrent
-  client writes, so one fsync covers several client requests.
+- ~~Group commit for higher write throughput (batch the fsyncs)~~ —
+  done in v0.7.0: follower-side batching (one AppendEntries batch is
+  written to `log.jsonl` with a single fsync, tested: 5 entries share
+  1 fsync, a conflicting batch truncates then appends in 2 fsyncs, a
+  duplicate batch costs 0) and leader-side batching (concurrent
+  client writes in the same 2ms window share one fsync before
+  replicating; tested: 5 concurrent writes cost the leader's log
+  exactly 1 fsync, sequential writes still pay one each). Concurrent
+  write throughput went from ~360 to ~810 ops/s on the benchmark.
 - ~~A benchmark script (`scripts/bench.py`) with concurrent clients~~ — done Nov 22, 2026: `scripts/bench.py` starts a real 3-node cluster, measures sequential/concurrent committed writes and ReadIndex reads with p50/p95/p99 latencies, and verifies a sample of written keys read back correctly.
