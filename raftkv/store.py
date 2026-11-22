@@ -13,14 +13,46 @@ class KVStore:
     def __init__(self) -> None:
         self._data: dict[str, str] = {}
 
-    def apply(self, command: dict) -> None:
+    # Sentinel for "key absent": distinct from any value a client can
+    # store, so a CAS against a missing key is distinguishable from a
+    # CAS against a stored value (including an empty string).
+    _MISSING = object()
+
+    def apply(self, command: dict) -> dict | None:
         """Apply one committed log command. Commands are dicts like
-        {"op": "set", "key": "k", "value": "v"} or {"op": "del", "key": "k"}."""
+        {"op": "set", "key": "k", "value": "v"} or {"op": "del", "key": "k"}.
+
+        Returns a result dict for commands whose outcome depends on the
+        state at apply time — currently only "cas" — and None for
+        set/del, whose outcome is always ok. The result is what the
+        leader hands back to the waiting client and what the dedup
+        table caches for retries, so it must be a pure function of
+        (state before, command): every node applying the same log
+        computes the same result.
+        """
         op = command.get("op")
         if op == "set":
             self._data[command["key"]] = command["value"]
+            return None
         elif op == "del":
             self._data.pop(command["key"], None)
+            return None
+        elif op == "cas":
+            key = command["key"]
+            expected = command["expected"]
+            current = self._data.get(key, self._MISSING)
+            if current is self._MISSING:
+                return {"type": "client_response", "status": "cas_failed",
+                        "reason": "missing_key", "current": None,
+                        "error": f"cas failed: key {key!r} does not exist"}
+            if current != expected:
+                return {"type": "client_response", "status": "cas_failed",
+                        "reason": "mismatch", "current": current,
+                        "error": f"cas failed: expected {expected!r} but "
+                                 f"current value is {current!r}"}
+            self._data[key] = command["value"]
+            return {"type": "client_response", "status": "ok",
+                    "cas": "success"}
         else:
             raise ValueError(f"unknown command op: {op!r}")
 

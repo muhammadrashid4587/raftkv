@@ -87,6 +87,18 @@ logic and the failure handling, not the key-value API on top.
   carries it; it is bounded (10,000 entries, oldest evicted first)
   and deterministic, so every node's table stays identical. Writes
   without a session id behave exactly as before.
+- **Linearizable compare-and-swap** — `cas key expected value`
+  (`python3 -m raftkv.client cas counter 41 42`) sets the key only if
+  its current value equals `expected`, and fails distinctly when the
+  key is missing (`missing_key`) versus when the value differs
+  (`mismatch`, with the current value in the reply). The CAS rides
+  the Raft log like any other write and its outcome is decided when
+  the entry applies, at its exact position in the log, so it is
+  linearizable: a read after a committed CAS sees the new value (or
+  the old one, if it failed). With a session id a retry returns the
+  first attempt's exact result — success or failure — instead of
+  re-executing, and the result survives snapshots and leader changes
+  with the dedup table.
 - **Real failure handling** — tested end to end: kill the leader, the
   cluster re-elects, writes continue, the old leader rejoins and
   catches up instead of forking.
@@ -100,6 +112,7 @@ make demo
 # In another terminal:
 python3 -m raftkv.client --node 127.0.0.1:5001 set hello world
 python3 -m raftkv.client --node 127.0.0.1:5002 get hello   # -> world
+python3 -m raftkv.client --node 127.0.0.1:5001 cas hello world there  # -> OK
 
 # Watch failover: kill the leader's process, then keep writing.
 # The remaining two nodes elect a new leader within ~a second.
@@ -121,7 +134,7 @@ make test
 # or: python3 -m unittest discover -s tests -v
 ```
 
-54 tests, plus a smoke test for the benchmark script, all passing:
+62 tests, plus a smoke test for the benchmark script, all passing:
 
 | Test | What it proves |
 |---|---|
@@ -175,6 +188,14 @@ make test
 | `test_retry_after_leader_change_is_deduped` | A retry after killing the leader is still deduped by the new leader |
 | `test_dedup_survives_snapshot_and_restart` | Dedup survives log compaction and a leader restart via the snapshot |
 | `test_delete_with_request_id_is_deduped` | Deletes dedup like sets |
+| `test_cas_succeeds_on_match` | CAS with a matching expected value writes and replicates |
+| `test_cas_fails_on_mismatch_value_unchanged` | CAS with a wrong expected value fails and writes nothing |
+| `test_cas_fails_on_missing_key` | CAS on an absent key fails distinctly as missing_key |
+| `test_cas_requires_expected_and_value` | CAS without expected or value is rejected |
+| `test_cas_survives_leader_change` | CAS succeeds against the new leader after the old one dies |
+| `test_cas_retry_with_same_session_id_returns_same_result` | Retried CAS returns the first attempt's result, one log entry |
+| `test_cas_failed_result_survives_snapshot_and_restart` | A failed CAS result survives compaction and a leader restart |
+| `test_cas_cli` | The `cas` CLI subcommand works end to end |
 
 Tests use real nodes (real TCP, real threads, real disk) on localhost —
 no mocks of the consensus path.
@@ -231,6 +252,7 @@ tests/
   test_readindex.py    ReadIndex reads, pending-read registry, deposed leader
   test_membership.py   Add/remove server, serialization, persistence
   test_dedup.py        Client session deduplication
+  test_cas.py          Linearizable compare-and-swap
 ```
 
 **Threading.** One TCP server thread (a thread per connection), one
@@ -254,8 +276,9 @@ network.
   "state": {...}}`, the state machine as of index `n`, written
   atomically (tmp file + rename) when the log is compacted or a
   snapshot is installed. It also carries the voting config and the
-  client-dedup keys covered by the compacted prefix, so neither is
-  lost to compaction. The in-memory log holds only entries after
+  client-dedup keys (with their cached results, so a retried CAS
+  gets its first outcome back) covered by the compacted prefix, so
+  neither is lost to compaction. The in-memory log holds only entries after
   the snapshot.
 
 On restart the node loads its snapshot into the state machine, then
@@ -348,6 +371,22 @@ entries left in `log.jsonl` are dropped by their index on reload.
   timeout but before commit therefore still dedups, and one that
   arrives after a failed attempt appends fresh, which is correct: the
   first write never took effect.
+- **Compare-and-swap.** A CAS is just a log entry whose outcome
+  depends on the state at its position in the log, so it is decided
+  by `KVStore.apply` — the same deterministic function every node
+  runs — and it is linearizable for exactly the same reason a set
+  is: the entry commits to a majority before the client hears back,
+  and a read after it sees the new value (or the old one, if it
+  failed). The only new machinery is returning the outcome to the
+  client: the leader records each CAS entry's apply-time result by
+  log index (`_apply_results`, pruned once the batch's waiters are
+  woken), and the dedup table caches the full result, not just "ok",
+  so a retry with the same session id gets the first attempt's exact
+  outcome. Snapshots carry `[client_id, request_id, result]`
+  triples (old pair-only snapshots still load as ok), and
+  InstallSnapshot carries the table too, so a lagging follower that
+  installs a snapshot adopts the dedup results for the covered
+  prefix.
 - **No dependencies.** Pure stdlib: `socket`, `threading`, `json`,
   `socketserver`. Nothing to install, nothing to break.
 
@@ -406,3 +445,11 @@ entries left in `log.jsonl` are dropped by their index on reload.
   bounded at 10,000 entries with deterministic oldest-first eviction
   and is carried in snapshots, so compaction and restart do not lose
   it. The CLI takes `--client-id` / `--request-id` on `set`/`del`.
+- ~~Linearizable compare-and-swap~~ — done in v0.10.0, Nov 22, 2026:
+  `cas key expected value` is a conditional write replicated through
+  the log, decided at apply time, with distinct `missing_key` and
+  `mismatch` failures; the outcome is returned to the waiting client
+  and cached in the dedup table (including in snapshots and across
+  InstallSnapshot), so a retry with the same session id returns the
+  first attempt's exact result. The CLI takes `cas` with
+  `--client-id` / `--request-id` like `set`/`del`.

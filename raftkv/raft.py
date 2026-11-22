@@ -290,6 +290,13 @@ class RaftNode:
         # appending a duplicate.
         self._dedup: dict[tuple[str, str], dict] = {}
         self._dedup_inflight: dict[tuple[str, str], dict] = {}
+        # Apply-time results by log index, for CAS entries only (see
+        # _apply_committed): a CAS outcome is decided when its entry
+        # applies, so the leader records it here and _flush_write_batch
+        # hands each waiter its own entry's result instead of a shared
+        # "ok". Entries are pruned once their batch's waiters are woken,
+        # so this stays tiny; followers never read it.
+        self._apply_results: dict[int, dict] = {}
         self._running = False
         self._server = None
         self._timer_thread: threading.Thread | None = None
@@ -340,12 +347,22 @@ class RaftNode:
             self.sm.load(snap.get("state") or {})
             # The dedup table for entries the snapshot covers: without
             # it a retry of a compacted-away write would append a
-            # duplicate. The result is always ok once committed, so
-            # only the keys need storing, in insertion order.
-            self._dedup = {
-                (str(c), str(r)): {"type": "client_response", "status": "ok"}
-                for c, r in (snap.get("dedup") or [])
-            }
+            # duplicate. The result is always ok once committed for
+            # set/del, so only the keys need storing for those — but a
+            # CAS result (success, mismatch, or missing key) is part of
+            # the reply a retry must get back, so CAS entries store
+            # [client_id, request_id, result] triples. Snapshots
+            # written before CAS existed store pairs and still load as
+            # ok, exactly as before.
+            self._dedup = {}
+            for item in (snap.get("dedup") or []):
+                if len(item) == 3:
+                    c, r, res = item
+                    self._dedup[(str(c), str(r))] = dict(res)
+                else:
+                    c, r = item
+                    self._dedup[(str(c), str(r))] = {
+                        "type": "client_response", "status": "ok"}
             # A snapshot only ever covers committed entries, so a config
             # entry compacted into it is committed state too: adopt the
             # config it was written with, unless meta.json (newer)
@@ -463,7 +480,10 @@ class RaftNode:
             "last_included_term": self.snapshot_term,
             "state": self.sm.items(),
             "config": self._config_list(),
-            "dedup": [[c, r] for (c, r) in self._dedup],
+            # The dedup table as [client_id, request_id, result]
+            # triples: a CAS result is part of the reply a retry must
+            # get back, so it rides in the snapshot with the key.
+            "dedup": [[c, r, res] for (c, r), res in self._dedup.items()],
         }
         tmp = self._snapshot_path.with_suffix(".json.tmp")
         with open(tmp, "w", encoding="utf-8") as f:
@@ -723,8 +743,19 @@ class RaftNode:
             elif op == "noop":
                 pass
             else:
-                self.sm.apply(entry["command"])
-                self._record_dedup(entry["command"])
+                # The apply result matters for CAS: its outcome is
+                # decided here, at this exact point in the log, so the
+                # result is recorded in the dedup table (a retry gets
+                # the first attempt's outcome, not a re-execution) and,
+                # while this node is the leader, by log index for the
+                # waiter that submitted the entry (see
+                # _flush_write_batch). Set/del return None: their
+                # outcome is always ok.
+                result = self.sm.apply(entry["command"])
+                self._record_dedup(entry["command"], result)
+                if (op == "cas" and result is not None
+                        and self.role == "leader"):
+                    self._apply_results[self.last_applied] = result
         self._save_meta()
         if (self.last_applied > self.snapshot_index
                 and len(self.log) > self.snapshot_threshold):
@@ -733,16 +764,22 @@ class RaftNode:
         # covered by the state machine can be served.
         self._resolve_pending_reads()
 
-    def _record_dedup(self, command: dict) -> None:
+    def _record_dedup(self, command: dict, result: dict | None = None) -> None:
         """Record an applied client write in the dedup table. Lock held.
-        The result is always ok once committed, so only the key is
-        stored. Evicting the oldest entry when the table is full is
-        deterministic — every node applies the same log in the same
-        order, so every node's table stays identical."""
+        The cached result is what a retry with the same session id gets
+        back instead of a second log entry. For set/del the result is
+        always ok once committed; for CAS it is the apply-time outcome
+        (success, mismatch, or missing key), so a retry returns the
+        first attempt's exact result. Evicting the oldest entry when
+        the table is full is deterministic — every node applies the
+        same log in the same order, so every node's table stays
+        identical."""
         key = _dedup_key(command)
         if key is None:
             return
-        self._dedup[key] = {"type": "client_response", "status": "ok"}
+        self._dedup[key] = (
+            dict(result) if result is not None
+            else {"type": "client_response", "status": "ok"})
         while len(self._dedup) > DEDUP_MAX_ENTRIES:
             self._dedup.pop(next(iter(self._dedup)))
 
@@ -1054,6 +1091,23 @@ class RaftNode:
                     for mid, addr in msg["config"]
                 }
                 self._rebuild_peers_from_config()
+            # The snapshot carries the dedup table for the entries it
+            # covers (see _write_snapshot_file): adopt it, merged with
+            # any keys this node already holds for entries past the
+            # snapshot index, so a retry of a compacted-away write
+            # still dedups after installing a snapshot. Snapshots from
+            # before CAS carry pairs and load as ok.
+            if msg.get("dedup") is not None:
+                for item in msg["dedup"]:
+                    if len(item) == 3:
+                        c, r, res = item
+                        self._dedup[(str(c), str(r))] = dict(res)
+                    else:
+                        c, r = item
+                        self._dedup[(str(c), str(r))] = {
+                            "type": "client_response", "status": "ok"}
+                while len(self._dedup) > DEDUP_MAX_ENTRIES:
+                    self._dedup.pop(next(iter(self._dedup)))
             self._write_snapshot_file()
             self._rewrite_log()
             self.commit_index = max(self.commit_index, last_included_index)
@@ -1071,9 +1125,9 @@ class RaftNode:
         if op in ("add_server", "remove_server"):
             return self._on_membership_request(msg)
         key = msg.get("key")
-        if op not in ("set", "get", "del") or key is None:
+        if op not in ("set", "get", "del", "cas") or key is None:
             return {"type": "client_response", "status": "error",
-                    "error": "op must be set/get/del with a key"}
+                    "error": "op must be set/get/del/cas with a key"}
         if self._is_removed():
             return {"type": "client_response", "status": "error",
                     "error": "this node was removed from the cluster"}
@@ -1082,6 +1136,20 @@ class RaftNode:
         command = {"op": op, "key": key}
         if op == "set":
             command["value"] = msg.get("value")
+        if op == "cas":
+            # A conditional write: set key to value only if its current
+            # value equals expected. The comparison happens at apply
+            # time (see KVStore.apply), so the outcome is decided by
+            # the entry's position in the log, like any other write —
+            # and a missing key fails distinctly from a mismatch.
+            if msg.get("expected") is None:
+                return {"type": "client_response", "status": "error",
+                        "error": "cas requires expected"}
+            if msg.get("value") is None:
+                return {"type": "client_response", "status": "error",
+                        "error": "cas requires value"}
+            command["expected"] = msg["expected"]
+            command["value"] = msg["value"]
         # Client session id, when the client sent one: it rides in the
         # log entry so every node records the same dedup key on apply.
         for field in ("client_id", "request_id"):
@@ -1382,11 +1450,20 @@ class RaftNode:
         # dedup table already holds it via _apply_committed) or the
         # batch failed (so nothing was appended), and a retry arriving
         # after this point takes the _dedup path or appends fresh.
+        # A waiter whose entry has an apply-time result (a CAS) gets
+        # that result, not the shared ok: the outcome was decided when
+        # the entry applied, and the waiter must learn it, not just
+        # that the entry committed. Apply results for this batch are
+        # pruned here, once every waiter has its own.
         with self.lock:
             for w in batch:
-                w["result"] = result
+                own = (self._apply_results.get(w["index"])
+                       if result.get("status") == "ok" else None)
+                w["result"] = dict(own) if own is not None else result
                 w["event"].set()
                 self._clear_inflight(w)
+            for idx in [i for i in self._apply_results if i <= last_index]:
+                del self._apply_results[idx]
 
     # ------------------------------------------------------------------
     # ReadIndex pending reads
@@ -1918,6 +1995,11 @@ class RaftNode:
                 "last_included_term": self.snapshot_term,
                 "data": self.sm.items(),
                 "config": self._config_list(),
+                # The dedup table for the covered prefix, so the
+                # follower adopts it (see _on_install_snapshot) and a
+                # retry of a compacted-away write still dedups there.
+                "dedup": [[c, r, res]
+                          for (c, r), res in self._dedup.items()],
             }
         resp = send_rpc(host, port, msg, timeout=RPC_TIMEOUT)
         with self.lock:
