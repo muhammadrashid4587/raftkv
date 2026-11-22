@@ -28,6 +28,13 @@ logic and the failure handling, not the key-value API on top.
   up by AppendEntries receives the snapshot via InstallSnapshot
   (Raft §7) instead. A restarted node loads its snapshot and replays
   only the remaining log suffix.
+- **Pre-vote** — before starting an election a candidate runs a
+  pre-vote round (RequestPreVote, Raft dissertation §4.2.3) and only
+  stands if a majority would vote for it. A voter refuses a pre-vote
+  when it is the leader, when it heard from a live leader recently,
+  or when the candidate's log is stale — and granting one changes no
+  state. A partitioned node can therefore never inflate its term, so
+  rejoining it cannot disrupt the leader or force a re-election.
 - **Leader redirects** — a write or read sent to a follower returns the
   current leader's address; the client follows it automatically.
 - **Real failure handling** — tested end to end: kill the leader, the
@@ -64,7 +71,7 @@ make test
 # or: python3 -m unittest discover -s tests -v
 ```
 
-11 tests, all passing:
+17 tests, all passing:
 
 | Test | What it proves |
 |---|---|
@@ -79,6 +86,12 @@ make test
 | `test_snapshot_compacts_log_and_survives_restart` | Log compacts past the threshold; restarted node resumes from snapshot + suffix |
 | `test_lagging_follower_catches_up_via_install_snapshot` | Follower behind the leader's snapshot catches up via InstallSnapshot |
 | `test_restart_loads_snapshot_without_a_cluster` | Node restarted alone reloads snapshotted state from disk |
+| `test_stale_candidate_prevote_rejected` | A candidate with a stale log gets no pre-vote, and the voter is unchanged |
+| `test_prevote_granted_when_log_current_and_no_leader` | An up-to-date candidate with no live leader wins a pre-vote |
+| `test_prevote_has_no_side_effects` | Granting a pre-vote changes no state and does not consume the real vote |
+| `test_prevote_rejected_when_leader_recently_heard` | A follower with a live leader refuses a pre-vote |
+| `test_partitioned_node_rejoin_does_not_disrupt_leader` | A rejoined node cannot force a re-election or a term jump |
+| `test_election_still_works_after_leader_failure` | Pre-vote does not stop a genuine failover election |
 
 Tests use real nodes (real TCP, real threads, real disk) on localhost —
 no mocks of the consensus path.
@@ -161,6 +174,15 @@ entries left in `log.jsonl` are dropped by their index on reload.
   follower rejects and the leader backs `next_index` down and retries,
   so a new leader brings stale followers up to date instead of
   diverging.
+- **Pre-vote.** Every election starts with a pre-vote round, and the
+  voter rule is the whole point: refuse if you are the leader, if you
+  heard from a leader recently, or if the candidate's log is stale —
+  and change nothing either way. One subtlety: "heard from a leader
+  recently" is tracked with its own timestamp, updated only by a valid
+  AppendEntries / InstallSnapshot. The election timer is reset by vote
+  grants and failed attempts too, so reusing it for the voter rule
+  would make nodes that just attempted an election keep rejecting
+  each other, and a fresh cluster could never elect a leader at all.
 - **No dependencies.** Pure stdlib: `socket`, `threading`, `json`,
   `socketserver`. Nothing to install, nothing to break.
 
@@ -172,7 +194,9 @@ entries left in `log.jsonl` are dropped by their index on reload.
   snapshot loading on restart.
 - Membership changes (joint consensus) for adding/removing nodes.
 - Pre-vote to avoid disruptive re-elections when a partitioned node
-  rejoins with a stale-but-high term.
+  rejoins with a stale-but-high term — done in v0.3.0: RequestPreVote
+  round before every election, voters refuse when they are the leader
+  or heard from a live leader recently, granting changes no state.
 - ReadIndex / lease-based reads to serve reads without a heartbeat
   round on the hot path.
 - Pipelined replication and group commit for higher write throughput.

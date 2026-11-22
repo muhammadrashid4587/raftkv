@@ -111,6 +111,15 @@ class RaftNode:
 
         self._last_heartbeat = time.monotonic()
         self._election_timeout = self._random_timeout()
+        # Last time this node heard from a leader it accepts (a valid
+        # AppendEntries / InstallSnapshot in the current term). Kept
+        # separate from _last_heartbeat on purpose: _last_heartbeat is
+        # reset by vote grants and election attempts too, but the
+        # pre-vote voter rule is only about leader contact — a node
+        # that just ran its own (failed) pre-vote must still be able
+        # to grant one to a peer, or a fresh cluster could never elect
+        # a leader at all. None means "never heard from a leader".
+        self._last_leader_contact: float | None = None
         self._last_heartbeat_sent = 0.0
         self._running = False
         self._server = None
@@ -376,6 +385,8 @@ class RaftNode:
         msg_type = msg.get("type")
         if msg_type == "request_vote":
             return self._on_request_vote(msg)
+        if msg_type == "request_pre_vote":
+            return self._on_request_pre_vote(msg)
         if msg_type == "append_entries":
             return self._on_append_entries(msg)
         if msg_type == "install_snapshot":
@@ -428,6 +439,52 @@ class RaftNode:
                     "term": self.current_term, "vote_granted": granted}
 
     # ------------------------------------------------------------------
+    # RequestPreVote
+    # ------------------------------------------------------------------
+    def _on_request_pre_vote(self, msg: dict) -> dict:
+        """Pre-vote round (Raft dissertation §4.2.3): a candidate asks
+        whether it *would* win an election, without changing any state.
+
+        A pre-vote is granted only if all of these hold:
+        - the proposed term is newer than ours (a stale candidate is
+          not even a contender);
+        - we are not the leader (a live leader never votes itself out);
+        - we have not heard from a leader recently — a follower with a
+          live leader must not help start an election that would
+          disrupt it;
+        - the candidate's log is at least as up to date as ours (same
+          check as RequestVote).
+
+        Granting or denying a pre-vote changes nothing: no term bump,
+        no voted_for, no timer reset. That is the whole point — a
+        partitioned node that cannot reach a majority can never inflate
+        its term, so when it rejoins it cannot force the cluster to
+        step down or re-elect.
+        """
+        term = int(msg["term"])
+        candidate = msg["candidate_id"]
+        with self.lock:
+            if term <= self.current_term:
+                return {"type": "request_pre_vote_response",
+                        "term": self.current_term, "pre_vote_granted": False}
+            if self.role == "leader":
+                return {"type": "request_pre_vote_response",
+                        "term": self.current_term, "pre_vote_granted": False}
+            if (self._last_leader_contact is not None
+                    and time.monotonic() - self._last_leader_contact
+                    < self._election_timeout):
+                return {"type": "request_pre_vote_response",
+                        "term": self.current_term, "pre_vote_granted": False}
+            cand_term = int(msg["last_log_term"])
+            cand_index = int(msg["last_log_index"])
+            up_to_date = (cand_term > self._last_log_term()) or (
+                cand_term == self._last_log_term()
+                and cand_index >= self._last_log_index()
+            )
+            return {"type": "request_pre_vote_response",
+                    "term": self.current_term, "pre_vote_granted": up_to_date}
+
+    # ------------------------------------------------------------------
     # AppendEntries
     # ------------------------------------------------------------------
     def _on_append_entries(self, msg: dict) -> dict:
@@ -450,6 +507,7 @@ class RaftNode:
             self.role = "follower"
             self.leader_id = leader_id
             self._reset_election_timer()
+            self._last_leader_contact = time.monotonic()
 
             # Log matching property: the log must contain an entry at
             # prev_log_index with term prev_log_term, or the RPC fails
@@ -527,6 +585,7 @@ class RaftNode:
             self.role = "follower"
             self.leader_id = leader_id
             self._reset_election_timer()
+            self._last_leader_contact = time.monotonic()
 
             if last_included_index <= self.snapshot_index:
                 # We already have this snapshot (or a newer one).
@@ -777,9 +836,79 @@ class RaftNode:
     # ------------------------------------------------------------------
     # Elections
     # ------------------------------------------------------------------
-    def _run_election(self) -> None:
-        """Start an election in this term. Runs on the timer thread."""
+    def _run_pre_vote(self) -> tuple[bool, int, float]:
+        """One pre-vote round for term current_term + 1.
+
+        Sends RequestPreVote to every peer without changing any local
+        state. Returns (majority_granted, term_before, heartbeat_mark):
+        the gate values _run_election re-checks under the lock before
+        starting the real election, so a leader that contacted us
+        mid-round still wins the race. If any voter reports a term
+        newer than ours, step down to it first — we learned of a newer
+        term, so an election in our old term + 1 is moot.
+        """
         with self.lock:
+            term_before = self.current_term
+            heartbeat_mark = self._last_heartbeat
+            proposed_term = term_before + 1
+            last_index = self._last_log_index()
+            last_term = self._last_log_term()
+        msg = {
+            "type": "request_pre_vote",
+            "term": proposed_term,
+            "candidate_id": self.id,
+            "last_log_index": last_index,
+            "last_log_term": last_term,
+        }
+        grants: set[str] = {self.id}
+        grant_lock = threading.Lock()
+        max_term = [term_before]
+
+        def _ask(peer: str) -> None:
+            host, port = self.peers[peer]
+            resp = send_rpc(host, port, msg, timeout=RPC_TIMEOUT)
+            if resp is None:
+                return
+            with grant_lock:
+                max_term[0] = max(max_term[0], int(resp.get("term", 0)))
+                if resp.get("pre_vote_granted"):
+                    grants.add(peer)
+
+        threads = [threading.Thread(target=_ask, args=(p,), daemon=True)
+                   for p in self.peers]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=RPC_TIMEOUT + 0.2)
+        with self.lock:
+            if max_term[0] > self.current_term:
+                self._step_down(max_term[0])
+        return len(grants) >= self._majority(), term_before, heartbeat_mark
+
+    def _run_election(self) -> None:
+        """Start an election in this term. Runs on the timer thread.
+
+        Pre-vote first: only start a real election if a majority would
+        vote for us. A candidate that cannot reach a majority (or whose
+        log is stale, or whose cluster already has a live leader) never
+        bumps its term, so it cannot disrupt the leader when it
+        rejoins. The gate is re-checked under the lock right before the
+        term increment, so a heartbeat that lands mid-round still wins.
+        """
+        granted, term_before, heartbeat_mark = self._run_pre_vote()
+        with self.lock:
+            if (
+                not granted
+                or self.role == "leader"
+                or self.current_term != term_before
+                or self._last_heartbeat != heartbeat_mark
+            ):
+                # No mandate, or something changed while we asked: a
+                # leader contacted us, we stepped down to a newer term,
+                # or we granted a vote. Back off and try again after a
+                # fresh randomized timeout instead of spinning.
+                self._reset_election_timer()
+                return
             self.current_term += 1
             self.voted_for = self.id
             self.role = "candidate"
