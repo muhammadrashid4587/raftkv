@@ -95,7 +95,7 @@ make test
 # or: python3 -m unittest discover -s tests -v
 ```
 
-38 tests, all passing:
+38 tests, plus a smoke test for the benchmark script, all passing:
 
 | Test | What it proves |
 |---|---|
@@ -143,24 +143,27 @@ no mocks of the consensus path.
 
 ## Benchmark
 
-Measured on this dev VM, 3-node localhost cluster, single client doing
-sequential committed writes (each write waits for majority replication
-and an fsync of the log append):
+Measured with `scripts/bench.py` (real 3-node cluster on localhost,
+200 writes, 10 threads, 32-byte values), Nov 22, 2026, on this dev VM:
 
 ```
-200 sequential committed writes in 0.54s -> ~370 writes/sec
+$ python3 scripts/bench.py
+sequential writes          200 ops    ~80 ops/s   p50 ~8.6ms
+concurrent writes x10      200 ops   ~360 ops/s   p50 ~20ms
+sequential reads           200 ops   ~250-380 ops/s
+concurrent reads x10       200 ops   ~185 ops/s
 ```
 
-This is latency-bound, not throughput-bound: every write pays a full
-round trip to a majority plus a disk fsync. Pipelining (v0.5.0) does
-not raise that number on localhost — 200 concurrent writes from 10
-threads measure ~350-400 writes/sec, the same ballpark, because the
-leader and followers fsync every entry under their locks and the
-fsyncs serialize the work. Pipelining's win is elsewhere: a lagging
-follower catches up in a few concurrent batches instead of one round
-trip per batch, and on a real network (where RTT is not ~0.2ms) the
-overlapped round trips matter. Group commit — batching the fsyncs —
-is what would raise write throughput; see the roadmap.
+This is latency-bound, not throughput-bound: every committed write
+pays a full round trip to a majority plus a disk fsync, ~8-9ms each
+on this VM, so a single sequential client manages ~80 writes/sec.
+Concurrency overlaps the fsyncs and reaches ~360 writes/sec.
+Pipelining (v0.5.0) does not raise the sequential number — its win
+is elsewhere: a lagging follower catches up in a few concurrent
+batches instead of one round trip per batch, and on a real network
+(where RTT is not ~0.2ms) the overlapped round trips matter. Group
+commit — batching the fsyncs — is what would raise write
+throughput; see the roadmap.
 
 ## Architecture
 
@@ -300,4 +303,4 @@ entries left in `log.jsonl` are dropped by their index on reload.
   the follower's hint on rejection, one active driver per peer, and
   a five-timeout failure budget so a dead peer fails fast.
 - Group commit for higher write throughput (batch the fsyncs).
-- A benchmark script (`scripts/bench.py`) with concurrent clients.
+- ~~A benchmark script (`scripts/bench.py`) with concurrent clients~~ — done Nov 22, 2026: `scripts/bench.py` starts a real 3-node cluster, measures sequential/concurrent committed writes and ReadIndex reads with p50/p95/p99 latencies, and verifies a sample of written keys read back correctly.
