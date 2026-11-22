@@ -195,9 +195,10 @@ network.
   atomically (tmp file + rename) on every change.
 - `log.jsonl` — one JSON object per line,
   `{"term": n, "index": g, "command": {"op": "set", "key": "k", "value": "v"}}`,
-  appended + fsynced per entry, rewritten whole after a truncation or
-  a snapshot. Each entry carries its global log index, so a restart can
-  tell a pre-snapshot entry from a live one.
+  appended in batches with one fsync per batch (group commit),
+  rewritten whole after a truncation or a snapshot. Each entry
+  carries its global log index, so a restart can tell a
+  pre-snapshot entry from a live one.
 - `snapshot.json` — `{"last_included_index": n, "last_included_term": t,
   "state": {...}}`, the state machine as of index `n`, written
   atomically (tmp file + rename) when the log is compacted or a
@@ -302,5 +303,11 @@ entries left in `log.jsonl` are dropped by their index on reload.
   tracking with an epoch that invalidates stale replies, retry from
   the follower's hint on rejection, one active driver per peer, and
   a five-timeout failure budget so a dead peer fails fast.
-- Group commit for higher write throughput (batch the fsyncs).
+- Group commit for higher write throughput (batch the fsyncs) — in
+  progress: follower-side batching done Nov 22, 2026 — one
+  AppendEntries batch is written to `log.jsonl` with a single fsync
+  (`_append_entries`, tested: 5 entries share 1 fsync, a conflicting
+  batch truncates then appends in 2 fsyncs, a duplicate batch costs
+  0). Still open: batching the leader's own appends across concurrent
+  client writes, so one fsync covers several client requests.
 - ~~A benchmark script (`scripts/bench.py`) with concurrent clients~~ — done Nov 22, 2026: `scripts/bench.py` starts a real 3-node cluster, measures sequential/concurrent committed writes and ReadIndex reads with p50/p95/p99 latencies, and verifies a sample of written keys read back correctly.

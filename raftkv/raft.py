@@ -21,11 +21,11 @@ Per node, in ``data_dir``:
 - ``meta.json`` — current_term, voted_for, commit_index (rewritten
   atomically via tmp file + rename whenever it changes).
 - ``log.jsonl`` — one JSON object per line,
-  {"term": n, "index": g, "command": {...}}. Appended + fsynced on
-  every new entry; rewritten whole when the log is truncated by a
-  conflicting AppendEntries or compacted by a snapshot. Each entry
-  carries its global log index so a restart can tell a pre-snapshot
-  entry (index <= snapshot_index) from a live one.
+  {"term": n, "index": g, "command": {...}}. Appended in batches with
+  one fsync per batch (group commit); rewritten whole when the log is
+  truncated by a conflicting AppendEntries or compacted by a snapshot.
+  Each entry carries its global log index so a restart can tell a
+  pre-snapshot entry (index <= snapshot_index) from a live one.
 - ``snapshot.json`` — {"last_included_index": n, "last_included_term": t,
   "state": {...}}, the compacted state machine as of index n, written
   atomically. The in-memory log holds only entries *after* the
@@ -338,8 +338,19 @@ class RaftNode:
 
     def _append_log_entry(self, entry: dict) -> None:
         """Append one entry to log.jsonl and fsync. Call with lock held."""
+        self._append_log_entries([entry])
+
+    def _append_log_entries(self, entries: list) -> None:
+        """Append entries to log.jsonl with a single fsync (group commit).
+
+        Every entry in the batch is written and flushed before the one
+        fsync, so a crash can never leave a later entry durable while
+        an earlier one is lost — the batch is durable as a unit. Call
+        with the lock held.
+        """
         with open(self._log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry) + "\n")
+            for entry in entries:
+                f.write(json.dumps(entry) + "\n")
             f.flush()
             os.fsync(f.fileno())
 
@@ -357,10 +368,19 @@ class RaftNode:
         """Append one entry to the in-memory log and log.jsonl, stamping
         it with its global log index. Call with the lock held. Returns
         the entry's global index."""
-        index = self.snapshot_index + len(self.log) + 1
-        entry["index"] = index
-        self.log.append(entry)
-        self._append_log_entry(entry)
+        return self._append_entries([entry])
+
+    def _append_entries(self, entries: list) -> int:
+        """Append entries to the in-memory log and log.jsonl, stamping
+        each with its global log index, with a single fsync for the
+        whole batch (group commit). Call with the lock held. Returns
+        the last entry's global index."""
+        index = self.snapshot_index + len(self.log)
+        for entry in entries:
+            index += 1
+            entry["index"] = index
+            self.log.append(entry)
+        self._append_log_entries(entries)
         return index
 
     def _write_snapshot_file(self) -> None:
@@ -839,20 +859,27 @@ class RaftNode:
 
             # Append new entries, deleting anything that conflicts.
             # Entries at or below the snapshot are already applied here,
-            # so they are skipped, not re-appended.
+            # so they are skipped, not re-appended. The entries that are
+            # actually new go on in one batch with a single fsync
+            # (group commit): once the first divergent entry is found,
+            # everything from there on is new, so the rest of the batch
+            # is appended together.
+            new_entries: list = []
             idx = prev_index
-            for entry in entries:
+            for i, entry in enumerate(entries):
                 idx += 1
                 if idx <= self.snapshot_index:
                     continue
                 pos = idx - self.snapshot_index - 1
+                if pos < len(self.log) and self.log[pos]["term"] == entry["term"]:
+                    continue
                 if pos < len(self.log):
-                    if self.log[pos]["term"] != entry["term"]:
-                        del self.log[pos:]
-                        self._rewrite_log()
-                        self._append_entry(entry)
-                else:
-                    self._append_entry(entry)
+                    del self.log[pos:]
+                    self._rewrite_log()
+                new_entries = entries[i:]
+                break
+            if new_entries:
+                self._append_entries(new_entries)
 
             if leader_commit > self.commit_index:
                 self.commit_index = min(leader_commit, self._last_log_index())
