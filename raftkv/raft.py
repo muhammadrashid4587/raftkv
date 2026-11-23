@@ -260,6 +260,20 @@ class RaftNode:
         # snapshot.json, so a restart mid-transition resumes in joint
         # phase instead of forgetting the change halfway.
         self._joint_new: dict[str, tuple[str, int] | None] | None = None
+        # Removal is an event, not a config derivation (see
+        # _is_removed): True once this node has been removed from the
+        # cluster, and False for a server that was never a member —
+        # a server being added adopts the old config from a snapshot
+        # before it ever joins, so "not in the config" must not by
+        # itself mean "removed". Persisted in meta.json, so a restart
+        # of a removed node stays removed.
+        self._removed = False
+        # True once this node has been a member of a cluster config —
+        # via a config entry, a snapshot, or applying entries while
+        # in the config. A snapshot whose config excludes a server
+        # that has been a member is a removal; the same snapshot
+        # landing on a server that never was one is just catch-up.
+        self._was_member = False
         # True while a thread is driving the final config entry that
         # completes a joint transition (see _complete_joint_transition):
         # exactly one driver, so a leader that applies a joint entry
@@ -415,12 +429,17 @@ class RaftNode:
     def _load_persistent_state(self) -> None:
         meta_config = False
         meta_joint = False
-        if self._meta_path.exists():
+        removed_from_meta: bool | None = None
+        was_member_from_meta: bool | None = None
+        meta_exists = self._meta_path.exists()
+        if meta_exists:
             with open(self._meta_path, "r", encoding="utf-8") as f:
                 meta = json.load(f)
             self.current_term = int(meta.get("current_term", 0))
             self.voted_for = meta.get("voted_for")
             self.commit_index = int(meta.get("commit_index", 0))
+            removed_from_meta = meta.get("removed")
+            was_member_from_meta = meta.get("was_member")
             # The config as of the last applied prefix (see _save_meta):
             # newest first, so it wins over the snapshot's older one.
             # meta.json written before membership changes existed has no
@@ -483,6 +502,21 @@ class RaftNode:
         # except this node. A stale --peers list on the command line
         # cannot resurrect a removed server, and a server added since
         # this node last ran is learned from the persisted config.
+        # Removal and membership survive restarts too. Metas written
+        # before the flags existed have neither key: derive removal
+        # from the config, as _is_removed used to — a node whose
+        # persisted config leaves it out was removed. A node with no
+        # meta file at all is fresh: it keeps the __init__ defaults
+        # (not removed, never a member), so the derivation must not
+        # run for it — its constructor config still names itself.
+        if removed_from_meta is not None:
+            self._removed = bool(removed_from_meta)
+            self._was_member = bool(was_member_from_meta)
+        elif meta_exists:
+            self._removed = (self.id not in self.config
+                             and (self._joint_new is None
+                                  or self.id not in self._joint_new))
+            self._was_member = self.id in self.config
         self._rebuild_peers_from_config()
         if self._log_path.exists():
             expected = 1
@@ -527,6 +561,11 @@ class RaftNode:
             # otherwise): a restart mid-transition resumes in joint
             # phase instead of forgetting the change halfway.
             "joint_new": self._joint_list(),
+            # Removal and membership (see _is_removed): a restart of
+            # a removed node stays removed, and a joining server
+            # that restarts mid-add comes back not-removed.
+            "removed": self._removed,
+            "was_member": self._was_member,
         }
         tmp = self._meta_path.with_suffix(".json.tmp")
         with open(tmp, "w", encoding="utf-8") as f:
@@ -660,17 +699,23 @@ class RaftNode:
                 and len(holders & new) >= len(new) // 2 + 1)
 
     def _is_removed(self) -> bool:
-        """True once this node has applied a config entry removing it:
-        it is no longer a voting member, so it must not vote, run for
-        election, or serve client requests. Derived from the config, so
-        a restart of a removed node stays removed. During a joint
-        transition a server in C-new but not yet in C-old (being added)
-        is still a member — it votes in the new config — so it is not
-        removed; a server in C-old but not C-new (being removed) is
-        still a member until the final entry applies."""
-        if self.id in self.config:
-            return False
-        return self._joint_new is None or self.id not in self._joint_new
+        """True once this node has been removed from the cluster.
+
+        Removal is an explicit event, not a reading of the config: a
+        node is removed when it applies a config entry that takes it
+        out (see _apply_removal), or when it installs a snapshot
+        whose config leaves it out after it has been a member (see
+        _install_snapshot_payload). It used to be derived from the
+        config — "not in the voting config means removed" — but a
+        server being added is not in the config yet either, and it
+        adopts the old config from the snapshot it installs to catch
+        up: the derivation flipped a joining server to removed the
+        moment the transfer landed, it then refused every
+        AppendEntries after it, and the add could never complete.
+        The flag is persisted in meta.json, so a restart of a removed
+        node stays removed; a joining server that restarts mid-add
+        comes back not-removed and the add can finish."""
+        return self._removed
 
     def _rebuild_peers_from_config(self) -> None:
         """Reset the address book from the voting config (every member
@@ -766,6 +811,16 @@ class RaftNode:
             self.config.pop(server_id, None)
             self._non_voting.discard(server_id)
             self._apply_removal(server_id)
+        # Membership is learned here too: a server the change adds
+        # (in C-new, or the subject of a legacy add) is a member from
+        # the joint entry on, and one the change keeps is still one —
+        # so a snapshot that later leaves it out registers as its
+        # removal (see _install_snapshot_payload), while a server the
+        # change removes is not one any more.
+        if (self.id in self.config
+                or (self._joint_new is not None
+                    and self.id in self._joint_new)):
+            self._was_member = True
 
     def _apply_removal(self, server_id: str,
                        old_config: dict | None = None) -> None:
@@ -793,7 +848,11 @@ class RaftNode:
             # but it will not vote, run for election, or serve
             # client requests, and a leader that removed itself
             # steps down here — the removal entry is committed, so
-            # the cluster has already agreed on it.
+            # the cluster has already agreed on it. This is the
+            # removal event _is_removed is built on: a config entry
+            # taking this node out marks it removed here, not a
+            # reading of the config afterwards.
+            self._removed = True
             self.role = "follower"
             self.leader_id = None
             self._fail_pending_reads()
@@ -1129,6 +1188,7 @@ class RaftNode:
         the threshold, compact it into a snapshot so the log (and the
         replay on the next restart) stays bounded.
         """
+        applied_from = self.last_applied
         while self.last_applied < self.commit_index:
             self.last_applied += 1
             entry = self.log[self.last_applied - self.snapshot_index - 1]
@@ -1185,6 +1245,22 @@ class RaftNode:
                     key = _dedup_key(entry["command"])
                     if key is None or key in self._dedup_inflight:
                         self._apply_results[self.last_applied] = result
+        # Applying entries while in the voting config is membership
+        # too: the initial members never apply a config entry that
+        # names them, so without this they would never count as
+        # members — and a snapshot that later left one out would not
+        # register as its removal. Only a call that actually applied
+        # something counts: the replay on load runs this check too,
+        # and a fresh server's constructor config still names itself,
+        # so an empty apply must not mark a joiner a member before
+        # it ever held a membership. A joining server applies its
+        # catch-up entries while the config still leaves it out, so
+        # this never marks one a member early either.
+        if (self.last_applied > applied_from
+                and (self.id in self.config
+                     or (self._joint_new is not None
+                         and self.id in self._joint_new))):
+            self._was_member = True
         self._save_meta()
         if (self.last_applied > self.snapshot_index
                 and len(self.log) > self.snapshot_threshold):
@@ -1634,6 +1710,13 @@ class RaftNode:
                         "term": self.current_term, "success": True,
                         "match_index": self._last_log_index()}
 
+            # Whether this node had been a member before this
+            # install: the snapshot's config decides removal below,
+            # and only a server that had been a member can be removed
+            # by one (see _is_removed). Captured before the install
+            # mutates anything.
+            was_member_before = self._was_member
+
             # Keep log entries after last_included_index only if the
             # entry at that index still matches the snapshot's term;
             # otherwise the whole log is stale and goes.
@@ -1668,6 +1751,20 @@ class RaftNode:
                 self._rebuild_peers_from_config()
             elif self.last_applied <= last_included_index:
                 self._joint_new = None
+            # Membership from the snapshot's config: a config that
+            # includes this node makes it a member; one that leaves
+            # it out removes it — but only if it had been a member
+            # before. A server being added installs exactly this
+            # snapshot to catch up, and the old config it adopts is
+            # not a membership it ever held, so the same exclusion
+            # must not remove it: it just adopts the config and keeps
+            # accepting replication until its own add completes.
+            if (self.id in self.config
+                    or (self._joint_new is not None
+                        and self.id in self._joint_new)):
+                self._was_member = True
+            elif was_member_before:
+                self._removed = True
             # The snapshot carries the dedup table for the entries it
             # covers (see _write_snapshot_file): adopt it, merged with
             # any keys this node already holds for entries past the

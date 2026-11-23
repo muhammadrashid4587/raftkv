@@ -10,9 +10,13 @@ change, and a leader dying mid-transition hands the half-open joint
 phase to the next leader. These tests drive the change through the
 faults and verify the cluster converges afterwards: every acked write
 still reads back, and the new membership is durable — the config every
-node reports, after restarts, is the changed one.
+node reports, after restarts, is the changed one. The snapshot-transfer
+tests drive the other half of the same danger: an add whose catch-up
+needs InstallSnapshot (the leader already compacted past the new node)
+and a lagging follower that needs a snapshot while the add is in flight.
 """
 
+import random
 import sys
 import threading
 import time
@@ -24,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 import chaos as chaos_script  # noqa: E402
 
 from harness import Cluster, client_request, wait_for_key
+from raftkv.linearizability import History, record_client_op
 
 
 def _set(addr, key, value):
@@ -35,10 +40,11 @@ def _get(addr, key):
     return client_request(addr, {"type": "client", "op": "get", "key": key})
 
 
-def _add_server(addr, server_id, server_addr):
+def _add_server(addr, server_id, server_addr, timeout=12.0):
     return client_request(addr, {"type": "client", "op": "add_server",
                                  "server_id": server_id,
-                                 "addr": [server_addr[0], server_addr[1]]})
+                                 "addr": [server_addr[0], server_addr[1]]},
+                          timeout=timeout)
 
 
 def _remove_server(addr, server_id):
@@ -46,16 +52,23 @@ def _remove_server(addr, server_id):
                                  "server_id": server_id})
 
 
-def _add_server_retry(addr, server_id, server_addr, timeout=30.0):
+def _add_server_retry(addr, server_id, server_addr, timeout=30.0,
+                      rpc_timeout=12.0):
     """Add a server, retrying until it acks ok or the deadline passes.
     A leader dying mid-add fails the attempt ("lost leadership while
     adding server"), and a joint entry that cannot commit yet returns
     a timeout — either way the change is retried, not lost: the next
-    leader either finishes the open transition or takes a fresh add."""
+    leader either finishes the open transition or takes a fresh add.
+    The per-attempt timeout must cover the whole add: a slow catch-up
+    (a snapshot transfer in many chunks) that outruns it leaves the
+    first attempt still running on the server, and every retry then
+    answers "a membership change is already in progress" instead of
+    the change's outcome — so slow adds pass a longer rpc_timeout."""
     deadline = time.monotonic() + timeout
     last = None
     while time.monotonic() < deadline:
-        last = _add_server(addr, server_id, server_addr)
+        last = _add_server(addr, server_id, server_addr,
+                           timeout=rpc_timeout)
         if last.get("status") == "ok":
             return last
         time.sleep(0.2)
@@ -358,6 +371,350 @@ class TestMembershipPhasePolling(unittest.TestCase):
             # must have been observed.
             self.assertTrue(any(p != "stable" for p in phases),
                             f"no intermediate phase observed: {timeline}")
+        finally:
+            cluster.stop_all()
+
+
+def _count_snapshot_chunks(node):
+    """Wrap a node's chunked-snapshot handler to record every
+    InstallSnapshot chunk it receives: (monotonic time, chunk_index,
+    chunk_total). The RPC dispatch calls the handler through the
+    instance, so shadowing the class method on the instance observes
+    every chunk. Returns the list the wrapper appends to."""
+    chunks: list = []
+    lock = threading.Lock()
+    orig = node._on_snapshot_chunk
+
+    def counting(msg, last_included_index, last_included_term):
+        with lock:
+            chunks.append((time.monotonic(),
+                           int(msg.get("chunk_index", -1)),
+                           int(msg.get("chunk_total", -1))))
+        return orig(msg, last_included_index, last_included_term)
+
+    node._on_snapshot_chunk = counting
+    return chunks
+
+
+def _wait_for_snapshot(node, index, timeout=10.0):
+    """Poll until a node's snapshot covers at least ``index``."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if node.snapshot_index >= index:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _start_load(addr, history):
+    """Start two writer threads (session-id sets, recorded in the
+    shared history) and one reader thread (reads acked keys,
+    recorded too) against ``addr``. Returns (acked, errors, stop,
+    threads): callers set ``stop`` and join the threads when the
+    load should end."""
+    acked: dict[str, str] = {}
+    errors: list[str] = []
+    lock = threading.Lock()
+    written_counts = [0, 0]
+    stop = threading.Event()
+
+    def writer(thread_id: int) -> None:
+        i = 0
+        while not stop.is_set():
+            key = f"snapchaos:t{thread_id}:{i}"
+            value = f"v{thread_id}-{i}"
+            msg = {"type": "client", "op": "set", "key": key,
+                   "value": value,
+                   "client_id": f"snapchaos-{thread_id}",
+                   "request_id": str(i)}
+            first_invoke = time.monotonic()
+            deadline = first_invoke + 60.0
+            while True:
+                resp = client_request(addr, msg, timeout=3.0)
+                if resp.get("status") == "ok":
+                    with lock:
+                        acked[key] = value
+                        written_counts[thread_id] = i + 1
+                    record_client_op(history, f"snapchaos-{thread_id}",
+                                     i, msg, resp, first_invoke,
+                                     time.monotonic())
+                    break
+                if time.monotonic() > deadline:
+                    errors.append(f"{key}: never acked, last {resp}")
+                    return
+                time.sleep(0.1)
+            i += 1
+
+    def reader() -> None:
+        rng = random.Random(99)
+        seq = 0
+        while not stop.is_set():
+            with lock:
+                counts = list(written_counts)
+            candidates = [(t, i) for t in range(2)
+                          for i in range(counts[t])]
+            if not candidates:
+                time.sleep(0.05)
+                continue
+            t, i = rng.choice(candidates)
+            msg = {"type": "client", "op": "get",
+                   "key": f"snapchaos:t{t}:{i}"}
+            invoke = time.monotonic()
+            resp = client_request(addr, msg, timeout=3.0)
+            record_client_op(history, "snapchaos-reader", seq, msg,
+                             resp, invoke, time.monotonic())
+            seq += 1
+            time.sleep(0.005)
+
+    threads = [threading.Thread(target=writer, args=(t,), daemon=True)
+               for t in range(2)]
+    threads.append(threading.Thread(target=reader, daemon=True))
+    for t in threads:
+        t.start()
+    return acked, errors, stop, threads
+
+
+class TestSnapshotTransferDuringMembershipChange(unittest.TestCase):
+    def test_add_node_catches_up_via_snapshot_during_membership_change(self):
+        cluster = Cluster(3, snapshot_threshold=50, snapshot_chunk_size=64,
+                          membership_catchup_timeout=15.0)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            # 150 keys: the leader compacts well past the threshold,
+            # so a brand-new node cannot catch up by AppendEntries —
+            # the entries it is missing are already gone from the
+            # leader's log, and only InstallSnapshot can bring it up
+            # to date. The 64-byte chunk size stretches that transfer
+            # over hundreds of RPCs, so it is genuinely in flight
+            # while the membership change runs.
+            for i in range(150):
+                self.assertEqual(
+                    _set(addr, f"snap:k{i}", "x" * 40).get("status"), "ok")
+            self.assertTrue(_wait_for_snapshot(leader, 100),
+                            f"leader never snapshotted: "
+                            f"{leader.snapshot_index}")
+            node4 = cluster.add_node("node4")
+            chunks = _count_snapshot_chunks(node4)
+
+            history = History()
+            acked, errors, stop_load, load_threads = _start_load(
+                addr, history)
+            samples: list = []
+            stop_poll = threading.Event()
+            poller = threading.Thread(
+                target=chaos_script.poll_membership_phases,
+                args=(cluster.status, lambda: list(cluster.nodes),
+                      stop_poll, samples),
+                daemon=True)
+            poller.start()
+            add_start = time.monotonic()
+            try:
+                # The catch-up streams a snapshot in 64-byte chunks,
+                # so one attempt must be allowed to run long: a
+                # client timeout shorter than the transfer would leave
+                # the attempt running on the server and every retry
+                # answering "already in progress" instead.
+                resp = _add_server_retry(addr, "node4",
+                                         cluster.addrs["node4"],
+                                         rpc_timeout=60.0)
+            finally:
+                add_end = time.monotonic()
+                stop_load.set()
+                # Let the poller sample the post-add stable phase too.
+                time.sleep(0.5)
+                stop_poll.set()
+            for t in load_threads:
+                t.join(timeout=70.0)
+            poller.join(timeout=5.0)
+            self.assertEqual(resp.get("status"), "ok", resp)
+
+            # The new node really did catch up through a chunked
+            # snapshot transfer, and the transfer ran while the add
+            # RPC was in flight — it is the catch-up phase of the
+            # membership change, not something that happened before
+            # or after it.
+            in_flight = [c for c in chunks
+                         if add_start <= c[0] <= add_end]
+            self.assertGreaterEqual(
+                len(in_flight), 2,
+                f"no chunked snapshot transfer during the add: "
+                f"{len(chunks)} chunks total")
+            self.assertGreater(max(c[2] for c in chunks), 1,
+                               "snapshot arrived in a single chunk, "
+                               "not streamed")
+            self.assertGreater(node4.snapshot_index, 0,
+                               "node4 installed no snapshot")
+            # The poller watched the transition go through the
+            # catching-up phase (the snapshot transfer) to stable.
+            timeline = chaos_script.summarize_phases(samples)
+            phases = timeline.split(" -> ") if timeline else []
+            self.assertIn("catching_up", phases,
+                          f"timeline never showed catching_up: {timeline}")
+            self.assertEqual(phases[-1], "stable",
+                             f"timeline does not end stable: {timeline}")
+            self.assertEqual(errors, [], "writes that never acked")
+            self.assertGreaterEqual(
+                len(acked), 5,
+                "writers should have acked writes during the add")
+            # Linearizability across the transfer: no concurrent read
+            # saw a stale value or a value from the future.
+            lin = history.check()
+            self.assertTrue(lin.ok, str(lin))
+            self.assertGreaterEqual(
+                lin.reads_checked, 1,
+                "reader should have observed reads during the add")
+
+            # Every node ends in the 4-node config with no joint
+            # phase left, holding every pre-add key and every acked
+            # write — and nothing else.
+            expected = {f"snap:k{i}": "x" * 40 for i in range(150)}
+            expected.update(acked)
+            cluster.wait_for_stable_leader()
+            for nid in ("node1", "node2", "node3", "node4"):
+                self.assertTrue(
+                    cluster.wait_for_config(
+                        nid, ["node1", "node2", "node3", "node4"]),
+                    f"{nid} config is not the 4-node config: "
+                    f"{cluster.status(nid).get('config')}")
+                self.assertIsNone(cluster.status(nid).get("joint_new"),
+                                  f"{nid} still in a joint transition")
+            for node in cluster.nodes.values():
+                for key, value in expected.items():
+                    self.assertTrue(wait_for_key(node, key, value),
+                                    f"{node.id} missing {key}={value}")
+            states = [node.sm.items() for node in cluster.nodes.values()]
+            for state in states[1:]:
+                self.assertEqual(state, states[0],
+                                 "nodes diverged after snapshot add")
+            self.assertEqual(states[0], expected)
+            # Writes still work on the enlarged cluster.
+            new_leader = cluster.wait_for_leader()
+            self.assertEqual(
+                _set(cluster.addrs[new_leader.id], "after", "yes")
+                .get("status"), "ok")
+            self.assertEqual(
+                _get(cluster.addrs[new_leader.id], "after").get("value"),
+                "yes")
+        finally:
+            cluster.stop_all()
+
+    def test_lagging_follower_needs_snapshot_during_add(self):
+        cluster = Cluster(3, snapshot_threshold=50, snapshot_chunk_size=64,
+                          membership_catchup_timeout=15.0)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            # Kill a follower, not the leader: writes keep going to
+            # the leader while the victim is down.
+            victim = [n for n in cluster.nodes.values()
+                      if n is not leader][0]
+            victim_id = victim.id
+            for i in range(60):
+                self.assertEqual(
+                    _set(addr, f"lag:k{i}", "y" * 40).get("status"), "ok")
+            self.assertTrue(_wait_for_snapshot(leader, 50),
+                            f"leader never snapshotted: "
+                            f"{leader.snapshot_index}")
+            # Kill the victim, then write past the end of its log: the
+            # leader snapshots past it, so when it restarts it can
+            # only catch up by InstallSnapshot.
+            cluster.stop_node(victim_id)
+            for i in range(60, 160):
+                self.assertEqual(
+                    _set(addr, f"lag:k{i}", "y" * 40).get("status"), "ok")
+            self.assertTrue(_wait_for_snapshot(leader, 100),
+                            f"leader never re-snapshotted: "
+                            f"{leader.snapshot_index}")
+            node4 = cluster.add_node("node4")
+            chunks4 = _count_snapshot_chunks(node4)
+
+            history = History()
+            acked, errors, stop_load, load_threads = _start_load(
+                addr, history)
+            # Drive the add in the background, then restart the
+            # lagging follower right away: its snapshot transfer
+            # starts while the add — and node4's own snapshot
+            # transfer — is still in flight.
+            result: dict = {}
+
+            def _do_add():
+                result["resp"] = _add_server_retry(
+                    addr, "node4", cluster.addrs["node4"],
+                    rpc_timeout=60.0)
+
+            add_start = time.monotonic()
+            add_thread = threading.Thread(target=_do_add, daemon=True)
+            add_thread.start()
+            lagging = cluster.restart_node(victim_id)
+            chunks_lagging = _count_snapshot_chunks(lagging)
+            add_thread.join(timeout=40.0)
+            add_end = time.monotonic()
+            self.assertFalse(add_thread.is_alive(), "add never returned")
+            stop_load.set()
+            for t in load_threads:
+                t.join(timeout=70.0)
+            self.assertEqual(result["resp"].get("status"), "ok",
+                             result["resp"])
+
+            # Both transfers ran, in chunks, while the add RPC was in
+            # flight: node4's is the add's own catch-up, the lagging
+            # follower's is a lagging follower catching up through the
+            # same window.
+            for name, chunks in ((victim_id, chunks_lagging),
+                                 ("node4", chunks4)):
+                in_flight = [c for c in chunks
+                             if add_start <= c[0] <= add_end]
+                self.assertGreaterEqual(
+                    len(in_flight), 2,
+                    f"{name}: no chunked snapshot transfer during "
+                    f"the add ({len(chunks)} chunks total)")
+                self.assertGreater(max(c[2] for c in chunks), 1,
+                                   f"{name}: snapshot arrived in a "
+                                   f"single chunk, not streamed")
+            self.assertGreater(lagging.snapshot_index, 0,
+                               f"{victim_id} installed no snapshot")
+            self.assertGreater(node4.snapshot_index, 0,
+                               "node4 installed no snapshot")
+            self.assertEqual(errors, [], "writes that never acked")
+            self.assertGreaterEqual(
+                len(acked), 5,
+                "writers should have acked writes during the add")
+            lin = history.check()
+            self.assertTrue(lin.ok, str(lin))
+            self.assertGreaterEqual(
+                lin.reads_checked, 1,
+                "reader should have observed reads during the add")
+
+            expected = {f"lag:k{i}": "y" * 40 for i in range(160)}
+            expected.update(acked)
+            cluster.wait_for_stable_leader()
+            for nid in ("node1", "node2", "node3", "node4"):
+                self.assertTrue(
+                    cluster.wait_for_config(
+                        nid, ["node1", "node2", "node3", "node4"]),
+                    f"{nid} config is not the 4-node config: "
+                    f"{cluster.status(nid).get('config')}")
+                self.assertIsNone(cluster.status(nid).get("joint_new"),
+                                  f"{nid} still in a joint transition")
+            for node in cluster.nodes.values():
+                for key, value in expected.items():
+                    self.assertTrue(wait_for_key(node, key, value),
+                                    f"{node.id} missing {key}={value}")
+            states = [node.sm.items() for node in cluster.nodes.values()]
+            for state in states[1:]:
+                self.assertEqual(state, states[0],
+                                 "nodes diverged after snapshot add")
+            self.assertEqual(states[0], expected)
+            new_leader = cluster.wait_for_leader()
+            self.assertEqual(
+                _set(cluster.addrs[new_leader.id], "after", "yes")
+                .get("status"), "ok")
+            self.assertEqual(
+                _get(cluster.addrs[new_leader.id], "after").get("value"),
+                "yes")
         finally:
             cluster.stop_all()
 

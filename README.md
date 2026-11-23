@@ -299,7 +299,7 @@ make test
 # or: python3 -m unittest discover -s tests -v
 ```
 
-145 tests, plus a smoke test for the benchmark script, all passing:
+147 tests, plus a smoke test for the benchmark script, all passing:
 
 | Test | What it proves |
 |---|---|
@@ -351,6 +351,8 @@ make test
 | `test_membership_survives_leader_restart_mid_chaos` | Writers and kill/restart faults running throughout, a node added mid-run, then the leader killed and restarted: every acked write present on all four nodes, 4-node config everywhere, no joint phase left |
 | `test_chaos_harness_polls_phases_during_add` | The chaos harness's membership poller observes a real add in-process: the timeline holds only valid phases, includes an intermediate phase, and ends stable |
 | `test_summarize_phases_dedupes_and_keeps_order` | The phase-timeline summarizer counts each phase once in first-seen order and still ends with the settled phase, and empty input summarizes to nothing |
+| `test_add_node_catches_up_via_snapshot_during_membership_change` | Adding a node whose catch-up needs a chunked InstallSnapshot (leader compacted past it): the transfer streams in chunks while the add is in flight, writers keep acking through it, and the cluster ends in the 4-node config with every acked write on every node and a linearizable history |
+| `test_lagging_follower_needs_snapshot_during_add` | A lagging follower that needs a snapshot and a new node that needs one transfer concurrently while the add runs: both install chunked snapshots in flight, the add completes, and every acked write is on every node |
 | `test_status_reports_stable_membership` | A healthy cluster reports phase stable, the 3-node config, no joint config, nothing in flight |
 | `test_status_reports_uncommitted_joint_entry` | An isolated leader with a joint entry in its log reports joint_pending with the op, server, and joint index; a follower that never saw the entry still reports stable |
 | `test_status_reports_joint_phase_mid_transition` | A cluster frozen in the joint phase reports joint_committed with the change and the non-voting server from both leader and follower, then stable once the change completes |
@@ -604,7 +606,17 @@ entries left in `log.jsonl` are dropped by their index on reload.
   until its commit index reaches the removal entry — the
   AppendEntries response carries the follower's commit index for
   exactly that check. Removing the last member and removing a server
-  that is not a member are both rejected.
+  that is not a member are both rejected. Removal itself is an
+  explicit event, not a reading of the config: a node is removed
+  when it applies a config entry that takes it out, or when it
+  installs a snapshot whose config leaves it out after it has been a
+  member (`_removed` / `_was_member`, persisted in `meta.json`).
+  It used to be derived — "not in the voting config means removed"
+  — but a server being added is not in the config yet either, and it
+  adopts the old config from the snapshot it installs to catch up:
+  the derivation flipped a joining server to removed the moment the
+  transfer landed, it refused every AppendEntries after it, and the
+  add could never complete when catch-up needed a snapshot.
 - **Client session deduplication.** The dedup table is derived from
   the applied log, not from leader memory: the `(client_id,
   request_id)` pair rides in the log entry and is recorded when the
@@ -944,3 +956,29 @@ entries left in `log.jsonl` are dropped by their index on reload.
   pre-existing `test_add_node_under_partition` flakes under load
   on this box (the add times out or the leader does not answer —
   4/8 on the clean tree too), unrelated to this change.
+- ~~Chaos coverage for snapshot transfer during membership
+  change~~ — done in v0.25.0, Nov 23, 2026:
+  `tests/test_membership_chaos.py` now drives an add whose catch-up
+  needs InstallSnapshot (the leader compacted past the new node's
+  start, 150 keys, 64-byte chunks) with writer/reader threads
+  running through it, and a second test where a lagging follower
+  that needs a snapshot restarts while the add is in flight, so two
+  chunked transfers overlap one membership change. Both assert the
+  transfers really streamed in chunks while the add RPC was open
+  (chunk timestamps inside the add window), the new node ends in the
+  4-node config with the right data, every acked write is present on
+  every node, all states are identical, and the recorded history is
+  linearizable. Building this caught a real bug: a joining server
+  installed the snapshot, adopted the old config (which does not
+  contain it), concluded from the config alone that it had been
+  removed, and then refused every AppendEntries after the transfer
+  — the add could never complete when catch-up needed a snapshot.
+  Removal is now an explicit persisted event (`_removed` /
+  `_was_member` in `meta.json`), set when a config entry takes a
+  node out or a snapshot leaves out a server that had been a
+  member — never by a joining server adopting the old config to
+  catch up. A test-helper fix rides along: `_add_server_retry`
+  takes a per-attempt timeout, since a slow catch-up that outruns
+  the 12s client timeout leaves the first attempt running on the
+  server and every retry answering "already in progress" instead of
+  the change's outcome.
