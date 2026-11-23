@@ -23,10 +23,12 @@ class Cluster:
 
     def __init__(self, n: int = 3, base_dir: str | None = None,
                  snapshot_threshold: int = 1000,
+                 snapshot_chunk_size: int = 65536,
                  pipeline_window: int = 10,
                  membership_catchup_timeout: float = 5.0):
         self.n = n
         self.snapshot_threshold = snapshot_threshold
+        self.snapshot_chunk_size = snapshot_chunk_size
         self.pipeline_window = pipeline_window
         self.membership_catchup_timeout = membership_catchup_timeout
         self.tmp = tempfile.TemporaryDirectory(prefix="raftkv-test-")
@@ -41,6 +43,7 @@ class Cluster:
             data_dir = self.base / node_id
             node = RaftNode(node_id, peers, data_dir, KVStore(),
                             snapshot_threshold=snapshot_threshold,
+                            snapshot_chunk_size=snapshot_chunk_size,
                             pipeline_window=pipeline_window,
                             membership_catchup_timeout=membership_catchup_timeout)
             self.nodes[node_id] = node
@@ -67,6 +70,7 @@ class Cluster:
         peers = {p: self.addrs[p] for p in self.nodes if p != node_id}
         node = RaftNode(node_id, peers, self.base / node_id, KVStore(),
                         snapshot_threshold=self.snapshot_threshold,
+                        snapshot_chunk_size=self.snapshot_chunk_size,
                         pipeline_window=self.pipeline_window,
                         membership_catchup_timeout=self.membership_catchup_timeout)
         self.nodes[node_id] = node

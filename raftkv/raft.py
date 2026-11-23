@@ -79,6 +79,18 @@ READ_INDEX_TIMEOUT = 2.0
 # but still bounds log.jsonl on a long-lived cluster. Tests pass a
 # much smaller value to force snapshots quickly.
 SNAPSHOT_THRESHOLD = 1000
+# InstallSnapshot streams the snapshot in chunks of at most this many
+# characters of serialized JSON (64 KiB by default), instead of one
+# RPC carrying the whole state machine. A large state (megabytes of
+# keys, plus the config and dedup table) would otherwise ride in a
+# single message — blocking the leader's replication driver and the
+# follower's handler thread for the whole transfer, and a failure
+# mid-transfer would discard all of it. Chunked, each chunk is acked
+# before the next is sent, so a failed chunk aborts cleanly and the
+# follower keeps only the buffered prefix; the transfer resumes from
+# chunk 0 on the next replication pass. Tests pass a tiny value to
+# force many chunks through a small snapshot.
+SNAPSHOT_CHUNK_SIZE = 65536
 # Pipelined replication: at most this many AppendEntries batches in
 # flight per follower, each carrying at most PIPELINE_BATCH_SIZE
 # entries. 10 x 32 = 320 entries can be outstanding, which is plenty
@@ -129,6 +141,7 @@ class RaftNode:
         data_dir: str | os.PathLike,
         state_machine,
         snapshot_threshold: int = SNAPSHOT_THRESHOLD,
+        snapshot_chunk_size: int = SNAPSHOT_CHUNK_SIZE,
         pipeline_window: int = PIPELINE_WINDOW,
         pipeline_batch_size: int = PIPELINE_BATCH_SIZE,
         membership_catchup_timeout: float = MEMBERSHIP_CATCHUP_TIMEOUT,
@@ -140,6 +153,10 @@ class RaftNode:
         state_machine: object with an ``apply(command: dict)`` method.
         snapshot_threshold: compact the log once it holds more than this
             many post-snapshot entries (see SNAPSHOT_THRESHOLD).
+        snapshot_chunk_size: at most this many characters of serialized
+            snapshot JSON per InstallSnapshot chunk (see
+            SNAPSHOT_CHUNK_SIZE). Tests pass a tiny value to force a
+            snapshot through many chunks.
         pipeline_window: at most this many AppendEntries batches in
             flight per follower (see PIPELINE_WINDOW). 1 means strictly
             sequential replication; tests use it to compare against.
@@ -160,6 +177,13 @@ class RaftNode:
         # not replicated, not persisted, not rebuilt on restart.
         self.watch = WatchManager()
         self.snapshot_threshold = snapshot_threshold
+        self.snapshot_chunk_size = max(1, snapshot_chunk_size)
+        # Partial InstallSnapshot transfer in progress (see
+        # _on_snapshot_chunk): {"key": (term, leader_id,
+        # last_included_index, chunk_total), "chunks": {index: str},
+        # "last_included_term": int} — or None. In-memory only: a
+        # restart drops it and the leader re-sends from chunk 0.
+        self._snapshot_transfer: dict | None = None
         self.pipeline_window = pipeline_window
         self.pipeline_batch_size = pipeline_batch_size
         self.membership_catchup_timeout = membership_catchup_timeout
@@ -1176,16 +1200,17 @@ class RaftNode:
 
         Sent when a follower is so far behind that the leader has
         already compacted away the entries it is missing — AppendEntries
-        can no longer bring it up to date. The follower replaces its
-        state machine with the snapshot's state, discards its log up to
-        the snapshot's last included index, and keeps any log entries
-        after that index whose prefix still matches.
+        can no longer bring it up to date. The snapshot arrives
+        streamed in chunks (see _send_install_snapshot): each chunk is
+        acked, buffered, and installed only once every chunk has
+        arrived. A message with no ``chunk_index`` is the old
+        whole-snapshot form and installs immediately, so an older
+        leader can still catch a follower up.
         """
         term = int(msg["term"])
         leader_id = msg["leader_id"]
         last_included_index = int(msg["last_included_index"])
         last_included_term = int(msg["last_included_term"])
-        data = msg.get("data") or {}
         with self.lock:
             if self._is_removed():
                 return {"type": "install_snapshot_response",
@@ -1203,6 +1228,88 @@ class RaftNode:
             self._reset_election_timer()
             self._last_leader_contact = time.monotonic()
 
+            if "chunk_index" in msg:
+                return self._on_snapshot_chunk(msg, last_included_index,
+                                               last_included_term)
+            return self._install_snapshot_payload(
+                last_included_index, last_included_term,
+                msg.get("data") or {}, msg.get("config"),
+                msg.get("dedup"))
+
+    def _on_snapshot_chunk(self, msg: dict, last_included_index: int,
+                           last_included_term: int) -> dict:
+        """Buffer one chunk of a streamed InstallSnapshot (lock held).
+
+        The transfer is keyed by (term, leader, last included index,
+        chunk total): a chunk for a different snapshot — a newer
+        snapshot, a new leader, a new term — drops whatever partial
+        transfer was buffered and starts a fresh one, so a superseded
+        transfer can never complete from mixed pieces. A duplicate
+        chunk (the leader re-sending from chunk 0 after a failed
+        chunk) is acked again without storing it twice. The snapshot
+        installs only once every chunk 0..total-1 is buffered, in
+        whatever order they arrived, so a chunk that arrives out of
+        order just waits for the missing ones.
+        """
+        try:
+            chunk_index = int(msg["chunk_index"])
+            chunk_total = int(msg["chunk_total"])
+            chunk = msg["chunk"]
+        except (KeyError, TypeError, ValueError):
+            return {"type": "install_snapshot_response",
+                    "term": self.current_term, "success": False,
+                    "match_index": self._last_log_index()}
+        if (chunk_total < 1 or chunk_index < 0
+                or chunk_index >= chunk_total
+                or not isinstance(chunk, str)):
+            return {"type": "install_snapshot_response",
+                    "term": self.current_term, "success": False,
+                    "match_index": self._last_log_index()}
+        if last_included_index <= self.snapshot_index:
+            # We already have this snapshot (or a newer one): ack so
+            # the leader moves on, and buffer nothing.
+            return {"type": "install_snapshot_response",
+                    "term": self.current_term, "success": True,
+                    "match_index": self._last_log_index()}
+        key = (self.current_term, msg["leader_id"],
+               last_included_index, chunk_total)
+        transfer = self._snapshot_transfer
+        if transfer is None or transfer["key"] != key:
+            transfer = {"key": key, "chunks": {},
+                        "last_included_term": last_included_term}
+            self._snapshot_transfer = transfer
+        transfer["chunks"].setdefault(chunk_index, chunk)
+        if len(transfer["chunks"]) != chunk_total:
+            # Still waiting on the rest: ack the chunk, install
+            # nothing yet.
+            return {"type": "install_snapshot_response",
+                    "term": self.current_term, "success": True,
+                    "match_index": self._last_log_index()}
+        try:
+            payload = json.loads("".join(
+                transfer["chunks"][i] for i in range(chunk_total)))
+        except ValueError:
+            self._snapshot_transfer = None
+            return {"type": "install_snapshot_response",
+                    "term": self.current_term, "success": False,
+                    "match_index": self._last_log_index()}
+        self._snapshot_transfer = None
+        return self._install_snapshot_payload(
+            last_included_index, last_included_term,
+            payload.get("data") or {}, payload.get("config"),
+            payload.get("dedup"))
+
+    def _install_snapshot_payload(self, last_included_index: int,
+                                  last_included_term: int, data: dict,
+                                  config, dedup) -> dict:
+        """Install a fully received snapshot (lock held).
+
+        The follower replaces its state machine with the snapshot's
+        state, discards its log up to the snapshot's last included
+        index, and keeps any log entries after that index whose
+        prefix still matches.
+        """
+        with self.lock:
             if last_included_index <= self.snapshot_index:
                 # We already have this snapshot (or a newer one).
                 return {"type": "install_snapshot_response",
@@ -1224,10 +1331,10 @@ class RaftNode:
             # committed config changes too: adopt the config it was
             # written with (snapshots from before membership changes
             # carry no "config" key and leave ours alone).
-            if msg.get("config") is not None:
+            if config is not None:
                 self.config = {
                     str(mid): (tuple(addr) if addr else None)
-                    for mid, addr in msg["config"]
+                    for mid, addr in config
                 }
                 self._rebuild_peers_from_config()
             # The snapshot carries the dedup table for the entries it
@@ -1236,8 +1343,8 @@ class RaftNode:
             # snapshot index, so a retry of a compacted-away write
             # still dedups after installing a snapshot. Snapshots from
             # before CAS carry pairs and load as ok.
-            if msg.get("dedup") is not None:
-                for item in msg["dedup"]:
+            if dedup is not None:
+                for item in dedup:
                     if len(item) == 3:
                         c, r, res = item
                         self._dedup[(str(c), str(r))] = dict(res)
@@ -1247,6 +1354,9 @@ class RaftNode:
                             "type": "client_response", "status": "ok"}
                 while len(self._dedup) > DEDUP_MAX_ENTRIES:
                     self._dedup.pop(next(iter(self._dedup)))
+            # A whole-snapshot install supersedes any partial chunked
+            # transfer buffered for an older snapshot.
+            self._snapshot_transfer = None
             self._write_snapshot_file()
             self._rewrite_log()
             self.commit_index = max(self.commit_index, last_included_index)
@@ -2250,9 +2360,16 @@ class RaftNode:
             return self._pipeline_acks.get(peer, 0) > acks_at_entry
 
     def _send_install_snapshot(self, peer: str) -> bool:
-        """Send this node's snapshot to a lagging peer. Network I/O
-        happens outside the lock; the reply is applied under it.
-        Returns True if the peer installed the snapshot in our term."""
+        """Stream this node's snapshot to a lagging peer, in chunks.
+        Network I/O happens outside the lock; each chunk's reply is
+        applied under it. The snapshot (state + config + dedup table)
+        is serialized once, split into ``snapshot_chunk_size``
+        pieces, and sent one RPC at a time — each chunk acked before
+        the next goes out, so a failed chunk aborts the transfer
+        instead of leaving a half-installed snapshot behind, and the
+        follower never has to hold a multi-megabyte snapshot in one
+        message. Returns True only if the peer installed the final
+        chunk in our term."""
         addr = self.peers.get(peer)
         if addr is None:
             return False  # Peer was removed while this call was queued.
@@ -2261,12 +2378,10 @@ class RaftNode:
         with self.lock:
             if self.role != "leader":
                 return False
-            msg = {
-                "type": "install_snapshot",
-                "term": self.current_term,
-                "leader_id": self.id,
-                "last_included_index": self.snapshot_index,
-                "last_included_term": self.snapshot_term,
+            term = self.current_term
+            last_included_index = self.snapshot_index
+            last_included_term = self.snapshot_term
+            payload = json.dumps({
                 "data": self.sm.items(),
                 "config": self._config_list(),
                 # The dedup table for the covered prefix, so the
@@ -2274,21 +2389,40 @@ class RaftNode:
                 # retry of a compacted-away write still dedups there.
                 "dedup": [[c, r, res]
                           for (c, r), res in self._dedup.items()],
+            })
+        size = self.snapshot_chunk_size
+        chunks = [payload[i:i + size]
+                  for i in range(0, len(payload), size)] or [""]
+        for i, chunk in enumerate(chunks):
+            msg = {
+                "type": "install_snapshot",
+                "term": term,
+                "leader_id": self.id,
+                "last_included_index": last_included_index,
+                "last_included_term": last_included_term,
+                "chunk_index": i,
+                "chunk_total": len(chunks),
+                "chunk": chunk,
             }
-        resp = self._send_peer_rpc(peer, msg)
-        with self.lock:
-            if resp is None:
-                return False
-            resp_term = int(resp.get("term", 0))
-            if resp_term > self.current_term:
-                self._step_down(resp_term)
-                return False
-            if self.role != "leader" or resp_term != self.current_term:
-                return False
-            if resp.get("success"):
+            resp = self._send_peer_rpc(peer, msg)
+            with self.lock:
+                if resp is None:
+                    return False
+                resp_term = int(resp.get("term", 0))
+                if resp_term > self.current_term:
+                    self._step_down(resp_term)
+                    return False
+                if self.role != "leader" or resp_term != term:
+                    return False
+                if not resp.get("success"):
+                    return False
+                # Every chunk ack is a fresh ack from this follower,
+                # so it extends the leader lease like any other ack.
                 self._last_ack[peer] = time.monotonic()
+                if i != len(chunks) - 1:
+                    continue
                 self.match_index[peer] = int(
-                    resp.get("match_index", self.snapshot_index))
+                    resp.get("match_index", last_included_index))
                 self.next_index[peer] = self.match_index[peer] + 1
                 self._next_to_send[peer] = self.next_index[peer]
                 self._pipeline_acks[peer] = self._pipeline_acks.get(peer, 0) + 1

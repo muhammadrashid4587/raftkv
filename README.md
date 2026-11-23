@@ -127,6 +127,22 @@ logic and the failure handling, not the key-value API on top.
   not applied that far yet. The CLI exposes it as `get
   --min-read-index N --read-term T`, which wins over
   `--min-index` when it names the newer position.
+- **Chunked snapshot streaming** — since v0.19.0 InstallSnapshot
+  streams the snapshot in bounded chunks (64 KiB of serialized
+  JSON each by default, `RaftNode(snapshot_chunk_size=...)` to
+  tune) instead of one RPC carrying the whole state machine. Each
+  chunk is acked before the next is sent, so a failed chunk aborts
+  the transfer instead of leaving a half-installed snapshot, and
+  a transfer resumes from chunk 0 on the next replication pass.
+  The follower buffers chunks keyed by (term, leader, last
+  included index, chunk total) and installs only once every chunk
+  has arrived, in whatever order; a chunk for a newer snapshot
+  drops the buffered prefix of the older one, so a superseded
+  transfer can never complete from mixed pieces, and a duplicate
+  chunk (a leader retry) is acked without storing it twice. A
+  message with no chunk fields is still the old whole-snapshot
+  form and installs immediately. Every chunk ack extends the
+  leader lease like any other follower ack.
 - **Watch/subscribe** — `node.watch.watch(key, callback)` (or
   `prefix=True` for a key prefix) fires the callback with
   `{"key", "value", "op"}` whenever a *committed* log entry changes
@@ -224,7 +240,7 @@ make test
 # or: python3 -m unittest discover -s tests -v
 ```
 
-123 tests, plus a smoke test for the benchmark script, all passing:
+126 tests, plus a smoke test for the benchmark script, all passing:
 
 | Test | What it proves |
 |---|---|
@@ -315,6 +331,9 @@ make test
 | `test_advanced_read_watermark_is_enforced_not_ignored` | An out-of-range or wrong-term read watermark errors instead of serving stale state |
 | `test_session_read_on_follower_waits_for_watermark` | A session read via a follower waits for the read watermark across a leader failover |
 | `test_cli_min_read_index_flags` | The `get --min-read-index/--read-term` CLI flags serve the newer value and reject an out-of-range index |
+| `test_lagging_follower_catches_up_via_chunked_snapshot` | A lagging follower catches up via InstallSnapshot streamed in 64-byte chunks |
+| `test_partial_transfer_installs_nothing` | A partial chunked transfer installs nothing; out-of-order and duplicate chunks are safe; a stale-term chunk is rejected; re-sending an installed snapshot is a no-op |
+| `test_superseded_transfer_never_mixes_pieces` | Chunks for a newer snapshot drop the older transfer's buffered prefix; completing the old transfer afterwards cannot overwrite the new snapshot |
 | `test_watch_rpc_returns_event_on_set` | A watch RPC long-polls and returns the set event with its log index |
 | `test_watch_rpc_times_out_with_no_change` | A watch with no change times out with no events and leaves nothing registered |
 | `test_watch_rpc_on_follower_sees_committed_write` | A watch on a follower fires when the leader's write commits and applies there |
@@ -720,3 +739,15 @@ entries left in `log.jsonl` are dropped by their index on reload.
   read, out-of-range and wrong-term watermarks erroring instead
   of serving stale state, follower reads waiting across a
   failover, and the CLI flags.
+- ~~Chunked snapshot streaming~~ — done in v0.19.0, Nov 23,
+  2026: InstallSnapshot now streams the snapshot in bounded
+  chunks (64 KiB of serialized JSON each by default) instead of
+  one RPC carrying the whole state machine — each chunk acked
+  before the next is sent, the follower buffering keyed by
+  (term, leader, last included index, chunk total) and installing
+  only once every chunk has arrived, so a failed or superseded
+  transfer can never leave a half-installed or mixed snapshot
+  behind. `tests/test_snapshot_stream.py` covers end-to-end
+  catch-up through 64-byte chunks, partial transfers installing
+  nothing, out-of-order and duplicate chunks, stale-term
+  rejection, and a superseded transfer never mixing pieces.
