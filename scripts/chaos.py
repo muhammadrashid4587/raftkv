@@ -1,0 +1,324 @@
+#!/usr/bin/env python3
+"""Chaos test for raftkv: kill and restart nodes mid-write, verify nothing
+is lost and every node converges to the same state.
+
+Starts a real 3-node cluster on localhost (subprocesses, like
+``scripts/demo.sh``), then runs two things at once:
+
+  * writer threads issuing committed writes, each with a unique key and
+    a session id (``client_id`` / ``request_id``), retrying on error
+    until the write is acknowledged — an acked write is one the cluster
+    promised to keep, so losing one is a correctness bug, not noise;
+  * a fault thread that, on a seeded random schedule, SIGKILLs a random
+    node (a real crash, no clean shutdown, so the disk log has to save
+    us) and restarts it a moment later.
+
+When the writers finish and the cluster settles, the script verifies:
+
+  * every acked write reads back with its exact value, and
+  * every node reports the same ``commit_index`` and ``last_applied`` —
+    the same applied prefix on every node, so no node diverged or
+    fell behind for good.
+
+The fault schedule is seeded, so ``--seed N`` reproduces the exact
+same kill/restart sequence for debugging a failure. Exits non-zero if
+any acked write is lost, the nodes disagree, or the cluster never
+elects a leader.
+
+Usage:
+
+    python3 scripts/chaos.py [--seed 7] [--writes 60] [--faults 6]
+        [--threads 3] [--port-base 5200] [--data-dir /tmp/raftkv-chaos]
+        [--keep]
+"""
+
+from __future__ import annotations
+
+import argparse
+import random
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from raftkv.client import request as client_request  # noqa: E402
+from raftkv.transport import send_rpc  # noqa: E402
+
+SEED_KEY = "__chaos_probe__"
+
+
+class Cluster:
+    """A throwaway 3-node cluster running as subprocesses, with
+    per-node kill/restart so a fault thread can crash nodes."""
+
+    def __init__(self, port_base: int, data_dir: Path):
+        self.port_base = port_base
+        self.data_dir = data_dir
+        self.procs: list[subprocess.Popen | None] = [None, None, None]
+        self.addrs = [("127.0.0.1", port_base + i) for i in range(3)]
+        self._logs: list = []
+
+    def _start_node(self, i: int) -> None:
+        node_id = f"node{i + 1}"
+        peers = ",".join(
+            f"node{j + 1}=127.0.0.1:{self.port_base + j}"
+            for j in range(3) if j != i
+        )
+        log = open(self.data_dir / f"{node_id}.log", "a")
+        self._logs.append(log)
+        self.procs[i] = subprocess.Popen(
+            [sys.executable, "-m", "raftkv.server",
+             "--id", node_id, "--port", str(self.port_base + i),
+             "--peers", peers,
+             "--data-dir", str(self.data_dir / node_id)],
+            stdout=log, stderr=subprocess.STDOUT,
+            cwd=str(Path(__file__).resolve().parent.parent),
+        )
+
+    def start(self) -> None:
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        for i in range(3):
+            self._start_node(i)
+        self.wait_for_leader()
+
+    def kill_node(self, i: int) -> None:
+        """SIGKILL a node: a real crash, not a clean shutdown."""
+        proc = self.procs[i]
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        self.procs[i] = None
+
+    def restart_node(self, i: int) -> None:
+        self._start_node(i)
+
+    def is_live(self, i: int) -> bool:
+        proc = self.procs[i]
+        return proc is not None and proc.poll() is None
+
+    def wait_for_leader(self, timeout: float = 15.0) -> None:
+        """Poll a read until it succeeds — a get only returns ok once
+        a leader exists and can serve it."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            resp = client_request(
+                self.addrs[0],
+                {"type": "client", "op": "get", "key": SEED_KEY},
+                timeout=2.0,
+            )
+            if resp.get("status") == "ok":
+                return
+            time.sleep(0.1)
+        raise RuntimeError(f"no leader after {timeout}s")
+
+    def status(self, i: int) -> dict:
+        host, port = self.addrs[i]
+        return send_rpc(host, port, {"type": "status"}, timeout=2.0) or {}
+
+    def wait_for_convergence(self, timeout: float = 15.0) -> dict:
+        """Poll until every live node reports the same commit index and
+        last applied index, then return the three status dicts."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            stats = [self.status(i) for i in range(3)]
+            if all(stats) and len({(s["commit_index"], s["last_applied"])
+                                  for s in stats}) == 1:
+                return {f"node{i + 1}": stats[i] for i in range(3)}
+            time.sleep(0.1)
+        raise RuntimeError(
+            "nodes did not converge: " +
+            ", ".join(
+                f"node{i + 1}=commit {s.get('commit_index')}/"
+                f"applied {s.get('last_applied')}" if s else
+                f"node{i + 1}=down"
+                for i, s in enumerate(
+                    [self.status(j) for j in range(3)])))
+
+    def stop(self) -> None:
+        for i, proc in enumerate(self.procs):
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+        deadline = time.monotonic() + 5.0
+        for proc in self.procs:
+            if proc is None:
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                proc.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                pass
+        for proc in self.procs:
+            if proc is not None and proc.poll() is None:
+                proc.kill()
+        self.procs = [None, None, None]
+        for log in self._logs:
+            log.close()
+
+
+def writer(cluster: Cluster, thread_id: int, min_count: int,
+           acked: dict[str, str], lock: threading.Lock,
+           errors: list[str], faults_done: threading.Event) -> None:
+    """Write unique keys until the fault thread has run its whole
+    schedule (and at least ``min_count`` writes), retrying each until
+    it is acked. A write that never acks is recorded as an error, not
+    silently dropped — but a retry uses the same session id, so a
+    write whose first attempt actually committed is deduped, not
+    applied twice."""
+    addr = cluster.addrs[0]
+    i = 0
+    while not faults_done.is_set() or i < min_count:
+        key = f"chaos:t{thread_id}:{i}"
+        value = f"v{thread_id}-{i}"
+        msg = {"type": "client", "op": "set", "key": key, "value": value,
+               "client_id": f"chaos-{thread_id}", "request_id": str(i)}
+        deadline = time.monotonic() + 60.0
+        while True:
+            resp = client_request(addr, msg, timeout=3.0)
+            if resp.get("status") == "ok":
+                with lock:
+                    acked[key] = value
+                break
+            if time.monotonic() > deadline:
+                errors.append(f"{key}: never acked, last reply {resp}")
+                break
+            time.sleep(0.1)
+        i += 1
+
+
+def fault_loop(cluster: Cluster, rng: random.Random, faults: int,
+               faults_done: threading.Event, log: list[str]) -> None:
+    """Seeded random kill/restart schedule: pick a live node, SIGKILL
+    it, wait a moment, restart it, wait a moment, repeat. Runs the
+    whole schedule — the writers keep writing until this finishes, so
+    the faults genuinely land mid-write."""
+    for n in range(faults):
+        time.sleep(rng.uniform(0.2, 1.0))
+        live = [i for i in range(3) if cluster.is_live(i)]
+        if not live:
+            continue
+        victim = rng.choice(live)
+        cluster.kill_node(victim)
+        log.append(f"fault {n + 1}/{faults}: killed node{victim + 1}")
+        time.sleep(rng.uniform(0.5, 2.0))
+        cluster.restart_node(victim)
+        log.append(f"fault {n + 1}/{faults}: restarted node{victim + 1}")
+    faults_done.set()
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--seed", type=int, default=7,
+                        help="RNG seed for the fault schedule "
+                             "(default 7; same seed, same faults)")
+    parser.add_argument("--writes", type=int, default=60,
+                        help="minimum writes per writer thread "
+                             "(default 60; writers keep going until the "
+                             "fault schedule finishes)")
+    parser.add_argument("--faults", type=int, default=6,
+                        help="kill/restart cycles (default 6)")
+    parser.add_argument("--threads", type=int, default=3,
+                        help="concurrent writer threads (default 3)")
+    parser.add_argument("--port-base", type=int, default=5200,
+                        help="first of three consecutive ports "
+                             "(default 5200)")
+    parser.add_argument("--data-dir", default="/tmp/raftkv-chaos",
+                        help="cluster data dir (default /tmp/raftkv-chaos)")
+    parser.add_argument("--keep", action="store_true",
+                        help="keep the data dir afterwards "
+                             "(default: remove it)")
+    args = parser.parse_args(argv)
+
+    rng = random.Random(args.seed)
+    data_dir = Path(args.data_dir)
+    cluster = Cluster(args.port_base, data_dir)
+    stop = False
+
+    def _on_signal(signum, frame):
+        nonlocal stop
+        stop = True
+
+    signal.signal(signal.SIGINT, _on_signal)
+    signal.signal(signal.SIGTERM, _on_signal)
+
+    try:
+        cluster.start()
+        print(f"cluster up on ports "
+              f"{args.port_base}-{args.port_base + 2} "
+              f"(seed {args.seed}, {args.writes} writes x "
+              f"{args.threads} threads, {args.faults} faults)")
+        acked: dict[str, str] = {}
+        lock = threading.Lock()
+        errors: list[str] = []
+        fault_log: list[str] = []
+        faults_done = threading.Event()
+
+        faults = threading.Thread(
+            target=fault_loop,
+            args=(cluster, rng, args.faults, faults_done, fault_log),
+            daemon=True)
+        faults.start()
+        writers = [
+            threading.Thread(target=writer,
+                             args=(cluster, t, args.writes, acked, lock,
+                                   errors, faults_done))
+            for t in range(args.threads)
+        ]
+        for w in writers:
+            w.start()
+        for w in writers:
+            w.join()
+        faults.join(timeout=5.0)
+        for line in fault_log:
+            print(f"  {line}")
+        if errors:
+            for err in errors:
+                print(f"writer error: {err}", file=sys.stderr)
+            return 1
+
+        # Every node back up, cluster settled, then verify.
+        for i in range(3):
+            if not cluster.is_live(i):
+                cluster.restart_node(i)
+        cluster.wait_for_leader()
+        converged = cluster.wait_for_convergence()
+        for node_id, s in converged.items():
+            print(f"  {node_id}: commit {s['commit_index']}, "
+                  f"applied {s['last_applied']}, term {s['term']}, "
+                  f"role {s['role']}")
+        seed = cluster.addrs[0]
+        lost = []
+        for key, value in acked.items():
+            resp = client_request(seed, {"type": "client", "op": "get",
+                                         "key": key}, timeout=5.0)
+            if resp.get("status") != "ok" or resp.get("value") != value:
+                lost.append((key, value, resp))
+        if lost:
+            for key, value, resp in lost[:10]:
+                print(f"LOST acked write {key}={value}: {resp}",
+                      file=sys.stderr)
+            print(f"{len(lost)} acked writes lost", file=sys.stderr)
+            return 1
+        print(f"chaos ok: {len(acked)} acked writes all present, "
+              f"3 nodes converged at commit "
+              f"{converged['node1']['commit_index']} "
+              f"after {args.faults} kill/restart faults "
+              f"(seed {args.seed})")
+        return 0 if not stop else 130
+    except (RuntimeError, AssertionError) as exc:
+        print(f"chaos failed: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        cluster.stop()
+        if not args.keep:
+            shutil.rmtree(data_dir, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

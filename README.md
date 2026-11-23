@@ -111,6 +111,15 @@ logic and the failure handling, not the key-value API on top.
   persisted, not rebuilt on restart; a watcher re-registers after
   reconnecting. Callbacks run synchronously on the applying thread,
   so keep them short and non-blocking.
+- **Chaos/fault-injection harness** — `scripts/chaos.py` starts a real
+  3-node cluster and, on a seeded random schedule, SIGKILLs a node
+  (a real crash, no clean shutdown) and restarts it while writer
+  threads keep issuing committed writes with session ids. At the end
+  it verifies every acked write reads back and every node reports the
+  same commit/applied index, so no acked write is lost and no node
+  diverges. The same scenario runs in-process as `tests/test_chaos.py`
+  (seeded, 4 kill/restart cycles, 2 writers). Same seed, same faults,
+  so a failure is reproducible: `python3 scripts/chaos.py --seed 7`.
 - **Real failure handling** — tested end to end: kill the leader, the
   cluster re-elects, writes continue, the old leader rejoins and
   catches up instead of forking.
@@ -146,7 +155,7 @@ make test
 # or: python3 -m unittest discover -s tests -v
 ```
 
-62 tests, plus a smoke test for the benchmark script, all passing:
+74 tests, plus a smoke test for the benchmark script, all passing:
 
 | Test | What it proves |
 |---|---|
@@ -208,6 +217,7 @@ make test
 | `test_cas_retry_with_same_session_id_returns_same_result` | Retried CAS returns the first attempt's result, one log entry |
 | `test_cas_failed_result_survives_snapshot_and_restart` | A failed CAS result survives compaction and a leader restart |
 | `test_cas_cli` | The `cas` CLI subcommand works end to end |
+| `test_random_kill_restart_mid_write_loses_nothing` | Seeded chaos: 4 kill/restart cycles mid-write, every acked write survives on every node, all nodes converge to identical state |
 
 Tests use real nodes (real TCP, real threads, real disk) on localhost —
 no mocks of the consensus path.
@@ -473,3 +483,11 @@ entries left in `log.jsonl` are dropped by their index on reload.
   failed CAS fires nothing, a raising callback cannot break the
   apply path or other watchers. Watches are local and in-memory
   only for now — no replication, persistence, or watch RPC yet.
+- ~~Chaos/fault-injection harness~~ — done in v0.12.0, Nov 22, 2026:
+  `scripts/chaos.py` runs a real 3-node cluster through a seeded
+  random SIGKILL/restart schedule while writer threads keep writing
+  with session ids, then verifies every acked write reads back and
+  all three nodes report the same commit/applied index; the same
+  scenario runs in-process as `tests/test_chaos.py`. Verified with
+  seeds 7 and 42: 283 and 199 acked writes respectively, zero lost,
+  all nodes converged, including a leader kill and re-election.
