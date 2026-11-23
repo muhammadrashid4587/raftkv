@@ -26,15 +26,19 @@ MAX_REDIRECTS = 10
 
 
 class Session:
-    """A read-your-writes client session.
+    """A read-your-writes, monotonic-reads client session.
 
     A session is one client talking to the cluster under one
-    ``client_id``. Every write it acks advances its watermark to the
-    log index (and term) of that write's entry, and every read it
-    issues carries the watermark — so a client that wrote through the
-    leader and then reads from any node, or from a new leader after a
-    failover, never sees its own write missing: the serving node waits
-    until it has applied up to the watermark before answering.
+    ``client_id``. Every write it acks advances its write watermark
+    to the log index (and term) of that write's entry, and every
+    read it serves advances its read watermark to the applied index
+    (and term) the returned value reflects. Every read it issues
+    carries the higher of the two watermarks — so a client that
+    wrote through the leader and then reads from any node, or from
+    a new leader after a failover, never sees its own write missing,
+    and a read never goes backwards to state older than a previous
+    read: the serving node waits until it has applied at least that
+    far before answering.
 
     The watermark is also the dedup session: each write carries a
     unique request id within the session, so a retried write returns
@@ -51,15 +55,24 @@ class Session:
         # (0/0 = no write yet: reads are plain ReadIndex reads).
         self.last_write_index = 0
         self.last_write_term = 0
+        # Applied index/term of the newest state a read of this
+        # session has returned (0/0 = nothing read yet). A later
+        # read waits until the serving node has applied at least
+        # this far, so reads never go backwards.
+        self.last_read_index = 0
+        self.last_read_term = 0
         self._next_request = 0
 
     @property
     def token(self) -> dict:
         """The session token: what identifies this client and how far
-        its acknowledged writes reach in the log."""
+        its acknowledged writes reach in the log, plus how far its
+        reads have seen."""
         return {"client_id": self.client_id,
                 "last_write_index": self.last_write_index,
-                "last_write_term": self.last_write_term}
+                "last_write_term": self.last_write_term,
+                "last_read_index": self.last_read_index,
+                "last_read_term": self.last_read_term}
 
     def _write(self, msg: dict) -> dict:
         self._next_request += 1
@@ -90,11 +103,33 @@ class Session:
                             "expected": expected, "value": value})
 
     def get(self, key: str) -> dict:
+        # The read carries the higher of the two watermarks — the
+        # last acknowledged write, or the newest state a previous
+        # read returned — with the term of whichever index wins, so
+        # the serving node checks the right log position.
+        if self.last_read_index > self.last_write_index:
+            min_index = self.last_read_index
+            term = self.last_read_term
+        else:
+            min_index = self.last_write_index
+            term = self.last_write_term
         msg: dict = {"type": "client", "op": "get", "key": key,
                      "client_id": self.client_id,
-                     "min_commit_index": self.last_write_index,
-                     "session_term": self.last_write_term}
-        return request(self.node_addr, msg)
+                     "min_commit_index": min_index,
+                     "session_term": term}
+        resp = request(self.node_addr, msg)
+        # A served read advances the read watermark to the applied
+        # index the value reflects — never backwards: a read that
+        # was served from a newer applied state raises the floor
+        # for every read after it. A response without the fields
+        # (an older server) leaves the watermark where it was.
+        if (resp.get("status") == "ok"
+                and resp.get("read_index") is not None):
+            read_index = int(resp["read_index"])
+            if read_index > self.last_read_index:
+                self.last_read_index = read_index
+                self.last_read_term = int(resp.get("read_term") or 0)
+        return resp
 
     def watch(self, key: str, prefix: bool = False,
               timeout: float = 5.0) -> dict:
@@ -163,6 +198,14 @@ def main(argv: list[str] | None = None) -> int:
     p_get.add_argument("--session-term", type=int, default=0,
                        help="term of the entry at --min-index, checked "
                             "against the serving node's log")
+    p_get.add_argument("--min-read-index", type=int, default=0,
+                       help="applied index of the newest state a previous "
+                            "read of this session returned: the serving "
+                            "node waits until it has applied that far, so "
+                            "the read never goes backwards to older state")
+    p_get.add_argument("--read-term", type=int, default=0,
+                       help="term of the entry at --min-read-index, "
+                            "checked against the serving node's log")
     p_del = sub.add_parser("del")
     p_del.add_argument("key")
     p_del.add_argument("--client-id", default=None)
@@ -243,10 +286,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.op == "get":
         # A read-your-writes read from the shell: --min-index names
         # the last write the reader saw acknowledged (its index, from
-        # the write response), --session-term its term.
+        # the write response), --session-term its term. A monotonic
+        # read adds --min-read-index / --read-term, the applied
+        # index a previous read returned; the read carries the
+        # higher of the two watermarks, with the term of whichever
+        # index wins.
         if args.client_id:
             msg["client_id"] = args.client_id
-        if args.min_index:
+        if args.min_read_index > args.min_index:
+            msg["min_commit_index"] = args.min_read_index
+            msg["session_term"] = args.read_term
+        elif args.min_index:
             msg["min_commit_index"] = args.min_index
             msg["session_term"] = args.session_term
     resp = request((host, int(port)), msg, timeout=args.timeout)

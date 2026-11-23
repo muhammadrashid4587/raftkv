@@ -116,6 +116,17 @@ logic and the failure handling, not the key-value API on top.
   that does not match the entry at that index, is an error, not a
   wait. The CLI exposes the same read as `get --min-index N
   --session-term T`.
+- **Monotonic-reads sessions** — since v0.18.0 the session also
+  remembers the highest log index it has *read*: every read reply
+  carries the applied index (and term) the returned value
+  reflects, and every later read carries the higher of the write
+  watermark and the read watermark, so the serving node waits
+  until it has applied at least that far. A client that read a
+  newer state never goes backwards to an older one — not when it
+  moves between nodes, not after a failover to a leader that has
+  not applied that far yet. The CLI exposes it as `get
+  --min-read-index N --read-term T`, which wins over
+  `--min-index` when it names the newer position.
 - **Watch/subscribe** — `node.watch.watch(key, callback)` (or
   `prefix=True` for a key prefix) fires the callback with
   `{"key", "value", "op"}` whenever a *committed* log entry changes
@@ -213,7 +224,7 @@ make test
 # or: python3 -m unittest discover -s tests -v
 ```
 
-116 tests, plus a smoke test for the benchmark script, all passing:
+123 tests, plus a smoke test for the benchmark script, all passing:
 
 | Test | What it proves |
 |---|---|
@@ -297,6 +308,13 @@ make test
 | `test_session_read_with_wrong_term_errors` | A read naming the right index with the wrong term errors; the right term serves |
 | `test_dedup_retry_returns_same_index` | A retried write reports the first attempt's index and appends no second entry |
 | `test_session_get_without_writes_reads_normally` | A fresh session (watermark 0) reads like a plain ReadIndex read; CAS advances the watermark |
+| `test_read_after_write_returns_the_write` | A monotonic-reads session read after its own write returns the write |
+| `test_read_response_carries_applied_index_and_term` | A read reply names the applied index and term its value reflects |
+| `test_session_read_advances_read_watermark` | A served read raises the session's read watermark at least as far as the write it returned |
+| `test_read_never_goes_backwards_after_higher_index_read` | A read after a higher-index read returns the newer value, never the older one |
+| `test_advanced_read_watermark_is_enforced_not_ignored` | An out-of-range or wrong-term read watermark errors instead of serving stale state |
+| `test_session_read_on_follower_waits_for_watermark` | A session read via a follower waits for the read watermark across a leader failover |
+| `test_cli_min_read_index_flags` | The `get --min-read-index/--read-term` CLI flags serve the newer value and reject an out-of-range index |
 | `test_watch_rpc_returns_event_on_set` | A watch RPC long-polls and returns the set event with its log index |
 | `test_watch_rpc_times_out_with_no_change` | A watch with no change times out with no events and leaves nothing registered |
 | `test_watch_rpc_on_follower_sees_committed_write` | A watch on a follower fires when the leader's write commits and applies there |
@@ -687,3 +705,18 @@ entries left in `log.jsonl` are dropped by their index on reload.
   `tests/test_watch_rpc.py` covers set/delete/prefix watches,
   follower watches, timeouts, empty-key rejection, the event index
   matching the write's log index, and the CLI.
+- ~~Monotonic-reads client sessions~~ — done in v0.18.0, Nov 23,
+  2026: the session now tracks a read watermark alongside the
+  write watermark — every read reply carries the applied index and
+  term the returned value reflects, and every later read carries
+  the higher of the two watermarks, so the serving node waits
+  until it has applied at least that far and a read never goes
+  backwards to older state, including across a leader failover
+  or when the client moves between followers. The CLI takes `get
+  --min-read-index N --read-term T`, which wins over
+  `--min-index` when it names the newer position.
+  `tests/test_monotonic_reads.py` covers the read watermark
+  advancing, reads never going backwards after a higher-index
+  read, out-of-range and wrong-term watermarks erroring instead
+  of serving stale state, follower reads waiting across a
+  failover, and the CLI flags.

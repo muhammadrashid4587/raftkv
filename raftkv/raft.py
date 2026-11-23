@@ -1759,7 +1759,12 @@ class RaftNode:
            write committed before the read started, plus the session's
            own writes. The wait registers a pending read, resolved by
            _apply_committed once the apply index catches up — no log
-           entry is written for the read.
+           entry is written for the read. The reply carries the
+           applied index (and its term) the returned value reflects,
+           so a client can remember how far it has read: its next
+           read waits until the serving node has applied at least
+           that far, and reads are monotonic — they never go
+           backwards to an older state.
         4. If leadership is lost mid-read, redirect (the client follows
            it to the new leader) — never serve from a deposed leader.
            If apply stalls past READ_INDEX_TIMEOUT while we are still
@@ -1809,7 +1814,9 @@ class RaftNode:
                 if self.last_applied >= read_index:
                     value = self.sm.get(key)
                     return {"type": "client_response", "status": "ok",
-                            "value": value}
+                            "value": value,
+                            "read_index": self.last_applied,
+                            "read_term": self._term_at(self.last_applied)}
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
@@ -1842,7 +1849,10 @@ class RaftNode:
             if self.role != "leader" or self.current_term != term:
                 return self._redirect()
             value = self.sm.get(key)
-        return {"type": "client_response", "status": "ok", "value": value}
+            read_index = self.last_applied
+            read_term = self._term_at(read_index)
+        return {"type": "client_response", "status": "ok", "value": value,
+                "read_index": read_index, "read_term": read_term}
 
     def _lease_valid(self) -> bool:
         """True if a majority of voters acked us within
