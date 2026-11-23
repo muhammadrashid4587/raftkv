@@ -62,6 +62,13 @@ LEADER_LEASE_TIMEOUT = 1.0
 # handler thread's socket timeout is 30s, so a watch must answer
 # before that or its reply can never be sent; 25s leaves headroom.
 WATCH_MAX_TIMEOUT = 25.0
+# A multi-get RPC serves at most this many keys in one request. One
+# frame carries the whole batch, so an unbounded list could hold a
+# worker (and its connection) for an arbitrarily long encode; 1000
+# keys of 32-byte values is ~32 KiB of payload, small next to a
+# snapshot chunk. A client that needs more splits the batch itself —
+# get_many already does exactly that, one pipelined batch at a time.
+MAX_MGET_KEYS = 1000
 # Leader lease for reads (Raft dissertation §6.4): how long a majority
 # ack stays fresh. Must be shorter than ELECTION_TIMEOUT_MIN (150ms):
 # a follower that acked at time T heard from the leader no later than
@@ -1867,10 +1874,63 @@ class RaftNode:
     # ------------------------------------------------------------------
     # Client protocol
     # ------------------------------------------------------------------
+    @staticmethod
+    def _parse_read_params(msg: dict) -> tuple[int, int | None, dict | None]:
+        """Parse a read's session watermark (``min_commit_index`` /
+        ``session_term``) into ``(min_index, session_term, error)``:
+        ``error`` is a client_response to return when the fields are
+        not integers or the index is negative, else None. Shared by
+        the single-key ``get`` and the multi-key ``mget`` — both ride
+        the same ReadIndex path, so both validate the same way."""
+        try:
+            min_index = int(msg.get("min_commit_index") or 0)
+            session_term = msg.get("session_term")
+            session_term = (int(session_term)
+                            if session_term is not None else None)
+        except (TypeError, ValueError):
+            return (0, None,
+                    {"type": "client_response", "status": "error",
+                     "error": "min_commit_index and session_term "
+                              "must be integers"})
+        if min_index < 0:
+            return (0, None,
+                    {"type": "client_response", "status": "error",
+                     "error": "min_commit_index must be >= 0"})
+        return (min_index, session_term, None)
+
+    def _on_mget(self, msg: dict) -> dict:
+        """Serve a multi-get: many keys in one request, answered from
+        the same ReadIndex/lease path as a single ``get`` — one
+        leadership confirmation and one apply wait for the whole
+        batch, one frame out, so the per-key cost is one state
+        machine lookup instead of one dispatch each. The reply
+        carries ``values`` aligned with ``keys`` (None for a missing
+        key), plus the same ``read_index`` / ``read_term`` a single
+        read carries, so a session can advance its read watermark
+        from it exactly as from a ``get``."""
+        keys = msg.get("keys")
+        if (not isinstance(keys, list) or not keys
+                or len(keys) > MAX_MGET_KEYS
+                or not all(isinstance(k, str) for k in keys)):
+            return {"type": "client_response", "status": "error",
+                    "error": "mget takes a list of 1-"
+                             f"{MAX_MGET_KEYS} keys"}
+        min_index, session_term, error = self._parse_read_params(msg)
+        if error is not None:
+            return error
+        return self._serve_read(keys=keys, min_index=min_index,
+                                session_term=session_term,
+                                stale_ok=bool(msg.get("stale_ok")))
+
     def _on_client(self, msg: dict) -> dict:
         op = msg.get("op")
         if op in ("add_server", "remove_server"):
             return self._on_membership_request(msg)
+        if op == "mget":
+            if self._is_removed():
+                return {"type": "client_response", "status": "error",
+                        "error": "this node was removed from the cluster"}
+            return self._on_mget(msg)
         key = msg.get("key")
         if op not in ("set", "get", "del", "cas") or key is None:
             return {"type": "client_response", "status": "error",
@@ -1885,23 +1945,15 @@ class RaftNode:
             # client never sees its own write missing — including
             # after a failover to a new leader. Plain reads send
             # neither field and behave exactly as before.
-            try:
-                min_index = int(msg.get("min_commit_index") or 0)
-                session_term = msg.get("session_term")
-                session_term = (int(session_term)
-                                if session_term is not None else None)
-            except (TypeError, ValueError):
-                return {"type": "client_response", "status": "error",
-                        "error": "min_commit_index and session_term "
-                                 "must be integers"}
-            if min_index < 0:
-                return {"type": "client_response", "status": "error",
-                        "error": "min_commit_index must be >= 0"}
+            min_index, session_term, error = self._parse_read_params(msg)
+            if error is not None:
+                return error
             # An explicit stale read asks to be served from any node
             # holding a fresh leader lease (see _serve_read): bounded
             # staleness, no redirect hop. Off by default — a plain
             # read stays linearizable through the leader.
-            return self._serve_read(key, min_index, session_term,
+            return self._serve_read(key, min_index=min_index,
+                                    session_term=session_term,
                                     stale_ok=bool(msg.get("stale_ok")))
         command = {"op": op, "key": key}
         if op == "set":
@@ -2482,10 +2534,20 @@ class RaftNode:
             p["event"].set()
         self._pending_reads = []
 
-    def _serve_read(self, key: str, min_index: int = 0,
+    def _serve_read(self, key: str | None = None,
+                    min_index: int = 0,
                     session_term: int | None = None,
+                    keys: list[str] | None = None,
                     stale_ok: bool = False) -> dict:
         """ReadIndex read (Raft dissertation §6.4).
+
+        ``key`` serves one key; ``keys`` serves a multi-get instead —
+        the same leadership confirmation and apply wait for the whole
+        batch, and the reply carries ``values`` aligned with
+        ``keys`` instead of ``value``. Everything else — the lease
+        fast path, the pending-read wait, the fallback, the redirect
+        on leadership loss — is identical, so a multi-get is exactly
+        as linearizable as a single ``get``.
 
         A stale read (``stale_ok``) is the one exception to the
         leader-only rule: a follower holding a fresh leader lease
@@ -2540,6 +2602,16 @@ class RaftNode:
         but then it is already applied), is an error, not a wait: the
         token names a write this node cannot have.
         """
+        def _values() -> dict:
+            """The read payload, from the applied state machine
+            (lock held at every call site): ``value`` for one key,
+            ``values`` aligned with ``keys`` for a multi-get — None
+            in a position whose key is missing, so a batch never
+            shifts after a miss."""
+            if keys is not None:
+                return {"values": [self.sm.get(k) for k in keys]}
+            return {"value": self.sm.get(key)}
+
         with self.lock:
             if self.role != "leader":
                 # A follower with a fresh leader lease serves an
@@ -2556,9 +2628,8 @@ class RaftNode:
                 # follower may not have applied) redirects too.
                 if (stale_ok and min_index == 0 and session_term is None
                         and self._follower_lease_valid()):
-                    value = self.sm.get(key)
                     return {"type": "client_response", "status": "ok",
-                            "value": value,
+                            **_values(),
                             "read_index": self.last_applied,
                             "read_term": self._term_at(self.last_applied),
                             "lease": "follower"}
@@ -2590,9 +2661,8 @@ class RaftNode:
                 if self.role != "leader" or self.current_term != term:
                     return self._redirect()
                 if self.last_applied >= read_index:
-                    value = self.sm.get(key)
                     return {"type": "client_response", "status": "ok",
-                            "value": value,
+                            **_values(),
                             "read_index": self.last_applied,
                             "read_term": self._term_at(self.last_applied)}
                 remaining = deadline - time.monotonic()
@@ -2626,10 +2696,10 @@ class RaftNode:
         with self.lock:
             if self.role != "leader" or self.current_term != term:
                 return self._redirect()
-            value = self.sm.get(key)
+            values = _values()
             read_index = self.last_applied
             read_term = self._term_at(read_index)
-        return {"type": "client_response", "status": "ok", "value": value,
+        return {"type": "client_response", "status": "ok", **values,
                 "read_index": read_index, "read_term": read_term}
 
     def _follower_lease_valid(self) -> bool:

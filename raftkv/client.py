@@ -8,6 +8,7 @@ Examples:
 
     python -m raftkv.client --node 127.0.0.1:5001 set mykey myvalue
     python -m raftkv.client --node 127.0.0.1:5001 get mykey
+    python -m raftkv.client --node 127.0.0.1:5001 mget mykey otherkey
     python -m raftkv.client --node 127.0.0.1:5001 del mykey
     python -m raftkv.client --node 127.0.0.1:5001 cas mykey myvalue newvalue
     python -m raftkv.client --node 127.0.0.1:5001 watch mykey --timeout 10
@@ -159,6 +160,38 @@ class Session:
         # was served from a newer applied state raises the floor
         # for every read after it. A response without the fields
         # (an older server) leaves the watermark where it was.
+        if (resp.get("status") == "ok"
+                and resp.get("read_index") is not None):
+            read_index = int(resp["read_index"])
+            if read_index > self.last_read_index:
+                self.last_read_index = read_index
+                self.last_read_term = int(resp.get("read_term") or 0)
+        return resp
+
+    def mget(self, keys: list[str]) -> dict:
+        """Read many keys with one ``mget`` RPC: one leadership
+        confirmation and one apply wait for the whole batch, and the
+        reply carries ``values`` aligned with ``keys`` (None for a
+        missing key). Carries the same session watermark as ``get``
+        and advances the read watermark from the reply's
+        ``read_index`` exactly the same way, so a multi-get is
+        read-your-writes and monotonic like any other session read.
+        An empty list is a client error — the server rejects it —
+        so this returns the error response instead of sending it."""
+        if not keys:
+            return {"type": "client_response", "status": "error",
+                    "error": "mget takes a list of 1-1000 keys"}
+        if self.last_read_index > self.last_write_index:
+            min_index = self.last_read_index
+            term = self.last_read_term
+        else:
+            min_index = self.last_write_index
+            term = self.last_write_term
+        msg: dict = {"type": "client", "op": "mget", "keys": list(keys),
+                     "client_id": self.client_id,
+                     "min_commit_index": min_index,
+                     "session_term": term}
+        resp = request(self.node_addr, msg, pool=self._pooled)
         if (resp.get("status") == "ok"
                 and resp.get("read_index") is not None):
             read_index = int(resp["read_index"])
@@ -333,6 +366,26 @@ def get_many(node_addr: tuple[str, int], keys: list[str],
     return request_many(node_addr, msgs, timeout=timeout, depth=depth)
 
 
+def mget(node_addr: tuple[str, int], keys: list[str],
+         timeout: float = 12.0) -> dict:
+    """Read many keys with one ``mget`` RPC, following leader
+    redirects like ``request``.
+
+    One request serves the whole batch through the leader's
+    ReadIndex path, so the per-key cost is one state machine lookup
+    instead of one dispatch each — the single-request equivalent of
+    ``get_many``'s pipelined batch, without the round trips between
+    requests. The reply is the plain ``mget`` response
+    (``status`` ``ok`` with ``values`` aligned with ``keys``, None
+    for a missing key); an empty list never goes on the wire and
+    returns the server's error shape instead."""
+    if not keys:
+        return {"type": "client_response", "status": "error",
+                "error": "mget takes a list of 1-1000 keys"}
+    return request(node_addr, {"type": "client", "op": "mget",
+                               "keys": list(keys)}, timeout=timeout)
+
+
 def request(node_addr: tuple[str, int], msg: dict, timeout: float = 12.0,
             pool: ConnectionPool | None = None) -> dict:
     """Send one client request, following leader redirects.
@@ -397,6 +450,12 @@ def main(argv: list[str] | None = None) -> int:
                             "heartbeat behind the leader), no redirect "
                             "hop. Ignored when a session watermark is "
                             "given — that read still goes to the leader")
+    p_mget = sub.add_parser(
+        "mget",
+        help="read many keys with one request: prints the values as "
+             "one JSON list, null for a missing key, in key order")
+    p_mget.add_argument("keys", nargs="+",
+                        help="keys to read, in order")
     p_del = sub.add_parser("del")
     p_del.add_argument("key")
     p_del.add_argument("--client-id", default=None)
@@ -486,6 +545,8 @@ def main(argv: list[str] | None = None) -> int:
     msg: dict = {"type": "client", "op": op}
     if op in ("set", "get", "del", "cas"):
         msg["key"] = args.key
+    elif op == "mget":
+        msg["keys"] = args.keys
     elif op == "add_server":
         msg["server_id"] = args.server_id
         ahost, _, aport = args.addr.rpartition(":")
@@ -526,6 +587,8 @@ def main(argv: list[str] | None = None) -> int:
     if status == "ok":
         if op == "get":
             print(resp.get("value") if resp.get("value") is not None else "(nil)")
+        elif op == "mget":
+            print(json.dumps(resp.get("values")))
         else:
             print("OK")
         return 0

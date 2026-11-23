@@ -76,6 +76,28 @@ logic and the failure handling, not the key-value API on top.
   (~7000 ops/s) is unchanged, since that one is CPU-bound on the
   server, not on the client's wait. `scripts/bench.py --pipelined`
   runs the phase (`--pipeline-depth` sets the batch size).
+- **Multi-get reads** — since v0.30.0 one `mget` RPC serves many
+  keys in a single request (`client.mget(keys)`,
+  `Session.mget(keys)`, `mget k1 k2 ...` on the CLI): one
+  leadership confirmation and one apply wait for the whole batch,
+  through the same ReadIndex/lease path as a single `get`, so it is
+  exactly as linearizable — and a stale `mget` is served from a
+  follower lease exactly like a stale `get`. The reply carries
+  `values` aligned with `keys` (None for a missing key) plus the
+  same `read_index` / `read_term`, so a session advances its read
+  watermark from it like any other read. At most 1000 keys per
+  request, so one frame can never hold an unbounded batch; a
+  client that needs more splits it, like `get_many` already does.
+  Measured on this box (see Benchmark): a batch of 50 keys costs
+  ~0.2ms total — ~0.004-0.005ms per key, ~12x cheaper per key
+  than 50 pipelined gets — because the per-request cost (dispatch,
+  frame, lease check) is paid once, and each key past the first is
+  one dictionary lookup. That is a per-key rate inside one batch,
+  not a rate at which independent clients can read: the sustained
+  concurrent ceiling is unchanged, and a batch of 10 is barely
+  faster per key than pipelining, since the dispatch still
+  dominates. `scripts/bench.py --mget` runs the phase
+  (`--mget-batch` sets the batch size).
 - **Leader lease reads** — a leader that heard acks from a majority
   within the last 100ms (shorter than any follower's 150ms minimum
   election timeout, so no new leader can have been elected since)
@@ -351,7 +373,7 @@ make test
 # or: python3 -m unittest discover -s tests -v
 ```
 
-167 tests, plus a smoke test for the benchmark script, all passing:
+183 tests, plus a smoke test for the benchmark script, all passing:
 
 | Test | What it proves |
 |---|---|
@@ -495,6 +517,14 @@ make test
 | `test_slow_dispatch_does_not_starve_pool` | Eight 1s dispatches run in parallel on the pool instead of serially |
 | `test_idle_connection_is_closed` | A connection idle past the timeout is closed by the server |
 | `test_watch_does_not_starve_reads` | Reads stay fast while a 5s watch long-polls on the leader |
+| `test_mget_returns_values_in_order` | 50 keys in one mget come back in key order with the right values |
+| `test_mget_includes_missing_keys` | A missing key mid-batch answers None in that position and does not shift the values after it |
+| `test_mget_from_follower_redirects` | An mget sent to a follower is redirected to the leader and still answers correctly |
+| `test_mget_stale_served_from_follower_lease` | An mget with stale_ok is served by a follower holding a fresh leader lease, carrying the follower marker |
+| `test_mget_rejects_bad_key_lists` | An empty list, a non-list, a non-string key, or more than 1000 keys is an error, not a read |
+| `test_mget_rejects_bad_read_params` | A non-integer or negative min_commit_index is an error, exactly as for a single get |
+| `test_session_mget_is_read_your_writes` | A session mget carries the write watermark, sees its own write, and advances the read watermark |
+| `test_mget_matches_pipelined_get_many` | The same 50 keys read by one mget and by pipelined get_many agree exactly |
 
 Tests use real nodes (real TCP, real threads, real disk) on localhost —
 no mocks of the consensus path.
@@ -587,14 +617,32 @@ The faster client (v0.29.0) is that next step, and it moves the
 single-client number without touching the server at all:
 
 ```
-$ python3 scripts/bench.py --pool-size 50 --threads 50 --pipelined  # three runs
+$ python3 scripts/bench.py --pool-size 50 --threads 50 --pipelined --mget  # three runs
 sequential reads           200 ops  3894-5972 ops/s    p50  0.2ms
 concurrent reads x50       200 ops  3440-4682 ops/s    p50  2.1-2.5ms
-pipelined reads            200 ops  13820-18284 ops/s  mean 0.055-0.072ms/op  (batches of 50/50/200)
+pipelined reads            200 ops  8144-17038 ops/s  mean 0.059-0.123ms/op  (batches of 50)
+mget reads                 200 ops  197928-261647 ops/s  mean 0.004-0.005ms/op  (batches of 50)
 ```
 
+The multi-get (v0.30.0) is the same measurement one level deeper:
+a batch of 50 keys in one `mget` costs ~0.2ms total, so per key it
+runs at ~198000-262000 ops/s — roughly 12x cheaper per key than 50
+pipelined gets (~2.8-3.2ms per batch in the same runs), because the
+per-request cost (one dispatch, one frame, one lease check, one
+apply wait) is paid once and every key past the first is one
+dictionary lookup. The batch time barely grows with size — a batch
+of 10 costs ~0.1ms, a batch of 200 ~0.3ms, so the per-key rate
+keeps rising with the batch (10: ~19000 ops/s, 200: ~590000) —
+but that is a per-key rate inside one batch, and it says nothing
+about independent clients: the sustained concurrent ceiling is
+still ~7000 ops/s, CPU-bound on the leader, and a lone client
+reading one key at a time still pays the ~0.06ms dispatch. The
+honest use is a client that already has many keys to read at once:
+it pays one request instead of fifty, and the 1000-key cap keeps
+one frame bounded while it does.
+
 A lone client sending reads 50 at a time over one connection runs
-at ~13800-18300 ops/s, roughly 2-5x the sequential client in the
+at ~13800-18300 ops/s in the v0.29.0 runs, roughly 2-5x the sequential client in the
 same runs (~3900-6000 ops/s) — the round-trip wait between requests
 was most of a sequential read's cost, and the server's per-request
 processing (~0.06ms) is what is left. Depth 200 is no faster than
@@ -1204,3 +1252,35 @@ entries left in `log.jsonl` are dropped by their index on reload.
   redirect from a follower, an empty batch, Nones to a dead port,
   and reconnect after close; `tests/test_bench.py` runs the new
   bench phase end to end.
+- ~~Multi-get reads~~ — done in v0.30.0, Nov 23, 2026: the
+  per-request cost the v0.29.0 measurement named (~0.06ms a
+  dispatch) is now paid once per batch instead of once per key —
+  one `mget` RPC serves up to 1000 keys through the same
+  ReadIndex/lease path as a single `get`, so it is exactly as
+  linearizable, with `values` aligned with `keys` (None for a
+  missing key) and the same `read_index` / `read_term` a session
+  uses to advance its read watermark. `_serve_read` serves both
+  shapes from one code path (a `_values()` payload built under the
+  lock at the same three return sites), the read-parameter
+  validation is shared too (`_parse_read_params`), and the client
+  exposes it as `client.mget(keys)`, `Session.mget(keys)` (same
+  watermark, same read-your-writes guarantees), and `mget k1 k2
+  ...` on the CLI (one JSON list). `scripts/bench.py --mget`
+  measures it (`--mget-batch` sets the batch size). Measured
+  honestly on this shared box: a batch of 50 costs ~0.2ms total,
+  ~0.004-0.005ms per key — ~12x cheaper per key than 50 pipelined
+  gets in the same runs — and the batch time barely grows with
+  size (10: ~0.1ms, 200: ~0.3ms), so the per-key rate is a
+  property of the batch, not of independent clients: the
+  sustained concurrent ceiling is unchanged, and a batch of 10 is
+  barely faster per key than pipelining. Building this caught a
+  real bug in the first draft: `_serve_read` gained its `keys`
+  parameter ahead of `min_index`, so the single-key caller's
+  positional `min_index` landed in `keys` and every plain `get`
+  failed with "'int' object is not iterable" — the parameter order
+  now keeps the old positional call working, and the single-key
+  call site passes its arguments by keyword. `tests/test_mget.py`
+  proves it: values in order, missing keys, redirect from a
+  follower, stale service from a follower lease, bad key lists
+  and bad read params rejected, session read-your-writes, and
+  agreement with pipelined `get_many` on the same 50 keys.

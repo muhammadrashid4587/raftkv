@@ -13,10 +13,17 @@ Starts a real 3-node cluster on localhost (subprocesses, like
   * (with ``--pipelined``) pipelined reads of the written keys:
     one client, one persistent connection, ``--pipeline-depth``
     requests sent at a time without waiting for each reply
+  * (with ``--mget``) multi-get reads of the written keys: one
+    client, one ``mget`` RPC per ``--mget-batch`` keys, so the
+    per-key cost is one state machine lookup instead of one
+    dispatch each
 
 Each phase reports ops/sec and per-op latency percentiles (p50/p95/p99).
 The pipelined phase reports mean per-op latency instead: per-op
 latencies are not observable inside a batch, only the batch time.
+The mget phase reports the same way: a batch is one request, so only
+the batch time is observable, and the per-key rate is what the phase
+measures.
 A sample of the written keys is read back afterwards and checked, so a
 fast run that lost data still fails. Exits non-zero if any operation
 fails, a verification read disagrees, or the cluster never elects a
@@ -26,6 +33,7 @@ Usage:
 
     python3 scripts/bench.py [--writes 200] [--threads 10]
         [--pool-size 10] [--pipelined] [--pipeline-depth 50]
+        [--mget] [--mget-batch 50]
         [--port-base 5100]
         [--data-dir /tmp/raftkv-bench] [--keep]
 
@@ -53,7 +61,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from raftkv.client import get_many
+from raftkv.client import get_many, mget
 from raftkv.client import request as client_request  # noqa: E402
 from raftkv.transport import ConnectionPool, send_rpc  # noqa: E402
 
@@ -218,6 +226,44 @@ def run_pipelined_reads(addr: tuple[str, int], count: int,
     )
 
 
+def run_mget_reads(addr: tuple[str, int], count: int,
+                   batch: int) -> None:
+    """One client, ``count`` reads, one ``mget`` RPC per ``batch``
+    keys over a persistent connection.
+
+    A batch is one request — one leadership confirmation, one apply
+    wait, one frame — so per-key latencies are not observable, only
+    the batch time; the row reports the mean per-key latency (batch
+    time / batch size) and the per-key rate, which is what the phase
+    measures: whether serving many keys per dispatch is cheaper than
+    one dispatch per key. Every value is checked against the written
+    value, so a fast run that lost data still fails."""
+    keys = [f"bench:{i}" for i in range(count)]
+    start = time.perf_counter()
+    batch_times: list[float] = []
+    for i in range(0, count, batch):
+        batch_keys = keys[i:i + batch]
+        batch_start = time.perf_counter()
+        resp = mget(addr, batch_keys, timeout=30.0)
+        batch_times.append(time.perf_counter() - batch_start)
+        if resp.get("status") != "ok":
+            raise RuntimeError(f"mget {batch_keys[0]}.. failed: {resp}")
+        values = resp.get("values") or []
+        if len(values) != len(batch_keys) or any(
+                v != VALUE for v in values):
+            raise RuntimeError(
+                f"mget {batch_keys[0]}.. returned wrong values: {resp}")
+    elapsed = time.perf_counter() - start
+    mean_ms = elapsed / count * 1000
+    print(
+        f"{'mget reads':<28} {count:>5} ops  {elapsed:>6.2f}s  "
+        f"{count / elapsed:>7.1f} ops/s  "
+        f"mean {mean_ms:>6.3f}ms/op  "
+        f"(batches of {batch}, "
+        f"batch p50 {percentile(batch_times, 50) * 1000:>6.1f}ms)"
+    )
+
+
 def run_phase(label: str, fn, count: int,
               threads: int, addr: tuple[str, int],
               pool: ConnectionPool | None = None) -> None:
@@ -255,6 +301,13 @@ def main(argv: list[str] | None = None) -> int:
                              "without waiting for each reply")
     parser.add_argument("--pipeline-depth", type=int, default=50,
                         help="requests sent per pipelined batch "
+                             "(default 50)")
+    parser.add_argument("--mget", action="store_true",
+                        help="also run a multi-get phase: one client "
+                             "reads all keys with one mget RPC per "
+                             "--mget-batch keys")
+    parser.add_argument("--mget-batch", type=int, default=50,
+                        help="keys served per mget request "
                              "(default 50)")
     parser.add_argument("--port-base", type=int, default=5100,
                         help="first of three consecutive ports "
@@ -300,6 +353,9 @@ def main(argv: list[str] | None = None) -> int:
             leader_addr = find_leader(cluster.addrs)
             run_pipelined_reads(leader_addr, args.writes,
                                 args.pipeline_depth)
+        if args.mget:
+            leader_addr = find_leader(cluster.addrs)
+            run_mget_reads(leader_addr, args.writes, args.mget_batch)
         # Verify a deterministic sample of the written keys.
         sample = list(range(0, args.writes, max(1, args.writes // 20)))
         for i in sample:
