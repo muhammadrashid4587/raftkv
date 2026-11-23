@@ -853,6 +853,115 @@ class RaftNode:
             self._membership_change = None
         return self._has_uncommitted_config_entry()
 
+    def _membership_status(self) -> dict:
+        """The cluster's membership as this node sees it, for the
+        status RPC and the ``membership-status`` CLI subcommand. Lock
+        held.
+
+        A client driving an add/remove only hears back once the
+        change has fully committed, so while a change is in flight
+        there is otherwise no way to see where it stands: this
+        reports the current voting config, the joint config while a
+        transition is open, which phase the transition is in, and
+        the change itself (op, server, and the log indexes of its
+        entries).
+
+        Phases:
+        - "stable": no transition open, nothing in flight.
+        - "catching_up": the leader is still replicating the log to
+          a server being added as a non-voting peer; no config entry
+          has been appended yet.
+        - "joint_pending": the joint_config entry is in the log but
+          has not committed yet.
+        - "joint_committed": the joint entry committed, so a majority
+          of BOTH configs is now needed for every quorum; the final
+          entry has not been appended yet.
+        - "final_pending": the final_config entry is in the log but
+          has not committed yet.
+
+        ``pending_change`` is None when the cluster is stable. Its
+        op/server come from the joint entry itself while the entry
+        is still in the log; when a snapshot taken mid-transition
+        has compacted it away, they are derived by diffing C-old
+        against C-new (exactly one server differs); when the change
+        has not reached the log yet, they come from the flag the
+        driving leader holds. ``joint_index`` / ``final_index`` are
+        None when the entry is not in this node's log.
+        """
+        joint_entry = None
+        final_entry = None
+        legacy_entry = None
+        for entry in self.log:
+            op = entry["command"].get("op")
+            if op == "joint_config":
+                joint_entry = entry
+                final_entry = None
+            elif op == "final_config":
+                final_entry = entry
+            elif op in ("add_server", "remove_server"):
+                legacy_entry = entry
+        if (final_entry is not None
+                and final_entry["index"] > self.commit_index):
+            phase = "final_pending"
+        elif self._joint_new is not None:
+            phase = "joint_committed"
+        elif (joint_entry is not None
+                and joint_entry["index"] > self.commit_index):
+            phase = "joint_pending"
+        elif (legacy_entry is not None
+                and legacy_entry["index"] > self.commit_index):
+            phase = "joint_pending"
+        elif self._membership_change is not None:
+            phase = "catching_up"
+        else:
+            phase = "stable"
+        pending: dict | None = None
+        if (joint_entry is not None
+                and (final_entry is None
+                     or final_entry["index"] > self.commit_index)):
+            cmd = joint_entry["command"]
+            pending = {
+                "op": cmd.get("change_op"),
+                "server_id": cmd.get("server_id"),
+                "joint_index": joint_entry["index"],
+                "final_index": (final_entry["index"]
+                                if final_entry is not None else None),
+            }
+        elif self._joint_new is not None:
+            old, new = set(self.config), set(self._joint_new)
+            added, removed = new - old, old - new
+            if len(added) == 1 and not removed:
+                pending = {"op": "add_server",
+                           "server_id": sorted(added)[0],
+                           "joint_index": None, "final_index": None}
+            elif len(removed) == 1 and not added:
+                pending = {"op": "remove_server",
+                           "server_id": sorted(removed)[0],
+                           "joint_index": None, "final_index": None}
+        elif (legacy_entry is not None
+                and legacy_entry["index"] > self.commit_index):
+            cmd = legacy_entry["command"]
+            pending = {"op": cmd.get("op"),
+                       "server_id": cmd.get("server_id"),
+                       "joint_index": None, "final_index": None}
+        elif self._membership_change is not None:
+            flag = self._membership_change
+            pending = {"op": flag.get("op"),
+                       "server_id": flag.get("server_id"),
+                       "joint_index": flag.get("index"),
+                       "final_index": None}
+        return {
+            "config": sorted(self.config),
+            "joint_new": (sorted(self._joint_new)
+                          if self._joint_new is not None else None),
+            "phase": phase,
+            "change_in_progress": self._membership_change_in_progress(),
+            "pending_change": pending,
+            "joint_committed": self._joint_new is not None,
+            "non_voting": sorted(self._non_voting),
+            "removal_pending": dict(self._removal_pending),
+        }
+
     def _init_peer_state(self, peer: str, next_index: int) -> None:
         """(Re)initialize all per-peer leader state for ``peer``. Lock
         held. Used by _become_leader for the whole cluster and when a
@@ -1219,6 +1328,7 @@ class RaftNode:
                     "config": sorted(self.config),
                     "joint_new": (sorted(self._joint_new)
                                   if self._joint_new is not None else None),
+                    "membership": self._membership_status(),
                     "peers": sorted(self.peers),
                     "removed": self._is_removed(),
                 }

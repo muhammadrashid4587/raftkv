@@ -155,6 +155,63 @@ class Session:
         return resp
 
 
+def membership_status(node_addr: tuple[str, int]) -> dict:
+    """Ask one node for its status response, which carries the
+    ``membership`` object: the current config, the joint config
+    while a transition is open, which phase it is in, and the
+    change itself (op, server, entry indexes). Any node answers —
+    no redirect following, since this reads local state, not a
+    client-protocol op."""
+    host, port = node_addr
+    resp = send_rpc(host, port, {"type": "status"}, timeout=5.0)
+    if resp is None:
+        return {"type": "status_response", "status": "error",
+                "error": f"node {host}:{port} did not answer"}
+    return resp
+
+
+def _format_membership_status(status: dict) -> list[str]:
+    """Human-readable lines for a status response's membership
+    object: one line naming the node, one for the config, one for
+    the phase and the change in flight, then the joint config and
+    any servers still catching up or pending removal."""
+    m = status.get("membership") or {}
+    lines = [
+        f"{status.get('node_id')} ({status.get('role')}, "
+        f"term {status.get('term')})",
+        "config: " + ", ".join(m.get("config") or []),
+    ]
+    phase = m.get("phase", "stable")
+    pending = m.get("pending_change") or {}
+    detail = f"membership: {phase}"
+    if pending:
+        detail += f" — {pending.get('op')} {pending.get('server_id')}"
+        joint_index = pending.get("joint_index")
+        final_index = pending.get("final_index")
+        if phase == "catching_up":
+            detail += (" (replicating the log as a non-voter; joint "
+                       "entry not yet appended)")
+        elif phase == "joint_pending":
+            detail += f" (joint entry {joint_index} not yet committed)"
+        elif phase == "joint_committed":
+            detail += (f" (joint entry {joint_index} committed; final "
+                       "entry not yet appended)")
+        elif phase == "final_pending":
+            detail += (f" (joint entry {joint_index} committed; final "
+                       f"entry {final_index} not yet committed)")
+    lines.append(detail)
+    if m.get("joint_new") is not None:
+        lines.append("joint config: " + ", ".join(m["joint_new"]))
+    if m.get("non_voting"):
+        lines.append("non-voting (catching up): "
+                     + ", ".join(m["non_voting"]))
+    if m.get("removal_pending"):
+        lines.append("removal pending: " + ", ".join(
+            f"{sid} (entry {idx})"
+            for sid, idx in sorted(m["removal_pending"].items())))
+    return lines
+
+
 def request(node_addr: tuple[str, int], msg: dict, timeout: float = 12.0) -> dict:
     """Send one client request, following leader redirects."""
     host, port = node_addr
@@ -249,10 +306,23 @@ def main(argv: list[str] | None = None) -> int:
     p_remove = sub.add_parser("remove-server",
                               help="remove a server from the cluster")
     p_remove.add_argument("server_id")
+    p_ms = sub.add_parser(
+        "membership-status",
+        help="show the cluster membership as this node sees it: the "
+             "current config, and any change in flight — which server, "
+             "which phase, and whether its entries have committed")
+    p_ms.add_argument("--json", action="store_true",
+                      help="print the membership object as JSON "
+                           "instead of the human-readable summary")
     args = parser.parse_args(argv)
+    # Subcommand names keep their hyphens (add-server), but the wire
+    # protocol and the server use underscores (add_server): normalize
+    # once here so every branch below can compare against the
+    # underscored form.
+    op = args.op.replace("-", "_")
 
     host, _, port = args.node.rpartition(":")
-    if args.op == "watch":
+    if op == "watch":
         # A watch is a long-poll, not a client-protocol op: any node
         # serves it, so no redirect following, and the RPC timeout
         # must outlive the watch timeout or the client gives up first.
@@ -270,27 +340,43 @@ def main(argv: list[str] | None = None) -> int:
         for event in resp.get("events") or []:
             print(json.dumps(event))
         return 0
-    msg: dict = {"type": "client", "op": args.op}
-    if args.op in ("set", "get", "del", "cas"):
+    if op == "membership_status":
+        # A status read, not a client-protocol op: any node serves
+        # it, so no redirect following, and the answer is the node's
+        # own view of the membership — which may lag the leader's
+        # during a transition, by design.
+        resp = membership_status((host, int(port)))
+        if resp.get("status") == "error":
+            print(f"error: {resp.get('error') or resp}", file=sys.stderr)
+            return 1
+        if args.json:
+            print(json.dumps(resp.get("membership") or {},
+                             sort_keys=True))
+        else:
+            for line in _format_membership_status(resp):
+                print(line)
+        return 0
+    msg: dict = {"type": "client", "op": op}
+    if op in ("set", "get", "del", "cas"):
         msg["key"] = args.key
-    elif args.op == "add_server":
+    elif op == "add_server":
         msg["server_id"] = args.server_id
         ahost, _, aport = args.addr.rpartition(":")
         msg["addr"] = [ahost, int(aport)]
-    elif args.op == "remove_server":
+    elif op == "remove_server":
         msg["server_id"] = args.server_id
-    if args.op == "set":
+    if op == "set":
         msg["value"] = args.value
-    if args.op == "cas":
+    if op == "cas":
         msg["expected"] = args.expected
         msg["value"] = args.value
-    if args.op in ("set", "del", "cas") and args.request_id:
+    if op in ("set", "del", "cas") and args.request_id:
         # A request id without an explicit client id still dedups
         # within the default "cli" session; the same id retried from
         # another session is a different write.
         msg["client_id"] = args.client_id or "cli"
         msg["request_id"] = args.request_id
-    if args.op == "get":
+    if op == "get":
         # A read-your-writes read from the shell: --min-index names
         # the last write the reader saw acknowledged (its index, from
         # the write response), --session-term its term. A monotonic
@@ -311,7 +397,7 @@ def main(argv: list[str] | None = None) -> int:
     resp = request((host, int(port)), msg, timeout=args.timeout)
     status = resp.get("status")
     if status == "ok":
-        if args.op == "get":
+        if op == "get":
             print(resp.get("value") if resp.get("value") is not None else "(nil)")
         else:
             print("OK")

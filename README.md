@@ -103,6 +103,22 @@ logic and the failure handling, not the key-value API on top.
   If the driving leader dies mid-transition, the next leader finishes
   it on election; a snapshot taken mid-transition carries the joint
   config, and a node restarted mid-transition resumes in it.
+- **Membership-change status** — since v0.23.0 the status RPC
+  carries a `membership` object, and the client exposes it as
+  `membership-status` (`--json` for the raw object): the current
+  voting config, the joint config while a transition is open, which
+  phase it is in (`stable`, `catching_up`, `joint_pending`,
+  `joint_committed`, `final_pending`), and the change itself — the
+  op (`add_server` / `remove_server`), the server, and the log
+  indexes of its joint and final entries — plus the servers still
+  catching up as non-voters and any removal the leader is still
+  replicating. A client driving an add/remove only hears back once
+  the change has fully committed, so this is the only way to see
+  where an in-flight change stands; each node reports its own view,
+  so a follower a heartbeat behind the leader may still show the
+  previous phase. The op and server come from the joint entry
+  itself, or — when a snapshot taken mid-transition has compacted
+  it away — from diffing C-old against C-new.
 - **Leader redirects** — a write or read sent to a follower returns the
   current leader's address; the client follows it automatically.
 - **Client session deduplication** — a write may carry a
@@ -278,7 +294,7 @@ make test
 # or: python3 -m unittest discover -s tests -v
 ```
 
-139 tests, plus a smoke test for the benchmark script, all passing:
+143 tests, plus a smoke test for the benchmark script, all passing:
 
 | Test | What it proves |
 |---|---|
@@ -328,6 +344,10 @@ make test
 | `test_add_node_under_partition` | Adding a node while one follower is partitioned: the majority side plus the catching-up node4 commit the joint and final entries, and after the heal every node reports the 4-node config |
 | `test_remove_node_while_follower_killed_and_restarted` | Removing a node while another follower is down: the joint entry waits out the restart, then commits, and writes continue on the 2-node cluster |
 | `test_membership_survives_leader_restart_mid_chaos` | Writers and kill/restart faults running throughout, a node added mid-run, then the leader killed and restarted: every acked write present on all four nodes, 4-node config everywhere, no joint phase left |
+| `test_status_reports_stable_membership` | A healthy cluster reports phase stable, the 3-node config, no joint config, nothing in flight |
+| `test_status_reports_uncommitted_joint_entry` | An isolated leader with a joint entry in its log reports joint_pending with the op, server, and joint index; a follower that never saw the entry still reports stable |
+| `test_status_reports_joint_phase_mid_transition` | A cluster frozen in the joint phase reports joint_committed with the change and the non-voting server from both leader and follower, then stable once the change completes |
+| `test_membership_status_cli` | The `membership-status` CLI prints the summary and `--json`, and the `add-server` / `remove-server` CLI paths drive the change end to end |
 | `test_lease_read_skips_heartbeat_round` | Five reads on a leased leader run zero confirmation rounds and return the right values |
 | `test_lease_expires_without_majority_acks` | With both followers down the lease goes stale, the read falls back to a round and errors instead of serving unconfirmed |
 | `test_step_down_clears_lease` | Stepping down clears the ack record, so a deposed leader holds no lease |
@@ -875,3 +895,22 @@ entries left in `log.jsonl` are dropped by their index on reload.
   `scripts/chaos.py --membership` (seeds 7 and 42, the second with
   a 3s partition overlapping the add): 81 and 129 acked writes, zero
   lost, 4 nodes converged, linearizability ok.
+- ~~Membership-change status reporting~~ — done in v0.23.0, Nov 23,
+  2026: the status RPC now carries a `membership` object and the
+  client exposes it as `membership-status` — the current voting
+  config, the joint config while a transition is open, the phase
+  (`stable`, `catching_up`, `joint_pending`, `joint_committed`,
+  `final_pending`), and the change itself (op, server, joint/final
+  log indexes), plus non-voting servers catching up and removals
+  still being replicated. The op/server come from the joint entry
+  in the log, or from diffing C-old against C-new when a snapshot
+  taken mid-transition has compacted it away.
+  `tests/test_membership_status.py` covers a stable cluster, an
+  uncommitted joint entry on an isolated leader (and a follower
+  still reporting stable), a frozen joint phase reported identically
+  by leader and follower and back to stable once the change
+  completes, and the CLI — including the `add-server` /
+  `remove-server` CLI paths, which previously never matched the
+  underscored op comparisons (the hyphenated subcommand name was
+  sent to the server verbatim) and so errored instead of driving
+  the change.
