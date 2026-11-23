@@ -118,6 +118,111 @@ class TestLinearizabilitySynthetic(unittest.TestCase):
         h2.record(read("r", 0, "k", "a", 4.0, 5.0))
         self.assertFalse(h2.check().ok)
 
+    def test_successful_cas_with_stale_expected_is_flagged(self):
+        # The key held "a", then "b" completed, then the CAS claimed
+        # to succeed against "a" — "a" was no longer the value, and
+        # no concurrent write could have made it so.
+        h = History()
+        h.record(write("w", 0, "k", "a", 0.0, 1.0))
+        h.record(write("w", 1, "k", "b", 2.0, 3.0))
+        h.record(op("w", 2, "cas", "k", value="c", expected="a",
+                   invoke=4.0, respond=5.0))
+        result = h.check()
+        self.assertFalse(result.ok)
+        self.assertIn("impossible CAS", result.violations[0])
+        self.assertIn("'a'", result.violations[0])
+
+    def test_successful_cas_with_concurrent_expected_is_ok(self):
+        # The overwrite overlaps the CAS: the CAS may have linearized
+        # before it (seeing "a") or after it (seeing "b").
+        h = History()
+        h.record(write("w", 0, "k", "a", 0.0, 1.0))
+        h.record(write("w", 1, "k", "b", 2.0, 4.0))
+        h.record(op("w", 2, "cas", "k", value="c", expected="b",
+                   invoke=3.0, respond=5.0))
+        self.assertTrue(h.check().ok)
+        h2 = History()
+        h2.record(write("w", 0, "k", "a", 0.0, 1.0))
+        h2.record(write("w", 1, "k", "b", 2.0, 4.0))
+        h2.record(op("w", 2, "cas", "k", value="c", expected="a",
+                    invoke=3.0, respond=5.0))
+        self.assertTrue(h2.check().ok)
+
+    def test_successful_cas_with_future_expected_is_flagged(self):
+        # The CAS finished before "b" was even invoked: it cannot
+        # have seen "b" as the current value.
+        h = History()
+        h.record(write("w", 0, "k", "a", 0.0, 1.0))
+        h.record(op("w", 1, "cas", "k", value="c", expected="b",
+                   invoke=2.0, respond=3.0))
+        h.record(write("w", 2, "k", "b", 4.0, 5.0))
+        self.assertFalse(h.check().ok)
+
+    def test_successful_cas_on_missing_key(self):
+        # No write had completed: only a CAS expecting the key absent
+        # (expected None) could have succeeded.
+        h = History()
+        h.record(op("w", 0, "cas", "k", value="a", expected=None,
+                   invoke=0.0, respond=1.0))
+        self.assertTrue(h.check().ok)
+        h2 = History()
+        h2.record(op("w", 0, "cas", "k", value="a", expected="x",
+                    invoke=0.0, respond=1.0))
+        result = h2.check()
+        self.assertFalse(result.ok)
+        self.assertIn("impossible CAS", result.violations[0])
+
+    def test_successful_cas_after_delete_may_expect_none(self):
+        h = History()
+        h.record(write("w", 0, "k", "a", 0.0, 1.0))
+        h.record(op("w", 1, "del", "k", invoke=2.0, respond=3.0))
+        h.record(op("w", 2, "cas", "k", value="b", expected=None,
+                   invoke=4.0, respond=5.0))
+        self.assertTrue(h.check().ok)
+        # ... but not the deleted value.
+        h2 = History()
+        h2.record(write("w", 0, "k", "a", 0.0, 1.0))
+        h2.record(op("w", 1, "del", "k", invoke=2.0, respond=3.0))
+        h2.record(op("w", 2, "cas", "k", value="b", expected="a",
+                    invoke=4.0, respond=5.0))
+        self.assertFalse(h2.check().ok)
+
+    def test_failed_cas_carries_no_precondition(self):
+        # A failed CAS changed nothing, so its expected is never
+        # checked — only the current value its reply reported, as a
+        # read. An expected of "zzz" is fine as long as the reported
+        # current value is one the key held.
+        h = History()
+        h.record(write("w", 0, "k", "a", 0.0, 1.0))
+        h.record(op("w", 1, "cas", "k", value="b", expected="zzz",
+                   invoke=2.0, respond=3.0, status="cas_failed",
+                   returned="a"))
+        result = h.check()
+        self.assertTrue(result.ok, result)
+        self.assertEqual(result.cas_checked, 0)
+
+    def test_multi_writer_cas_expected_uses_weak_check(self):
+        # Two writers to the same key: a CAS expecting a value the
+        # other writer wrote before the CAS responded is legal, but
+        # one expecting a value nobody wrote is impossible.
+        h = History()
+        h.record(write("w1", 0, "k", "a", 0.0, 1.0))
+        h.record(write("w2", 0, "k", "b", 0.5, 1.5))
+        h.record(op("w1", 1, "cas", "k", value="c", expected="b",
+                   invoke=2.0, respond=3.0))
+        result = h.check()
+        self.assertTrue(result.ok, result)
+        self.assertEqual(result.multi_writer_keys, ["k"])
+        self.assertEqual(result.cas_checked, 1)
+        h2 = History()
+        h2.record(write("w1", 0, "k", "a", 0.0, 1.0))
+        h2.record(write("w2", 0, "k", "b", 0.5, 1.5))
+        h2.record(op("w1", 1, "cas", "k", value="c",
+                    expected="never-written", invoke=2.0, respond=3.0))
+        result2 = h2.check()
+        self.assertFalse(result2.ok)
+        self.assertIn("impossible CAS", result2.violations[0])
+
     def test_failed_cas_counts_as_a_read_of_current_value(self):
         h = History()
         h.record(write("w", 0, "k", "a", 0.0, 1.0))

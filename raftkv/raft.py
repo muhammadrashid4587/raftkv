@@ -833,7 +833,18 @@ class RaftNode:
                                       entry["command"]["value"], "set")
                 if (op == "cas" and result is not None
                         and self.role == "leader"):
-                    self._apply_results[self.last_applied] = result
+                    # Record the outcome only when a local waiter is
+                    # waiting on it: the waiter is the only consumer,
+                    # and a result recorded for an entry this node did
+                    # not submit — a new leader applying the old
+                    # leader's batch — would never be claimed, so it
+                    # would sit in _apply_results forever. A write
+                    # without a session id has no dedup key, so it
+                    # always records: its waiter is identified by
+                    # index alone.
+                    key = _dedup_key(entry["command"])
+                    if key is None or key in self._dedup_inflight:
+                        self._apply_results[self.last_applied] = result
         self._save_meta()
         if (self.last_applied > self.snapshot_index
                 and len(self.log) > self.snapshot_threshold):
@@ -1562,7 +1573,11 @@ class RaftNode:
         # that result, not the shared ok: the outcome was decided when
         # the entry applied, and the waiter must learn it, not just
         # that the entry committed. Apply results for this batch are
-        # pruned here, once every waiter has its own.
+        # pruned here, once every waiter has its own — and only this
+        # batch's: batches flush concurrently, so pruning every
+        # result up to last_index could delete another batch's CAS
+        # outcome before its flusher read it, and that waiter would
+        # then get the shared "ok" for a CAS that actually failed.
         with self.lock:
             for w in batch:
                 own = (self._apply_results.get(w["index"])
@@ -1570,8 +1585,9 @@ class RaftNode:
                 w["result"] = dict(own) if own is not None else result
                 w["event"].set()
                 self._clear_inflight(w)
-            for idx in [i for i in self._apply_results if i <= last_index]:
-                del self._apply_results[idx]
+            for w in batch:
+                if w["index"] is not None:
+                    self._apply_results.pop(w["index"], None)
 
     # ------------------------------------------------------------------
     # ReadIndex pending reads

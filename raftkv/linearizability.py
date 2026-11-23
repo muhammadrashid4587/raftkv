@@ -19,6 +19,18 @@ The check, per key:
 * A **write** is a successful ``set`` / ``del`` / ``cas``. A delete
   writes ``None``. A failed CAS changes nothing, but its reply carries
   the current value, so it counts as a **read** of that value.
+* A **successful CAS** is a write *and* a precondition: at the
+  instant the CAS linearized, the key must have held ``expected``.
+  The key held the latest write completed before the CAS was invoked
+  until a concurrent write linearized, so ``expected`` must be that
+  latest value, or the value of a write concurrent with the CAS, or
+  ``None`` if no write had completed yet. A CAS that "succeeded"
+  against a value the key never held, or held only after the CAS
+  finished, is impossible — and the read rule alone would never
+  catch it, because the read rule only constrains what reads
+  return, not what a conditional write assumed. Failed CAS ops
+  carry no precondition (they changed nothing), so they are only
+  checked as reads.
 * A **read** is a successful ``get`` (or a failed CAS). Let ``latest``
   be the write that completed most recently before the read was
   invoked, and let ``concurrent`` be the writes that overlap the read
@@ -90,6 +102,7 @@ class CheckResult:
     violations: list[str] = field(default_factory=list)
     ops_checked: int = 0
     reads_checked: int = 0
+    cas_checked: int = 0
     keys_checked: int = 0
     multi_writer_keys: list[str] = field(default_factory=list)
 
@@ -100,6 +113,7 @@ class CheckResult:
     def __str__(self) -> str:
         if self.ok:
             return (f"linearizability ok: {self.reads_checked} reads "
+                    f"and {self.cas_checked} successful CAS "
                     f"over {self.keys_checked} keys checked "
                     f"({self.ops_checked} ops)")
         return (f"linearizability FAILED: {len(self.violations)} "
@@ -153,15 +167,24 @@ class History:
         reads = [op for op in ops
                  if (op.kind == "get" and op.status == "ok")
                  or (op.kind == "cas" and op.status == "cas_failed")]
+        # Successful CAS ops are writes too, but they also carry a
+        # precondition — the key must have held ``expected`` when the
+        # CAS linearized — which the read rule never checks.
+        cas_ops = [op for op in ops
+                   if op.kind == "cas" and op.status == "ok"]
         result.reads_checked += len(reads)
-        if not reads:
-            return
+        result.cas_checked += len(cas_ops)
         writers = {op.client for op in writes}
         if len(writers) > 1:
-            result.multi_writer_keys.append(key)
-            self._check_key_weak(key, writes, reads, result)
+            if reads or cas_ops:
+                result.multi_writer_keys.append(key)
+            if reads:
+                self._check_key_weak(key, writes, reads, result)
+            self._check_cas_expected_weak(key, writes, cas_ops, result)
         else:
-            self._check_key_strict(key, writes, reads, result)
+            if reads:
+                self._check_key_strict(key, writes, reads, result)
+            self._check_cas_expected_strict(key, writes, cas_ops, result)
 
     def _check_key_strict(self, key: str, writes: list[Op],
                           reads: list[Op], result: CheckResult) -> None:
@@ -208,6 +231,64 @@ class History:
                     f"returned {read.returned!r}, but no write of that "
                     f"value was invoked before the read responded "
                     f"(writes seen: {sorted(possible, key=str)})")
+
+    def _check_cas_expected_strict(self, key: str, writes: list[Op],
+                                   cas_ops: list[Op],
+                                   result: CheckResult) -> None:
+        """Single-writer rule: a CAS that succeeded must have seen
+        ``expected`` as the key's value at some instant inside its
+        own interval. The key held the latest write completed before
+        the CAS was invoked until a concurrent write linearized, so
+        ``expected`` must be that latest value, or the value of a
+        concurrent write, or None if no write had completed yet. A
+        CAS that "succeeded" against a value the key never held, or
+        held only after the CAS finished, is impossible."""
+        for cas in cas_ops:
+            others = [w for w in writes if w is not cas]
+            completed = [w for w in others if w.respond <= cas.invoke]
+            concurrent = [w for w in others
+                          if w.invoke < cas.respond
+                          and w.respond > cas.invoke]
+            valid = {w.value for w in concurrent}
+            if completed:
+                latest = max(completed, key=lambda w: w.respond)
+                valid.add(latest.value)
+                detail = (f"latest completed write was "
+                          f"{latest.value!r} by {latest.client} "
+                          f"(responded at {latest.respond:.3f}, CAS "
+                          f"invoked at {cas.invoke:.3f})")
+            else:
+                valid.add(None)
+                detail = "no write had completed when the CAS began"
+            if cas.expected not in valid:
+                result.violations.append(
+                    f"impossible CAS on {key!r} by {cas.client}: "
+                    f"succeeded with expected {cas.expected!r}, but "
+                    f"{detail}; concurrent writes were "
+                    f"{[w.value for w in concurrent]}")
+
+    def _check_cas_expected_weak(self, key: str, writes: list[Op],
+                                 cas_ops: list[Op],
+                                 result: CheckResult) -> None:
+        """Multi-writer rule: a CAS that succeeded must have expected
+        a value some write had invoked before the CAS responded, or
+        None if no write had completed before it was invoked. Weaker
+        — overlapping writers can linearize in either order — but it
+        still catches a CAS that "succeeded" against a value nobody
+        had written yet."""
+        for cas in cas_ops:
+            others = [w for w in writes if w is not cas]
+            possible = {w.value for w in others
+                        if w.invoke < cas.respond}
+            if not any(w.respond <= cas.invoke for w in others):
+                possible.add(None)
+            if cas.expected not in possible:
+                result.violations.append(
+                    f"impossible CAS on {key!r} by {cas.client}: "
+                    f"succeeded with expected {cas.expected!r}, but no "
+                    f"write of that value was invoked before the CAS "
+                    f"responded (writes seen: "
+                    f"{sorted(possible, key=str)})")
 
 
 def record_client_op(history: History, client: str, seq: int,

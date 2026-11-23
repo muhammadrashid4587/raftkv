@@ -136,6 +136,24 @@ logic and the failure handling, not the key-value API on top.
   end of `scripts/chaos.py` and of `tests/test_chaos.py`, and
   `tests/test_linearizability.py` covers it with synthetic histories
   plus a live-cluster test.
+- **CAS-heavy chaos workload** — `scripts/chaos.py` (`--cas-threads`,
+  `--cas-writes`) and `tests/test_chaos.py` run CAS threads alongside
+  the set writers: each owns a counter key it increments with CAS, and
+  all of them contend on one shared counter they increment the same
+  way (read, then CAS expected = the value just read). A lost race
+  fails the CAS and the thread re-reads and retries, so the shared
+  counter only ever moves forward by exactly one — the end-of-run
+  check verifies it equals the number of successful shared CAS ops.
+  The linearizability checker verifies the precondition of every
+  successful CAS, not just what reads returned. Building this caught
+  a real bug: two group-commit batches flushing concurrently could
+  prune each other's CAS apply results, so a failed CAS came back
+  "ok" to the client (the counter did not move, but the client was
+  told it did). Fixed by pruning only each batch's own results, and
+  by recording an apply result only when a local waiter is waiting
+  on it. Verified with seeds 7 and 42: 276 and 610 successful CAS
+  respectively, 49 and 107 failed races, zero lost, all nodes
+  converged, linearizability ok.
 - **Real failure handling** — tested end to end: kill the leader, the
   cluster re-elects, writes continue, the old leader rejoins and
   catches up instead of forking.
@@ -171,7 +189,7 @@ make test
 # or: python3 -m unittest discover -s tests -v
 ```
 
-90 tests, plus a smoke test for the benchmark script, all passing:
+100 tests, plus a smoke test for the benchmark script, all passing:
 
 | Test | What it proves |
 |---|---|
@@ -233,12 +251,19 @@ make test
 | `test_cas_retry_with_same_session_id_returns_same_result` | Retried CAS returns the first attempt's result, one log entry |
 | `test_cas_failed_result_survives_snapshot_and_restart` | A failed CAS result survives compaction and a leader restart |
 | `test_cas_cli` | The `cas` CLI subcommand works end to end |
-| `test_random_kill_restart_mid_write_loses_nothing` | Seeded chaos: 4 kill/restart cycles mid-write, every acked write survives on every node, all nodes converge to identical state, and the recorded read history is linearizable |
+| `test_random_kill_restart_mid_write_loses_nothing` | Seeded chaos: 4 kill/restart cycles mid-write, every acked write survives on every node, all nodes converge to identical state, and the recorded read history is linearizable — now with CAS threads incrementing owned and shared counters through the same faults |
 | `test_stale_read_after_overwrite_is_flagged` | A read invoked after an overwrite completed but returning the old value fails the linearizability check |
 | `test_concurrent_read_may_see_old_or_new_value` | A read overlapping an overwrite may return either value |
 | `test_read_returning_a_future_value_is_flagged` | A read returning a value written only after the read finished fails the check |
 | `test_delete_then_read_returns_none` | A read after a delete returns None; returning the old value fails |
 | `test_failed_cas_counts_as_a_read_of_current_value` | A failed CAS is checked like a read of its reported current value |
+| `test_successful_cas_with_stale_expected_is_flagged` | A CAS that "succeeded" against a value superseded before it was invoked fails the check |
+| `test_successful_cas_with_concurrent_expected_is_ok` | A CAS expecting the value of a concurrent write may have linearized either side of it |
+| `test_successful_cas_with_future_expected_is_flagged` | A CAS that finished before its expected value was written fails the check |
+| `test_successful_cas_on_missing_key` | A CAS on a missing key may only expect the key absent |
+| `test_successful_cas_after_delete_may_expect_none` | After a delete, a CAS may expect None but not the deleted value |
+| `test_failed_cas_carries_no_precondition` | A failed CAS is checked only as a read; its expected is never checked |
+| `test_multi_writer_cas_expected_uses_weak_check` | A contended CAS expecting a value another writer wrote is legal; expecting a value nobody wrote is impossible |
 | `test_multi_writer_key_uses_weak_check` | A key written by several clients uses the weaker rule and is reported as such |
 | `test_concurrent_reads_and_writes_on_a_live_cluster` | Two writers and two readers on a real 3-node cluster: every observed read is linearizable |
 
@@ -429,7 +454,12 @@ entries left in `log.jsonl` are dropped by their index on reload.
   log index (`_apply_results`, pruned once the batch's waiters are
   woken), and the dedup table caches the full result, not just "ok",
   so a retry with the same session id gets the first attempt's exact
-  outcome. Snapshots carry `[client_id, request_id, result]`
+  outcome. Batches flush concurrently, so each batch prunes only its
+  own results: pruning by index range once deleted another batch's
+  unread outcome, and a failed CAS came back "ok" to the client. An
+  apply result is recorded only when a local waiter is waiting on
+  it, so a new leader applying the old leader's batch leaves nothing
+  stranded. Snapshots carry `[client_id, request_id, result]`
   triples (old pair-only snapshots still load as ok), and
   InstallSnapshot carries the table too, so a lagging follower that
   installs a snapshot adopts the dedup results for the covered
@@ -445,7 +475,12 @@ entries left in `log.jsonl` are dropped by their index on reload.
   one client in program order (true for the chaos workload, where
   each writer owns its keys); a key with several writers falls back
   to the weaker rule and is flagged in the result, so a run never
-  looks stricter than it was.
+  looks stricter than it was. A successful CAS gets the same
+  treatment for its precondition: its `expected` must be a value the
+  key could have held inside the CAS's own interval — the latest
+  completed write's value, a concurrent write's value, or `None` if
+  nothing had completed — under the strict rule for single-writer
+  keys and the weak rule for contended ones.
 - **No dependencies.** Pure stdlib: `socket`, `threading`, `json`,
   `socketserver`. Nothing to install, nothing to break.
 
@@ -558,3 +593,23 @@ entries left in `log.jsonl` are dropped by their index on reload.
   the same end-of-run verification. Verified with seeds 42 and 7
   plus a 3s partition: 242 and 191 acked writes respectively, zero
   lost, all nodes converged, linearizability ok.
+- ~~Linearizability checking on the CAS-heavy chaos workload~~ — done
+  in v0.15.0, Nov 22, 2026: the checker now verifies the
+  precondition of every successful CAS — the key must have held
+  `expected` at some instant inside the CAS's own interval (the
+  latest completed write's value, a concurrent write's value, or
+  None if nothing had completed) — under the strict rule for
+  single-writer keys and the weak rule for contended ones, with
+  failed CAS ops still checked only as reads. `scripts/chaos.py`
+  (`--cas-threads`, `--cas-writes`) and `tests/test_chaos.py` run
+  CAS threads through the fault schedule: each owns a counter key
+  it increments with CAS, and all contend on one shared counter
+  (read, then CAS expected = the value just read), verified at the
+  end to equal the number of successful shared CAS ops. Building
+  this caught a real bug — concurrent group-commit batches pruning
+  each other's CAS apply results, so a failed CAS came back "ok" —
+  fixed by pruning only each batch's own results and recording an
+  apply result only when a local waiter is waiting on it. Verified
+  with seeds 7 and 42: 276 and 610 successful CAS respectively, 49
+  and 107 failed races, zero lost, all nodes converged,
+  linearizability ok.

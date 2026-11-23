@@ -9,6 +9,15 @@ Starts a real 3-node cluster on localhost (subprocesses, like
     a session id (``client_id`` / ``request_id``), retrying on error
     until the write is acknowledged — an acked write is one the cluster
     promised to keep, so losing one is a correctness bug, not noise;
+  * CAS threads doing read-modify-write cycles with compare-and-swap:
+    each owns a counter key it increments with CAS, and all of them
+    contend on one shared counter they increment the same way (read,
+    then CAS expected = the value just read). A lost race fails the
+    CAS and the thread re-reads and retries, so the run exercises
+    real CAS contention — and the linearizability check verifies not
+    just what reads returned but the precondition of every
+    successful CAS: the key must actually have held ``expected``
+    when the CAS linearized;
   * reader threads reading keys the writers have already acked,
     recording every observation in a shared history;
   * a fault thread that, on a seeded random schedule, SIGKILLs a random
@@ -18,12 +27,17 @@ Starts a real 3-node cluster on localhost (subprocesses, like
 When the writers finish and the cluster settles, the script verifies:
 
   * every acked write reads back with its exact value,
+  * every CAS-owned counter and the shared counter read back at their
+    final values (the shared counter must equal the number of
+    successful shared CAS ops — each one increments by exactly one),
   * every node reports the same ``commit_index`` and ``last_applied`` —
     the same applied prefix on every node, so no node diverged or
     fell behind for good, and
   * the recorded history is linearizable (``raftkv.linearizability``):
     no concurrent read returned a stale value or a value from the
-    future, across the whole fault schedule.
+    future, and no successful CAS claimed an ``expected`` value the
+    key did not hold when the CAS linearized — across the whole fault
+    schedule.
 
 The fault schedule is seeded, so ``--seed N`` reproduces the exact
 same kill/restart sequence for debugging a failure. Exits non-zero if
@@ -63,6 +77,137 @@ from raftkv.linearizability import History, record_client_op  # noqa: E402
 from raftkv.transport import send_rpc  # noqa: E402
 
 SEED_KEY = "__chaos_probe__"
+SHARED_CAS_KEY = "chaos:cas:shared"
+
+
+def attempt(addr, msg, timeout=60.0):
+    """Send one logical op until it acks (``ok`` or ``cas_failed``)
+    or ``timeout`` passes, retrying transport errors with the same
+    session id, so a lost response is deduped, not applied twice.
+    Returns ``(resp, first_invoke)``; ``resp`` is None on deadline."""
+    first_invoke = time.monotonic()
+    deadline = first_invoke + timeout
+    while True:
+        resp = client_request(addr, msg, timeout=3.0)
+        if resp.get("status") in ("ok", "cas_failed"):
+            return resp, first_invoke
+        if time.monotonic() > deadline:
+            return None, first_invoke
+        time.sleep(0.1)
+
+
+def cas_worker(cluster: Cluster, thread_id: int, min_count: int,
+               cas_acked: dict[str, str], lock: threading.Lock,
+               errors: list[str], faults_done: threading.Event,
+               history: History, shared_successes: list[int]) -> None:
+    """CAS-heavy workload: one thread owns a counter key it increments
+    with compare-and-swap, and all CAS threads contend on one shared
+    counter they increment the same way (read, then CAS expected =
+    the value just read). A lost race fails the CAS and the thread
+    re-reads and retries, so the counter only ever moves forward by
+    exactly one. Every CAS op — success or failed race — is recorded
+    in the shared history with its first attempt's invocation time,
+    so the linearizability check can verify each successful CAS's
+    precondition, not just what reads returned. A retry after a
+    failed CAS is a new logical op (new request id): the failed
+    result is cached in the dedup table, so reusing the id would
+    return the cached failure forever."""
+    addr = cluster.addrs[0]
+    client_id = f"cas-{thread_id}"
+    owned = f"chaos:cas:t{thread_id}"
+    seq = 0
+
+    def get(key: str) -> dict | None:
+        """One get, retried until it acks; records the read in the
+        history. Returns the response dict, or None if it never
+        acked within the deadline."""
+        nonlocal seq
+        seq += 1
+        msg = {"type": "client", "op": "get", "key": key}
+        resp, first_invoke = attempt(addr, msg)
+        if resp is None:
+            return None
+        record_client_op(history, client_id, seq, msg, resp,
+                         first_invoke, time.monotonic())
+        return resp
+
+    def cas(key: str, expected: str, value: str) -> dict | None:
+        """One CAS, retried on transport errors until it acks (ok or
+        cas_failed); records it in the history. Returns the response
+        dict, or None if it never acked within the deadline."""
+        nonlocal seq
+        seq += 1
+        msg = {"type": "client", "op": "cas", "key": key,
+               "expected": expected, "value": value,
+               "client_id": client_id, "request_id": f"cas-{seq}"}
+        resp, first_invoke = attempt(addr, msg)
+        if resp is None:
+            return None
+        record_client_op(history, client_id, seq, msg, resp,
+                         first_invoke, time.monotonic())
+        return resp
+
+    # Seed the owned key with a plain set, recorded like any write.
+    last = f"c{thread_id}-0"
+    msg = {"type": "client", "op": "set", "key": owned, "value": last,
+           "client_id": client_id, "request_id": "init"}
+    resp, first_invoke = attempt(addr, msg)
+    if resp is None or resp.get("status") != "ok":
+        errors.append(f"{owned}: initial set never acked: {resp}")
+        return
+    record_client_op(history, client_id, 0, msg, resp,
+                     first_invoke, time.monotonic())
+    with lock:
+        cas_acked[owned] = last
+
+    n = 0
+    successes = 0
+    while not faults_done.is_set() or successes < min_count:
+        n += 1
+        # Owned key: increment our own counter with CAS. We own this
+        # key, so the CAS should succeed; if it ever fails, learn the
+        # current value and retry from there.
+        value = f"c{thread_id}-{n}"
+        while True:
+            resp = cas(owned, last, value)
+            if resp is None:
+                errors.append(f"{owned}: CAS {n} never acked")
+                return
+            if resp.get("status") == "ok":
+                last = value
+                successes += 1
+                with lock:
+                    cas_acked[owned] = value
+                break
+            cur = get(owned)
+            if cur is None or cur.get("status") != "ok":
+                errors.append(f"{owned}: re-read after failed CAS "
+                              f"never acked: {cur}")
+                return
+            if cur.get("value") is None:
+                errors.append(f"{owned}: key missing after failed CAS")
+                return
+            last = cur["value"]
+        # Shared counter: read the current value, CAS it up by one.
+        # Lost races fail the CAS and retry from a fresh read.
+        while True:
+            cur = get(SHARED_CAS_KEY)
+            if cur is None or cur.get("status") != "ok":
+                errors.append(f"{SHARED_CAS_KEY}: get never acked: {cur}")
+                return
+            current = cur.get("value")
+            if current is None:
+                errors.append(f"{SHARED_CAS_KEY}: key missing mid-run")
+                return
+            resp = cas(SHARED_CAS_KEY, current, str(int(current) + 1))
+            if resp is None:
+                errors.append(f"{SHARED_CAS_KEY}: CAS never acked")
+                return
+            if resp.get("status") == "ok":
+                with lock:
+                    shared_successes[0] += 1
+                break
+            # Lost the race: loop around, re-read, try again.
 
 
 class Cluster:
@@ -365,6 +510,14 @@ def main(argv: list[str] | None = None) -> int:
                              "run verification.")
     parser.add_argument("--threads", type=int, default=3,
                         help="concurrent writer threads (default 3)")
+    parser.add_argument("--cas-threads", type=int, default=2,
+                        help="concurrent CAS threads doing read-modify-"
+                             "write cycles (default 2)")
+    parser.add_argument("--cas-writes", type=int, default=15,
+                        help="minimum successful owned-key CAS ops per "
+                             "CAS thread (default 15; each thread also "
+                             "increments the shared counter once per "
+                             "owned CAS)")
     parser.add_argument("--readers", type=int, default=2,
                         help="concurrent reader threads recording a "
                              "history for the linearizability check "
@@ -396,7 +549,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"cluster up on ports "
               f"{args.port_base}-{args.port_base + 2} "
               f"(seed {args.seed}, {args.writes} writes x "
-              f"{args.threads} threads, {args.faults} faults)")
+              f"{args.threads} threads, {args.cas_writes} CAS x "
+              f"{args.cas_threads} threads, {args.faults} faults)")
         acked: dict[str, str] = {}
         lock = threading.Lock()
         errors: list[str] = []
@@ -405,6 +559,22 @@ def main(argv: list[str] | None = None) -> int:
         history = History()
         written_counts = [0] * args.threads
         stop_readers = threading.Event()
+        cas_acked: dict[str, str] = {}
+        shared_successes = [0]
+
+        # Seed the shared CAS counter before the CAS threads start:
+        # their first read must see "0", and the init set is recorded
+        # in the history so the checker knows where "0" came from.
+        shared_msg = {"type": "client", "op": "set",
+                      "key": SHARED_CAS_KEY, "value": "0",
+                      "client_id": "cas-init", "request_id": "0"}
+        resp, first_invoke = attempt(cluster.addrs[0], shared_msg)
+        if resp is None or resp.get("status") != "ok":
+            print(f"shared CAS counter init failed: {resp}",
+                  file=sys.stderr)
+            return 1
+        record_client_op(history, "cas-init", 0, shared_msg, resp,
+                         first_invoke, time.monotonic())
 
         faults = threading.Thread(
             target=fault_loop,
@@ -437,8 +607,19 @@ def main(argv: list[str] | None = None) -> int:
             w.start()
         for r in readers:
             r.start()
+        cas_threads = [
+            threading.Thread(target=cas_worker,
+                             args=(cluster, t, args.cas_writes, cas_acked,
+                                   lock, errors, faults_done, history,
+                                   shared_successes))
+            for t in range(args.cas_threads)
+        ]
+        for c in cas_threads:
+            c.start()
         for w in writers:
             w.join()
+        for c in cas_threads:
+            c.join()
         stop_readers.set()
         for r in readers:
             r.join(timeout=5.0)
@@ -470,6 +651,20 @@ def main(argv: list[str] | None = None) -> int:
                                          "key": key}, timeout=5.0)
             if resp.get("status") != "ok" or resp.get("value") != value:
                 lost.append((key, value, resp))
+        # CAS counters: each owned key at its last successful value,
+        # and the shared counter at exactly the number of successful
+        # shared CAS ops — each one increments by one, so the count
+        # is the value.
+        for key, value in cas_acked.items():
+            resp = client_request(seed, {"type": "client", "op": "get",
+                                         "key": key}, timeout=5.0)
+            if resp.get("status") != "ok" or resp.get("value") != value:
+                lost.append((key, value, resp))
+        resp = client_request(seed, {"type": "client", "op": "get",
+                                     "key": SHARED_CAS_KEY}, timeout=5.0)
+        if resp.get("status") != "ok" or resp.get("value") != str(
+                shared_successes[0]):
+            lost.append((SHARED_CAS_KEY, str(shared_successes[0]), resp))
         if lost:
             for key, value, resp in lost[:10]:
                 print(f"LOST acked write {key}={value}: {resp}",
@@ -481,9 +676,17 @@ def main(argv: list[str] | None = None) -> int:
               f"{converged['node1']['commit_index']} "
               f"after {args.faults} kill/restart faults "
               f"(seed {args.seed})")
+        cas_ops = [op for op in history.ops() if op.kind == "cas"]
+        cas_ok = sum(1 for op in cas_ops if op.status == "ok")
+        print(f"cas ok: {cas_ok} successful CAS "
+              f"({len(cas_ops) - cas_ok} failed races) across "
+              f"{len(cas_acked)} owned counters, shared counter at "
+              f"{shared_successes[0]}")
         # Linearizability: every concurrent read must have returned a
         # value some linearization could produce — no stale reads, no
-        # values from the future — across the whole fault schedule.
+        # values from the future — and every successful CAS must have
+        # seen its expected value when it linearized, across the
+        # whole fault schedule.
         lin = history.check()
         print(f"linearizability: {lin}")
         if lin.multi_writer_keys:
