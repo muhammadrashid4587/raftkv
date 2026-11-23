@@ -13,9 +13,15 @@ still reads back, and the new membership is durable — the config every
 node reports, after restarts, is the changed one.
 """
 
+import sys
 import threading
 import time
 import unittest
+from pathlib import Path
+
+# The chaos harness lives in scripts/, not on the test path.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+import chaos as chaos_script  # noqa: E402
 
 from harness import Cluster, client_request, wait_for_key
 
@@ -286,6 +292,72 @@ class TestMembershipSurvivesLeaderRestartMidChaos(unittest.TestCase):
             self.assertEqual(
                 _get(cluster.addrs[new_leader.id], "after").get("value"),
                 "yes")
+        finally:
+            cluster.stop_all()
+
+
+class TestMembershipPhasePolling(unittest.TestCase):
+    def test_summarize_phases_dedupes_and_keeps_order(self):
+        samples = [
+            (0.0, "node1", "stable"),
+            (0.05, "node1", "catching_up"),
+            (0.1, "node2", "catching_up"),  # same phase, other node
+            (0.15, "node1", "joint_pending"),
+            (0.2, "node1", "joint_pending"),  # repeat, no new step
+            (0.25, "node1", "stable"),
+        ]
+        self.assertEqual(
+            chaos_script.summarize_phases(samples),
+            "stable -> catching_up -> joint_pending -> stable")
+        self.assertEqual(chaos_script.summarize_phases([]), "")
+
+    def test_chaos_harness_polls_phases_during_add(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            # Give node4 a log worth catching up on, so the
+            # catching_up phase lasts long enough for the 50ms
+            # poller to see it.
+            for i in range(50):
+                self.assertEqual(
+                    _set(cluster.addrs[leader.id], f"k{i}", f"v{i}")
+                    .get("status"), "ok")
+            node4 = cluster.add_node("node4")
+            samples: list = []
+            stop = threading.Event()
+            poller = threading.Thread(
+                target=chaos_script.poll_membership_phases,
+                args=(cluster.status, lambda: list(cluster.nodes),
+                      stop, samples),
+                daemon=True)
+            poller.start()
+            try:
+                resp = _add_server_retry(cluster.addrs[leader.id],
+                                         "node4", cluster.addrs["node4"])
+                # The change committed; let the poller run a little
+                # longer so the post-add stable phase is sampled
+                # too and the timeline ends where the cluster
+                # settled, not mid-transition.
+                time.sleep(0.5)
+            finally:
+                stop.set()
+                poller.join(timeout=5.0)
+            self.assertEqual(resp.get("status"), "ok", resp)
+            timeline = chaos_script.summarize_phases(samples)
+            phases = timeline.split(" -> ") if timeline else []
+            valid = {"stable", "catching_up", "joint_pending",
+                     "joint_committed", "final_pending"}
+            self.assertTrue(phases, "poller recorded no phases at all")
+            self.assertTrue(set(phases) <= valid,
+                            f"unknown phase in timeline: {timeline}")
+            self.assertEqual(phases[-1], "stable",
+                             f"timeline does not end stable: {timeline}")
+            # The add went through a transition, not straight from
+            # stable to stable: at least one intermediate phase
+            # must have been observed.
+            self.assertTrue(any(p != "stable" for p in phases),
+                            f"no intermediate phase observed: {timeline}")
         finally:
             cluster.stop_all()
 

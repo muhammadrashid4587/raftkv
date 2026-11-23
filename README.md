@@ -221,7 +221,12 @@ logic and the failure handling, not the key-value API on top.
   faults (and the partition, if enabled) are active, then the leader
   is killed and restarted, and the run verifies the 4-node membership
   is durable and every acked write still reads back on the enlarged
-  cluster. `tests/test_membership_chaos.py` covers the same
+  cluster. While the add is in flight a poller thread asks every
+  node for its membership-status every 20ms and records the phases
+  it sees, so the run output shows the transition the cluster
+  actually went through (e.g. ``catching_up -> joint_pending ->
+  joint_committed -> final_pending -> stable``), not just the final
+  config. `tests/test_membership_chaos.py` covers the same
   combination in-process: add under a partition, remove while a
   follower is killed and restarted, and membership surviving a leader
   restart mid-chaos.
@@ -294,7 +299,7 @@ make test
 # or: python3 -m unittest discover -s tests -v
 ```
 
-143 tests, plus a smoke test for the benchmark script, all passing:
+145 tests, plus a smoke test for the benchmark script, all passing:
 
 | Test | What it proves |
 |---|---|
@@ -344,6 +349,8 @@ make test
 | `test_add_node_under_partition` | Adding a node while one follower is partitioned: the majority side plus the catching-up node4 commit the joint and final entries, and after the heal every node reports the 4-node config |
 | `test_remove_node_while_follower_killed_and_restarted` | Removing a node while another follower is down: the joint entry waits out the restart, then commits, and writes continue on the 2-node cluster |
 | `test_membership_survives_leader_restart_mid_chaos` | Writers and kill/restart faults running throughout, a node added mid-run, then the leader killed and restarted: every acked write present on all four nodes, 4-node config everywhere, no joint phase left |
+| `test_chaos_harness_polls_phases_during_add` | The chaos harness's membership poller observes a real add in-process: the timeline holds only valid phases, includes an intermediate phase, and ends stable |
+| `test_summarize_phases_dedupes_and_keeps_order` | The phase-timeline summarizer counts each phase once in first-seen order and still ends with the settled phase, and empty input summarizes to nothing |
 | `test_status_reports_stable_membership` | A healthy cluster reports phase stable, the 3-node config, no joint config, nothing in flight |
 | `test_status_reports_uncommitted_joint_entry` | An isolated leader with a joint entry in its log reports joint_pending with the op, server, and joint index; a follower that never saw the entry still reports stable |
 | `test_status_reports_joint_phase_mid_transition` | A cluster frozen in the joint phase reports joint_committed with the change and the non-voting server from both leader and follower, then stable once the change completes |
@@ -914,3 +921,26 @@ entries left in `log.jsonl` are dropped by their index on reload.
   underscored op comparisons (the hyphenated subcommand name was
   sent to the server verbatim) and so errored instead of driving
   the change.
+- ~~Chaos harness polls membership-status during membership
+  changes~~ — done in v0.24.0, Nov 23, 2026: while `--membership`
+  drives the add, a poller thread asks every node for its
+  membership-status every 20ms and records the phases it sees, so
+  the run output shows the transition the cluster actually went
+  through (`catching_up -> joint_pending -> joint_committed ->
+  final_pending -> stable`) instead of just the final config — the
+  add RPC blocks until the change commits, so polling from a side
+  thread is the only way to observe the intermediate phases. The
+  poller keeps running for 0.5s after the add acks so the post-add
+  stable phase is sampled too, and the timeline (each phase once, in
+  first-seen order, plus the settled phase at the end — nodes report
+  different phases at the same instant, so a merged per-sample
+  timeline would oscillate) is printed with the sample count.
+  On localhost the joint phases last milliseconds, so a run may
+  only observe `catching_up` and `final_pending` between the two
+  `stable` endpoints — that is the transition being faster than
+  the 20ms poll, not a missed phase. `tests/test_membership_chaos.py` covers the poller
+  in-process (a 50-key log so the catching-up phase lasts long
+  enough to sample) and the timeline summarizer. Note: the
+  pre-existing `test_add_node_under_partition` flakes under load
+  on this box (the add times out or the leader does not answer —
+  4/8 on the clean tree too), unrelated to this change.

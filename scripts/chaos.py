@@ -63,7 +63,12 @@ enabled) are active: a fourth node is started and added to the
 cluster, then the current leader is killed and restarted, and the
 run verifies the new 4-node membership is durable — every node
 still reports it after the leader restart — and that every acked
-write still reads back on the enlarged cluster.
+write still reads back on the enlarged cluster. While the add is
+in flight a poller thread asks every node for its
+membership-status every 20ms and records the phases it sees, so
+the run output shows the transition the cluster actually went
+through (``catching_up -> joint_pending -> joint_committed ->
+final_pending -> stable``), not just the final config.
 """
 
 from __future__ import annotations
@@ -522,6 +527,53 @@ def partition_phase(cluster: Cluster, seconds: float,
     log.append("partition: healed")
 
 
+def poll_membership_phases(status_fn, node_ids_fn, stop, samples,
+                           interval: float = 0.02) -> None:
+    """Poll every node's membership-status while a change is in
+    flight and record ``(elapsed_seconds, node_id, phase)`` samples.
+    Runs on its own thread: the add RPC blocks until the change
+    commits, so the only way to see the intermediate phases is to
+    ask while it is running. A node that is down (killed by the
+    fault thread) just yields no sample for that round, and a node
+    that has not seen the change yet reports ``stable`` — both are
+    honest observations, not errors. ``status_fn`` maps a node id
+    to its status dict; ``node_ids_fn`` lists the nodes to poll
+    each round, so a node added mid-poll gets polled too."""
+    start = time.monotonic()
+    while not stop.is_set():
+        for node_id in node_ids_fn():
+            st = status_fn(node_id) or {}
+            phase = (st.get("membership") or {}).get("phase")
+            if phase:
+                samples.append((time.monotonic() - start,
+                                str(node_id), phase))
+        stop.wait(interval)
+
+
+def summarize_phases(samples: list[tuple[float, str, str]]) -> str:
+    """Compress raw phase samples into the timeline of phases the
+    transition went through, in first-seen order: ``catching_up ->
+    joint_pending -> ... -> stable``. Each phase counts once, when
+    it is first seen on any node — nodes report different phases
+    at the same instant (a follower a heartbeat behind still says
+    ``stable`` while the leader is already ``catching_up``, and
+    the new node keeps saying ``catching_up`` after the leader
+    moved on), so a merged per-sample timeline would oscillate
+    between phases and read as if the cluster flip-flopped. The
+    one exception is the end: the last phase observed is appended
+    even if it was seen before, so a run that settles ends with
+    ``stable`` instead of ending mid-transition. Empty input (the
+    change completed before the first poll) summarizes to ``""`` so
+    the caller can say so instead of inventing a timeline."""
+    seen: list[str] = []
+    for _, _, phase in samples:
+        if phase not in seen:
+            seen.append(phase)
+    if samples and samples[-1][2] != seen[-1]:
+        seen.append(samples[-1][2])
+    return " -> ".join(seen)
+
+
 def membership_phase(cluster: Cluster, log: list[str],
                      result: dict) -> None:
     """Drive a membership change mid-run, while the kill/restart
@@ -537,6 +589,34 @@ def membership_phase(cluster: Cluster, log: list[str],
     time.sleep(2.0)
     node4 = cluster.add_extra_node()
     host, port = cluster.addrs[node4]
+    # Poll membership-status on a side thread while the add is in
+    # flight: the add RPC below blocks until the change commits, so
+    # this is the only way to observe the intermediate phases.
+    phase_samples: list[tuple[float, str, str]] = []
+    poll_stop = threading.Event()
+    poller = threading.Thread(
+        target=poll_membership_phases,
+        args=(cluster.status, lambda: list(range(len(cluster.procs))),
+              poll_stop, phase_samples),
+        daemon=True)
+    poller.start()
+
+    def _finish_polling() -> str:
+        """Stop the poller and record what it saw in the run log
+        and result."""
+        poll_stop.set()
+        poller.join(timeout=5.0)
+        timeline = summarize_phases(phase_samples)
+        result["phases"] = timeline
+        result["phase_samples"] = len(phase_samples)
+        if timeline:
+            log.append(f"membership phases observed "
+                       f"({len(phase_samples)} samples): {timeline}")
+        else:
+            log.append("membership phases observed: none — the add "
+                       "completed before the first poll")
+        return timeline
+
     deadline = time.monotonic() + 90.0
     resp = None
     while time.monotonic() < deadline:
@@ -549,9 +629,16 @@ def membership_phase(cluster: Cluster, log: list[str],
             break
         time.sleep(0.2)
     if resp is None or resp.get("status") != "ok":
+        _finish_polling()
         log.append(f"membership: add node4 never acked: {resp}")
         result["ok"] = False
         return
+    # The change committed; let the poller run a little longer so
+    # the post-add stable phase is sampled too and the timeline
+    # ends where the cluster settled, not mid-transition.
+    time.sleep(0.5)
+    _finish_polling()
+    log.append("membership: node4 added")
     log.append("membership: node4 added")
     members = [f"node{i + 1}" for i in range(len(cluster.procs))]
     if not cluster.wait_for_config(members):
@@ -770,6 +857,11 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             print(f"membership ok: every node reports the "
                   f"{len(members)}-node config")
+            if membership_result.get("phases"):
+                print(f"membership phases: "
+                      f"{membership_result['phases']} "
+                      f"({membership_result.get('phase_samples', 0)} "
+                      f"samples)")
         seed = cluster.addrs[0]
         lost = []
         for key, value in acked.items():
