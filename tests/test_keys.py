@@ -66,6 +66,102 @@ class TestKeys(unittest.TestCase):
         finally:
             cluster.stop_all()
 
+    def test_keys_start_after_pages(self):
+        """A scan with start_after resumes strictly after the
+        cursor: paging limit=2 through five keys returns each page
+        in order with no repeats and no gaps, and the last page is
+        untruncated. The reply's next_start_after is the cursor
+        for the next page, and passing the previous page's last key
+        by hand works the same way."""
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            _write_keys(addr, [(f"k{i}", "v") for i in range(5)])
+            resp = keys(addr, limit=2)
+            self.assertEqual(resp.get("status"), "ok", resp)
+            self.assertEqual(resp.get("keys"), ["k0", "k1"])
+            self.assertTrue(resp.get("truncated"))
+            self.assertEqual(resp.get("next_start_after"), "k1")
+            resp = keys(addr, limit=2,
+                        start_after=resp["next_start_after"])
+            self.assertEqual(resp.get("keys"), ["k2", "k3"])
+            self.assertTrue(resp.get("truncated"))
+            self.assertEqual(resp.get("next_start_after"), "k3")
+            resp = keys(addr, limit=2, start_after="k3")
+            self.assertEqual(resp.get("keys"), ["k4"])
+            self.assertFalse(resp.get("truncated"))
+            self.assertIsNone(resp.get("next_start_after"))
+        finally:
+            cluster.stop_all()
+
+    def test_keys_start_after_with_prefix(self):
+        """A cursor composes with a prefix: paging under one prefix
+        never leaks keys from another, and the cursor still bounds
+        the sorted order within that prefix."""
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            _write_keys(addr, [("user:1", "a"), ("user:2", "b"),
+                               ("user:3", "c"), ("order:1", "d")])
+            resp = keys(addr, prefix="user:", limit=2)
+            self.assertEqual(resp.get("keys"), ["user:1", "user:2"])
+            self.assertTrue(resp.get("truncated"))
+            resp = keys(addr, prefix="user:", limit=2,
+                        start_after="user:2")
+            self.assertEqual(resp.get("keys"), ["user:3"])
+            self.assertFalse(resp.get("truncated"))
+        finally:
+            cluster.stop_all()
+
+    def test_keys_start_after_beyond_last_key(self):
+        """A cursor past every matching key returns an empty list,
+        not an error — the page is just empty — and a cursor equal
+        to a key excludes that key itself: the bound is
+        exclusive."""
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            _write_keys(addr, [("a", "1"), ("b", "2")])
+            resp = keys(addr, start_after="zzz")
+            self.assertEqual(resp.get("status"), "ok", resp)
+            self.assertEqual(resp.get("keys"), [])
+            self.assertFalse(resp.get("truncated"))
+            resp = keys(addr, start_after="a")
+            self.assertEqual(resp.get("keys"), ["b"])
+        finally:
+            cluster.stop_all()
+
+    def test_keys_start_after_pages_whole_keyspace(self):
+        """Paging one key at a time walks the whole keyspace in
+        sorted order — the cursor protocol is exact, not
+        approximate."""
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            _write_keys(addr, [(f"k{i}", "v") for i in range(5)])
+            seen: list[str] = []
+            cursor: str | None = None
+            for _ in range(10):
+                resp = keys(addr, limit=1, start_after=cursor)
+                self.assertEqual(resp.get("status"), "ok", resp)
+                seen.extend(resp.get("keys") or [])
+                if not resp.get("truncated"):
+                    break
+                cursor = resp.get("next_start_after")
+            else:
+                self.fail("paging did not terminate")
+            self.assertEqual(seen, ["k0", "k1", "k2", "k3", "k4"])
+        finally:
+            cluster.stop_all()
+
     def test_keys_limit_truncates(self):
         """A limit below the number of matching keys returns the
         first that many in sorted order and says truncated, so the
@@ -185,7 +281,10 @@ class TestKeys(unittest.TestCase):
                           {"limit": -1},
                           {"limit": MAX_KEYS_SCAN + 1},
                           {"limit": "ten"},
-                          {"limit": True}):
+                          {"limit": True},
+                          {"start_after": 123},
+                          {"start_after": ["k0"]},
+                          {"start_after": True}):
                 resp = client_request(
                     addr, {"type": "client", "op": "keys", **params})
                 self.assertEqual(resp.get("status"), "error",
@@ -196,6 +295,9 @@ class TestKeys(unittest.TestCase):
             self.assertEqual(keys(addr, limit=0), {
                 "type": "client_response", "status": "error",
                 "error": "keys limit must be between 1 and 1000"})
+            self.assertEqual(keys(addr, start_after=123), {
+                "type": "client_response", "status": "error",
+                "error": "keys start_after must be a string"})
         finally:
             cluster.stop_all()
 
@@ -241,6 +343,37 @@ class TestKeys(unittest.TestCase):
         finally:
             cluster.stop_all()
 
+    def test_session_keys_start_after_and_keys_all(self):
+        """A session scan takes a cursor like any other scan, and
+        ``keys_all`` walks the whole keyspace in pages and returns
+        every key sorted, with the page count — a session scan
+        still advances the read watermark."""
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            with Session(addr) as session:
+                for i in range(5):
+                    resp = session.set(f"k{i}", "v")
+                    self.assertEqual(resp.get("status"), "ok", resp)
+                resp = session.keys(limit=2, start_after="k1")
+                self.assertEqual(resp.get("status"), "ok", resp)
+                self.assertEqual(resp.get("keys"), ["k2", "k3"])
+                self.assertTrue(resp.get("truncated"))
+                resp = session.keys_all(limit=2)
+                self.assertEqual(resp.get("status"), "ok", resp)
+                self.assertEqual(resp.get("keys"),
+                                 ["k0", "k1", "k2", "k3", "k4"])
+                self.assertFalse(resp.get("truncated"))
+                self.assertEqual(resp.get("pages"), 3)
+                self.assertGreater(session.last_read_index, 0)
+                resp = session.keys_all(prefix="k1", limit=1)
+                self.assertEqual(resp.get("keys"), ["k1"])
+                self.assertEqual(resp.get("pages"), 1)
+        finally:
+            cluster.stop_all()
+
     def test_keys_cli(self):
         """The ``keys`` CLI subcommand prints the keys as one JSON
         list, honoring --prefix and --limit."""
@@ -269,6 +402,36 @@ class TestKeys(unittest.TestCase):
                 capture_output=True, text=True, timeout=15)
             self.assertEqual(out.returncode, 0, out.stderr)
             self.assertEqual(json.loads(out.stdout), ["order:1"])
+        finally:
+            cluster.stop_all()
+
+    def test_keys_cli_start_after(self):
+        """The ``keys`` CLI subcommand honors --start-after: it
+        resumes past the given key, exclusive."""
+        import json
+        import subprocess
+        import sys
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            _write_keys(addr, [("a", "1"), ("b", "2"), ("c", "3")])
+            host, port = addr
+            out = subprocess.run(
+                [sys.executable, "-m", "raftkv.client",
+                 "--node", f"{host}:{port}", "keys",
+                 "--start-after", "a"],
+                capture_output=True, text=True, timeout=15)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertEqual(json.loads(out.stdout), ["b", "c"])
+            out = subprocess.run(
+                [sys.executable, "-m", "raftkv.client",
+                 "--node", f"{host}:{port}", "keys",
+                 "--limit", "1", "--start-after", "b"],
+                capture_output=True, text=True, timeout=15)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertEqual(json.loads(out.stdout), ["c"])
         finally:
             cluster.stop_all()
 

@@ -99,21 +99,29 @@ logic and the failure handling, not the key-value API on top.
   dominates. `scripts/bench.py --mget` runs the phase
   (`--mget-batch` sets the batch size).
 - **Key enumeration** — since v0.31.0 one `keys` RPC lists the
-  store's keys (`client.keys(prefix, limit)`,
-  `Session.keys(prefix, limit)`, `keys --prefix p --limit 100` on
-  the CLI): every matching key in sorted order, at most 1000 per
-  reply, with `truncated` saying whether more matched, so a client
-  that needs the rest narrows the prefix and re-scans. The scan
+  store's keys (`client.keys(prefix, limit, start_after)`,
+  `Session.keys(prefix, limit, start_after)`, `keys --prefix p
+  --limit 100 --start-after k` on the CLI): every matching key in
+  sorted order, at most 1000 per reply, with `truncated` saying
+  whether more matched and `next_start_after` naming the last key
+  returned. Since v0.32.0 a scan takes a `start_after` cursor — an
+  exclusive lower bound on the sorted key order — so a client
+  pages through a large keyspace by passing back the previous
+  page's last key (or `next_start_after`), with no repeats and no
+  gaps while the state is unchanged; `keys_all` does the walk in
+  one call and returns every key plus the page count. The scan
   rides the same ReadIndex/lease path as a single `get` — one
-  leadership confirmation, one apply wait — so the list reflects
+  leadership confirmation, one apply wait — so each page reflects
   the committed state as of one read index, exactly as
   linearizable, and a stale scan is served from a follower lease
   exactly like a stale `get`. The reply carries the same
   `read_index` / `read_term`, so a session advances its read
-  watermark from a scan like any other read. Sorting the whole
-  keyspace per call is the honest cost: this is an enumeration for
-  operators and small stores, not a streaming cursor — paging a
-  very large keyspace is the next step (see Roadmap).
+  watermark from a scan like any other read. Honest limit: the
+  pages are individually linearizable, but the enumeration as a
+  whole is not a snapshot — a key written or deleted between pages
+  can be missed, or appear in a later page if it sorts ahead of
+  the cursor — and the server still sorts the whole matching
+  keyspace per page, so paging bounds the reply, not the work.
 - **Leader lease reads** — a leader that heard acks from a majority
   within the last 100ms (shorter than any follower's 150ms minimum
   election timeout, so no new leader can have been elected since)
@@ -542,16 +550,22 @@ make test
 | `test_session_mget_is_read_your_writes` | A session mget carries the write watermark, sees its own write, and advances the read watermark |
 | `test_mget_matches_pipelined_get_many` | The same 50 keys read by one mget and by pipelined get_many agree exactly |
 | `test_keys_returns_all_keys_sorted` | A scan with no prefix returns every key in sorted order, with the read index/term |
+| `test_keys_start_after_pages` | Paging limit=2 through five keys returns each page in order, no repeats or gaps, last page untruncated |
+| `test_keys_start_after_with_prefix` | A cursor composes with a prefix: paging under one prefix never leaks another's keys |
+| `test_keys_start_after_beyond_last_key` | A cursor past every key returns [], and a cursor equal to a key excludes that key (exclusive bound) |
+| `test_keys_start_after_pages_whole_keyspace` | Paging one key at a time walks the whole keyspace in sorted order |
 | `test_keys_prefix_filters` | A prefix scan returns only keys under that prefix; a non-matching prefix returns [] |
 | `test_keys_limit_truncates` | A limit below the match count returns the first keys in order with truncated True |
 | `test_keys_empty_store` | A scan of an empty store returns an empty list, not an error |
 | `test_keys_reflects_deletes` | A deleted key is gone from the next scan |
 | `test_keys_from_follower_redirects` | A scan sent to a follower is redirected to the leader and still answers |
 | `test_keys_stale_served_from_follower_lease` | A scan with stale_ok is served by a follower holding a fresh leader lease |
-| `test_keys_rejects_bad_params` | A non-string prefix or a limit outside 1-1000 is an error, not a scan |
+| `test_keys_rejects_bad_params` | A non-string prefix or start_after, or a limit outside 1-1000, is an error, not a scan |
 | `test_keys_rejects_bad_read_params` | A non-integer or negative min_commit_index is an error, exactly as for a single get |
 | `test_session_keys_is_read_your_writes` | A session scan sees its own write and advances the session's read watermark |
+| `test_session_keys_start_after_and_keys_all` | A session scan takes a cursor, and `keys_all` walks the whole keyspace in pages and returns every key plus the page count |
 | `test_keys_cli` | The `keys` CLI subcommand prints the keys as one JSON list, honoring --prefix and --limit |
+| `test_keys_cli_start_after` | The `keys` CLI subcommand honors --start-after, resuming past the given key, exclusive |
 
 Tests use real nodes (real TCP, real threads, real disk) on localhost —
 no mocks of the consensus path.
@@ -1334,8 +1348,38 @@ entries left in `log.jsonl` are dropped by their index on reload.
   deletes reflected, redirect from a follower, stale service from
   a follower lease, bad prefixes/limits and bad read params
   rejected, session read-your-writes, and the CLI end to end.
-  The next real thing is cursor-based paging: a scan currently
-  sorts the whole keyspace on every call, so enumerating a very
-  large store means repeated full sorts — a `start_after` cursor
-  (resume past the last key returned) would let a client page
-  through it in bounded calls instead.
+- ~~Cursor-based paging for key enumeration~~ — done in v0.32.0,
+  Nov 23, 2026: a `keys` scan takes a `start_after` cursor, an
+  exclusive lower bound on the sorted key order, so a client pages
+  through a large keyspace in bounded calls instead of re-scanning
+  from the start — pass back the previous page's last key, or the
+  reply's `next_start_after` (the last key returned when
+  `truncated`, else None). `KVStore.keys(prefix, start_after)`
+  filters after the cursor before sorting; `_serve_read` gained a
+  `scan_start_after` parameter alongside `scan_prefix` /
+  `scan_limit`, so the lease fast path and the pending-read wait
+  still serve every page exactly like a single `get`. The client
+  exposes it as `client.keys(prefix, limit, start_after)`,
+  `Session.keys(prefix, limit, start_after)`, and `keys
+  --start-after K` on the CLI, plus `keys_all` (module-level and
+  on Session) which walks the pages and returns every key plus
+  the page count. Documented honestly: each page is linearizable
+  on its own, but the walk as a whole is not a snapshot — a key
+  written or deleted between pages can be missed or appear in a
+  later page — and the server still sorts the whole matching
+  keyspace per page, so paging bounds the reply, not the work.
+  `tests/test_keys.py` proves it: paging in order with no repeats
+  or gaps, cursor with a prefix, cursor past the last key,
+  one-key-at-a-time walk of the whole keyspace, bad cursors
+  rejected server- and client-side, session paging and
+  `keys_all`, and the CLI `--start-after` end to end. The roadmap
+  is now exhausted — every item is done — so the next real thing
+  is a new one, grounded in this increment's honest limit: a
+  sorted index in the state machine. Paging bounds the reply, not
+  the work: every page still sorts the whole matching keyspace, so
+  a scan of a million-key store pays a million-key sort per page.
+  Keeping the keys in sorted order inside `KVStore` (a sorted
+  list maintained with `bisect` on write, or a balanced tree)
+  would make a page cost O(page + log n) instead of O(n log n),
+  with the write path paying the insert — measure the write-side
+  cost before committing to it.

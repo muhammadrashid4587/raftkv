@@ -201,19 +201,25 @@ class Session:
                 self.last_read_term = int(resp.get("read_term") or 0)
         return resp
 
-    def keys(self, prefix: str = "", limit: int = 1000) -> dict:
+    def keys(self, prefix: str = "", limit: int = 1000,
+             start_after: str | None = None) -> dict:
         """Enumerate keys with one ``keys`` RPC: every key in the
         applied state machine starting with ``prefix`` (empty
-        prefix means all keys), sorted, at most ``limit`` of them
-        (default 1000, the server cap). The reply carries ``keys``
-        plus ``truncated`` — True when more keys matched than the
-        limit returned, so the caller narrows the prefix and
-        re-scans. Carries the same session watermark as ``get`` and
-        advances the read watermark from the reply's ``read_index``
-        exactly the same way, so a scan is read-your-writes and
-        monotonic like any other session read. A bad limit is a
-        client error — the server rejects it — so this returns the
-        error response instead of sending it."""
+        prefix means all keys) and strictly after ``start_after``
+        when one is given, sorted, at most ``limit`` of them
+        (default 1000, the server cap). ``start_after`` is an
+        exclusive lower bound on the sorted key order — pass the
+        previous page's last key (or the reply's
+        ``next_start_after``) to fetch the next page, with no
+        repeats and no gaps while the state is unchanged. The reply
+        carries ``keys`` plus ``truncated`` — True when more keys
+        matched than the limit returned. Carries the same session
+        watermark as ``get`` and advances the read watermark from
+        the reply's ``read_index`` exactly the same way, so a scan
+        is read-your-writes and monotonic like any other session
+        read. A bad limit or cursor is a client error — the server
+        rejects it — so this returns the error response instead of
+        sending it."""
         if not isinstance(prefix, str):
             return {"type": "client_response", "status": "error",
                     "error": "keys prefix must be a string"}
@@ -221,6 +227,10 @@ class Session:
                 or limit < 1 or limit > 1000:
             return {"type": "client_response", "status": "error",
                     "error": "keys limit must be between 1 and 1000"}
+        if start_after is not None \
+                and not isinstance(start_after, str):
+            return {"type": "client_response", "status": "error",
+                    "error": "keys start_after must be a string"}
         if self.last_read_index > self.last_write_index:
             min_index = self.last_read_index
             term = self.last_read_term
@@ -232,6 +242,8 @@ class Session:
                      "client_id": self.client_id,
                      "min_commit_index": min_index,
                      "session_term": term}
+        if start_after is not None:
+            msg["start_after"] = start_after
         resp = request(self.node_addr, msg, pool=self._pooled)
         if (resp.get("status") == "ok"
                 and resp.get("read_index") is not None):
@@ -240,6 +252,46 @@ class Session:
                 self.last_read_index = read_index
                 self.last_read_term = int(resp.get("read_term") or 0)
         return resp
+
+    def keys_all(self, prefix: str = "", limit: int = 1000) -> dict:
+        """Enumerate every key under ``prefix`` by paging through
+        the ``keys`` RPC: each page fetches at most ``limit`` keys,
+        then resumes from the page's ``next_start_after`` until a
+        page comes back untruncated. The reply is one merged
+        ``keys`` response — every key in sorted order, ``truncated``
+        False — plus ``pages``, how many RPCs the walk took, and
+        the ``read_index`` / ``read_term`` of the last page. Each
+        page is linearizable on its own, but the walk as a whole
+        is not a snapshot: a key written or deleted mid-walk can
+        be missed or appear once the cursor has passed it. An
+        error on any page stops the walk and returns that error
+        response instead of a partial list."""
+        all_keys: list[str] = []
+        start_after: str | None = None
+        pages = 0
+        last_resp: dict = {}
+        while True:
+            resp = self.keys(prefix=prefix, limit=limit,
+                             start_after=start_after)
+            if resp.get("status") != "ok":
+                return resp
+            pages += 1
+            all_keys.extend(resp.get("keys") or [])
+            last_resp = resp
+            if not resp.get("truncated"):
+                break
+            start_after = resp.get("next_start_after")
+            if start_after is None:
+                # A truncated reply without a cursor cannot be
+                # resumed — treat it as a server bug, not a
+                # partial answer.
+                return {"type": "client_response", "status": "error",
+                        "error": "keys page truncated without a "
+                                 "next_start_after cursor"}
+        last_resp = dict(last_resp)
+        last_resp["keys"] = all_keys
+        last_resp["pages"] = pages
+        return last_resp
 
     def watch(self, key: str, prefix: bool = False,
               timeout: float = 5.0) -> dict:
@@ -428,7 +480,8 @@ def mget(node_addr: tuple[str, int], keys: list[str],
 
 
 def keys(node_addr: tuple[str, int], prefix: str = "",
-         limit: int = 1000, timeout: float = 12.0) -> dict:
+         limit: int = 1000, start_after: str | None = None,
+         timeout: float = 12.0) -> dict:
     """Enumerate keys with one ``keys`` RPC, following leader
     redirects like ``request``.
 
@@ -437,8 +490,12 @@ def keys(node_addr: tuple[str, int], prefix: str = "",
     one read index — never a half-applied prefix. The reply is the
     plain ``keys`` response (``status`` ``ok`` with ``keys`` in
     sorted order, ``truncated`` True when more matched than the
-    limit). A bad prefix or limit never goes on the wire and
-    returns the server's error shape instead."""
+    limit, and ``next_start_after`` — the last key returned — to
+    resume the next page with). ``start_after`` is an exclusive
+    lower bound on the sorted key order: pass the previous page's
+    last key to fetch the next page. A bad prefix, limit, or
+    cursor never goes on the wire and returns the server's error
+    shape instead."""
     if not isinstance(prefix, str):
         return {"type": "client_response", "status": "error",
                 "error": "keys prefix must be a string"}
@@ -446,9 +503,52 @@ def keys(node_addr: tuple[str, int], prefix: str = "",
             or limit < 1 or limit > 1000:
         return {"type": "client_response", "status": "error",
                 "error": "keys limit must be between 1 and 1000"}
-    return request(node_addr, {"type": "client", "op": "keys",
-                               "prefix": prefix, "limit": limit},
-                   timeout=timeout)
+    if start_after is not None and not isinstance(start_after, str):
+        return {"type": "client_response", "status": "error",
+                "error": "keys start_after must be a string"}
+    msg: dict = {"type": "client", "op": "keys",
+                 "prefix": prefix, "limit": limit}
+    if start_after is not None:
+        msg["start_after"] = start_after
+    return request(node_addr, msg, timeout=timeout)
+
+
+def keys_all(node_addr: tuple[str, int], prefix: str = "",
+             limit: int = 1000, timeout: float = 12.0) -> dict:
+    """Enumerate every key under ``prefix`` by paging through the
+    ``keys`` RPC: each page fetches at most ``limit`` keys, then
+    resumes from the page's ``next_start_after`` until a page
+    comes back untruncated. The reply is one merged ``keys``
+    response — every key in sorted order, ``truncated`` False —
+    plus ``pages``, how many RPCs the walk took. Each page is
+    linearizable on its own, but the walk as a whole is not a
+    snapshot: a key written or deleted mid-walk can be missed or
+    appear once the cursor has passed it. An error on any page
+    stops the walk and returns that error response instead of a
+    partial list."""
+    all_keys: list[str] = []
+    start_after: str | None = None
+    pages = 0
+    last_resp: dict = {}
+    while True:
+        resp = keys(node_addr, prefix=prefix, limit=limit,
+                    start_after=start_after, timeout=timeout)
+        if resp.get("status") != "ok":
+            return resp
+        pages += 1
+        all_keys.extend(resp.get("keys") or [])
+        last_resp = resp
+        if not resp.get("truncated"):
+            break
+        start_after = resp.get("next_start_after")
+        if start_after is None:
+            return {"type": "client_response", "status": "error",
+                    "error": "keys page truncated without a "
+                             "next_start_after cursor"}
+    last_resp = dict(last_resp)
+    last_resp["keys"] = all_keys
+    last_resp["pages"] = pages
+    return last_resp
 
 
 def request(node_addr: tuple[str, int], msg: dict, timeout: float = 12.0,
@@ -532,6 +632,12 @@ def main(argv: list[str] | None = None) -> int:
     p_keys.add_argument("--limit", type=int, default=1000,
                         help="at most this many keys (1-1000, "
                              "default 1000)")
+    p_keys.add_argument("--start-after", default=None,
+                        help="resume past this key: only keys "
+                             "strictly after it in sorted order are "
+                             "returned — pass the last key of the "
+                             "previous page to page through a large "
+                             "keyspace")
     p_del = sub.add_parser("del")
     p_del.add_argument("key")
     p_del.add_argument("--client-id", default=None)
@@ -626,6 +732,8 @@ def main(argv: list[str] | None = None) -> int:
     elif op == "keys":
         msg["prefix"] = args.prefix
         msg["limit"] = args.limit
+        if args.start_after is not None:
+            msg["start_after"] = args.start_after
     elif op == "add_server":
         msg["server_id"] = args.server_id
         ahost, _, aport = args.addr.rpartition(":")

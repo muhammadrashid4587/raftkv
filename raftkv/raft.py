@@ -73,9 +73,11 @@ MAX_MGET_KEYS = 1000
 # the same reason as the mget cap: one frame carries the whole list,
 # so an unbounded scan could hold a worker (and its connection) for
 # an arbitrarily long encode. The reply carries ``truncated`` when
-# more keys matched than the limit, so a client that needs the rest
-# re-issues with a narrower prefix — the same split-the-work rule
-# as mget's batching.
+# more keys matched than the limit, plus ``next_start_after`` — the
+# last key returned — so a client pages by re-issuing with
+# ``start_after`` set to it, an exclusive lower bound on the sorted
+# key order: no repeats, no gaps, as long as the state does not
+# change between pages.
 MAX_KEYS_SCAN = 1000
 # Leader lease for reads (Raft dissertation §6.4): how long a majority
 # ack stays fresh. Must be shorter than ELECTION_TIMEOUT_MIN (150ms):
@@ -1932,22 +1934,34 @@ class RaftNode:
 
     def _on_keys(self, msg: dict) -> dict:
         """Serve a key enumeration: every key in the applied state
-        machine, sorted, optionally restricted to a prefix, capped
-        at MAX_KEYS_SCAN. It rides the same ReadIndex/lease path as
+        machine, sorted, optionally restricted to a prefix and to
+        keys strictly after ``start_after``, capped at
+        MAX_KEYS_SCAN. It rides the same ReadIndex/lease path as
         ``get`` and ``mget`` — one leadership confirmation and one
         apply wait — so a scan is exactly as linearizable as a
         single read: it reflects the committed state as of the
         read index it names, never a half-applied prefix. The reply
         carries ``keys`` (the matching keys in sorted order, at most
         ``limit`` of them), ``truncated`` (True when more keys
-        matched than the limit returned, so the caller knows to
-        narrow the prefix and re-scan), and the same ``read_index``
-        / ``read_term`` a session uses to advance its read
-        watermark."""
+        matched than the limit returned), ``next_start_after`` (the
+        last key returned when truncated, else None — pass it back
+        as ``start_after`` to fetch the next page), and the same
+        ``read_index`` / ``read_term`` a session uses to advance
+        its read watermark. ``start_after`` is an exclusive lower
+        bound on the sorted key order, not a page number: resuming
+        with the last key returned starts the next page exactly
+        after it. Each page is linearizable on its own, but the
+        enumeration as a whole is not a snapshot — a key written
+        or deleted between pages can be missed, or (if it sorts
+        ahead of the cursor) appear in a later page."""
         prefix = msg.get("prefix") or ""
         if not isinstance(prefix, str):
             return {"type": "client_response", "status": "error",
                     "error": "keys prefix must be a string"}
+        start_after = msg.get("start_after")
+        if start_after is not None and not isinstance(start_after, str):
+            return {"type": "client_response", "status": "error",
+                    "error": "keys start_after must be a string"}
         limit = msg.get("limit")
         if limit is None:
             limit = MAX_KEYS_SCAN
@@ -1965,6 +1979,7 @@ class RaftNode:
         if error is not None:
             return error
         return self._serve_read(scan_prefix=prefix, scan_limit=limit,
+                                scan_start_after=start_after,
                                 min_index=min_index,
                                 session_term=session_term,
                                 stale_ok=bool(msg.get("stale_ok")))
@@ -2592,7 +2607,8 @@ class RaftNode:
                     keys: list[str] | None = None,
                     stale_ok: bool = False,
                     scan_prefix: str | None = None,
-                    scan_limit: int = MAX_KEYS_SCAN) -> dict:
+                    scan_limit: int = MAX_KEYS_SCAN,
+                    scan_start_after: str | None = None) -> dict:
         """ReadIndex read (Raft dissertation §6.4).
 
         ``key`` serves one key; ``keys`` serves a multi-get instead —
@@ -2603,6 +2619,13 @@ class RaftNode:
         starting with the prefix, sorted, at most ``scan_limit`` of
         them, with ``truncated`` when more matched — and the reply
         carries ``keys`` plus the same ``read_index`` / ``read_term``.
+        ``scan_start_after`` resumes a scan past a cursor: only keys
+        strictly after it in sorted order are returned, so a client
+        pages by passing back the previous page's last key (or the
+        reply's ``next_start_after``). Each page is linearizable on
+        its own, but the enumeration as a whole is not a snapshot —
+        a key written or deleted between pages can be missed, or
+        appear in a later page if it sorts ahead of the cursor.
         Everything else — the lease fast path, the pending-read wait,
         the fallback, the redirect on leadership loss — is identical
         for all three shapes, so a scan is exactly as linearizable
@@ -2667,12 +2690,17 @@ class RaftNode:
             ``values`` aligned with ``keys`` for a multi-get — None
             in a position whose key is missing, so a batch never
             shifts after a miss — or ``keys`` plus ``truncated``
-            for a scan, the matching keys in sorted order capped at
-            the scan limit."""
+            and ``next_start_after`` for a scan, the matching keys
+            in sorted order capped at the scan limit, resumed past
+            ``scan_start_after`` when one is given."""
             if scan_prefix is not None:
-                matching = self.sm.keys(scan_prefix)
-                return {"keys": matching[:scan_limit],
-                        "truncated": len(matching) > scan_limit}
+                matching = self.sm.keys(scan_prefix, scan_start_after)
+                page = matching[:scan_limit]
+                truncated = len(matching) > scan_limit
+                return {"keys": page,
+                        "truncated": truncated,
+                        "next_start_after": page[-1] if truncated
+                                            else None}
             if keys is not None:
                 return {"values": [self.sm.get(k) for k in keys]}
             return {"value": self.sm.get(key)}

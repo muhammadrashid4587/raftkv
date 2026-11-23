@@ -59,15 +59,23 @@ class KVStore:
     def get(self, key: str) -> str | None:
         return self._data.get(key)
 
-    def keys(self, prefix: str = "") -> list[str]:
+    def keys(self, prefix: str = "", start_after: str | None = None) -> list[str]:
         """Every key in the store, sorted, optionally restricted to
-        keys starting with ``prefix``. Sorted so a scan's answer is
-        deterministic — the same state always enumerates in the same
-        order, which is what makes a paged scan (limit + repeat)
-        well-defined. Pure read: no log entry, no state change."""
-        if prefix:
-            return sorted(k for k in self._data if k.startswith(prefix))
-        return sorted(self._data)
+        keys starting with ``prefix`` and to keys strictly after
+        ``start_after``. Sorted so a scan's answer is deterministic
+        — the same state always enumerates in the same order, which
+        is what makes a paged scan (limit + resume from the last key
+        returned) well-defined: ``start_after`` is an exclusive
+        lower bound on the sorted key order, so resuming with the
+        last key of one page starts the next page exactly after it,
+        with no repeats and no gaps, as long as the state does not
+        change between pages. Pure read: no log entry, no state
+        change."""
+        matching = (k for k in self._data if k.startswith(prefix)) \
+            if prefix else iter(self._data)
+        if start_after is not None:
+            matching = (k for k in matching if k > start_after)
+        return sorted(matching)
 
     def load(self, state: dict[str, str]) -> None:
         """Replace the whole state with ``state`` (used when installing
