@@ -58,6 +58,24 @@ logic and the failure handling, not the key-value API on top.
   retried once on a fresh connection, so a stale pooled socket is
   invisible, and watches stay one-shot so a long-poll never pins
   a pooled connection.
+- **Pipelined client reads** — since v0.29.0 a client can send many
+  reads over one persistent connection without waiting for each
+  reply (`PipelinedConnection` in `transport.py`,
+  `client.get_many(keys, depth=50)`): the whole batch goes out in
+  one send and the replies come back in order, so a single client
+  stops paying a round-trip wait per read. The server still
+  dispatches frames from one connection in order, so pipelining
+  removes the client's wait, not the server's serial dispatch —
+  the ceiling becomes the server's per-request processing time.
+  Reads are idempotent, so a batch that hits a follower is re-sent
+  once to the leader it names; a batch that fails mid-way reports
+  an error in that position instead of raising. Measured on this
+  box (see Benchmark): a single pipelined client reads at
+  ~13800-18300 ops/s against ~3900-6000 sequential in the same
+  runs — roughly 2-5x — while the sustained concurrent ceiling
+  (~7000 ops/s) is unchanged, since that one is CPU-bound on the
+  server, not on the client's wait. `scripts/bench.py --pipelined`
+  runs the phase (`--pipeline-depth` sets the batch size).
 - **Leader lease reads** — a leader that heard acks from a majority
   within the last 100ms (shorter than any follower's 150ms minimum
   election timeout, so no new leader can have been elected since)
@@ -565,11 +583,36 @@ cores, client 0.71 + leader 0.63), so the next ceiling is raw CPU
 on this VM, not scheduling — a faster client or a real network
 would move it before any more server threading will.
 
+The faster client (v0.29.0) is that next step, and it moves the
+single-client number without touching the server at all:
+
+```
+$ python3 scripts/bench.py --pool-size 50 --threads 50 --pipelined  # three runs
+sequential reads           200 ops  3894-5972 ops/s    p50  0.2ms
+concurrent reads x50       200 ops  3440-4682 ops/s    p50  2.1-2.5ms
+pipelined reads            200 ops  13820-18284 ops/s  mean 0.055-0.072ms/op  (batches of 50/50/200)
+```
+
+A lone client sending reads 50 at a time over one connection runs
+at ~13800-18300 ops/s, roughly 2-5x the sequential client in the
+same runs (~3900-6000 ops/s) — the round-trip wait between requests
+was most of a sequential read's cost, and the server's per-request
+processing (~0.06ms) is what is left. Depth 200 is no faster than
+depth 50 in any meaningful way (18284 vs 17066 in runs that also
+differ by load), so 50 stays the default: past it the batch just
+holds more replies in flight on a server that still dispatches
+them one at a time. The sustained concurrent ceiling does not move
+— 50 threads of pooled reads still sit at ~7000 ops/s, CPU-bound
+on the leader — which is the honest limit of this box: pipelining
+lifts a single client to the server's per-request cost, it does not
+make the server cheaper.
+
 ## Architecture
 
 ```
 raftkv/
-  transport.py   Length-prefixed JSON framing, pooled or one-shot RPC, reactor + worker-pool TCP server
+  transport.py   Length-prefixed JSON framing, pooled, one-shot or
+                 pipelined RPC, reactor + worker-pool TCP server
   raft.py        RaftNode: elections, log replication, commit, persistence
   store.py       KVStore: the deterministic state machine (SET/GET/DEL)
   linearizability.py  History/Op: record concurrent ops, verify linearizability
@@ -1137,3 +1180,27 @@ entries left in `log.jsonl` are dropped by their index on reload.
   one thread per connection on the server, under heavier concurrency
   than 10 clients — measure first, then decide whether that is a
   read path that skips the lock or a thread-pool server.
+- ~~Pipelined client reads~~ — done in v0.29.0, Nov 23, 2026: the
+  read ceiling the Benchmark section named was the client's wait,
+  not the server — a lone sequential reader paid a round trip per
+  read while the leader served each in ~0.06ms. `transport.py`
+  gains a `PipelinedConnection`: one persistent socket, the whole
+  batch encoded and sent in one `sendall`, replies read back in
+  order, one `None` per unread position and a closed socket on a
+  mid-batch failure. `client.get_many(keys, depth=50)` builds on
+  it (via `request_many`, reads only — a re-sent batch repeats
+  every message, so writes stay out), re-sending a batch once to
+  the leader a follower names, and `scripts/bench.py --pipelined`
+  adds a pipelined-reads phase (`--pipeline-depth` sets the batch
+  size) that reports mean per-op latency, since per-op latencies
+  are not observable inside a batch. Measured honestly on this
+  shared box (see Benchmark): a single pipelined client reads at
+  13820-18284 ops/s across three runs, against 3894-5972
+  sequential in the same runs — the server's per-request cost is
+  now the single-client ceiling, and the sustained concurrent
+  ceiling (~7000 ops/s) is unchanged, CPU-bound on the leader.
+  `tests/test_pipelined_client.py` proves it: 50 and 200 gets in
+  key order with the right values, a missing key mid-batch, a
+  redirect from a follower, an empty batch, Nones to a dead port,
+  and reconnect after close; `tests/test_bench.py` runs the new
+  bench phase end to end.

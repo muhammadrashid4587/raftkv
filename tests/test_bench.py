@@ -33,6 +33,21 @@ class TestBenchScript(unittest.TestCase):
             self.assertIn("verified 10 keys read back correctly",
                           proc.stdout)
 
+    def test_bench_pipelined_phase_runs(self):
+        with tempfile.TemporaryDirectory(prefix="raftkv-bench-test-") as d:
+            proc = subprocess.run(
+                [sys.executable, "scripts/bench.py",
+                 "--writes", "10", "--threads", "2",
+                 "--pipelined", "--pipeline-depth", "5",
+                 "--port-base", "5495",
+                 "--data-dir", str(Path(d) / "cluster")],
+                cwd=ROOT, capture_output=True, text=True, timeout=120,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("pipelined reads", proc.stdout)
+            self.assertIn("verified 10 keys read back correctly",
+                          proc.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

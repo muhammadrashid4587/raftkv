@@ -20,7 +20,7 @@ import json
 import sys
 import uuid
 
-from .transport import ConnectionPool, send_rpc
+from .transport import ConnectionPool, PipelinedConnection, send_rpc
 
 MAX_REDIRECTS = 10
 # One pooled connection per concurrent in-flight request is enough;
@@ -249,6 +249,88 @@ def _format_membership_status(status: dict) -> list[str]:
             f"{sid} (entry {idx})"
             for sid, idx in sorted(m["removal_pending"].items())))
     return lines
+
+
+def request_many(node_addr: tuple[str, int], msgs: list[dict],
+                 timeout: float = 12.0, depth: int = 50) -> list[dict]:
+    """Send many idempotent requests pipelined over one connection.
+
+    The messages go out in batches of ``depth`` on a single
+    persistent socket and the replies come back aligned by position:
+    the i-th reply answers the i-th message. A batch that hits a
+    follower is re-sent once to the leader it names, like
+    ``request`` follows a redirect; a batch that fails mid-way (a
+    ``None`` reply) is returned as-is with an ``error`` response in
+    that position, and the caller decides whether to retry it — the
+    connection is gone by then, so a retry starts fresh.
+
+    Only for idempotent messages (reads): a batch re-sent after a
+    redirect or a lost reply repeats every message in it, so a write
+    without a dedup session id could apply twice.
+    """
+    if not msgs:
+        return []
+    conn = PipelinedConnection(node_addr[0], node_addr[1],
+                               timeout=timeout)
+    host, port = node_addr
+    replies: list[dict] = []
+    try:
+        for start in range(0, len(msgs), depth):
+            batch = msgs[start:start + depth]
+            batch_replies = _request_batch(conn, host, port, batch,
+                                           timeout)
+            replies.extend(batch_replies)
+    finally:
+        conn.close()
+    return replies
+
+
+def _request_batch(conn: PipelinedConnection, host: str, port: int,
+                   batch: list[dict], timeout: float) -> list[dict]:
+    """One pipelined batch, following a leader redirect once.
+
+    A ``not_leader`` reply names the leader; the whole batch is
+    re-sent to it on a fresh connection, since the follower answered
+    nothing from the batch. After one redirect the replies are
+    returned as they came back, redirect or not — the caller sees
+    them. A ``None`` reply (the connection died mid-batch) becomes
+    an ``error`` response in that position."""
+    for _ in range(MAX_REDIRECTS):
+        raw = conn.call_many(batch)
+        responses = [
+            r if r is not None else
+            {"type": "client_response", "status": "error",
+             "error": f"node {host}:{port} did not answer"}
+            for r in raw
+        ]
+        leader = None
+        for resp in responses:
+            if (resp.get("status") == "not_leader"
+                    and resp.get("leader_addr")):
+                leader = resp["leader_addr"]
+                break
+        if leader is None:
+            return responses
+        host, port = leader[0], int(leader[1])
+        conn.close()
+        conn.host, conn.port = host, port
+    return [{"type": "client_response", "status": "error",
+             "error": "too many leader redirects"}] * len(batch)
+
+
+def get_many(node_addr: tuple[str, int], keys: list[str],
+             timeout: float = 12.0, depth: int = 50) -> list[dict]:
+    """Read many keys with one pipelined connection.
+
+    One ``get`` per key, sent in batches of ``depth`` without
+    waiting between them; the replies come back in key order. Each
+    reply is the plain ``get`` response (``status`` ``ok`` with the
+    value, or ``ok`` with ``value`` ``None`` for a missing key) —
+    a failed read is an ``error`` response in that position, never
+    an exception, so a partial batch is still usable.
+    """
+    msgs = [{"type": "client", "op": "get", "key": key} for key in keys]
+    return request_many(node_addr, msgs, timeout=timeout, depth=depth)
 
 
 def request(node_addr: tuple[str, int], msg: dict, timeout: float = 12.0,

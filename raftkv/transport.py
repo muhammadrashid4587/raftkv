@@ -299,6 +299,109 @@ class ConnectionPool:
 
 
 # ---------------------------------------------------------------------------
+# Client-side pipelining: many requests on one connection, replies in order.
+# ---------------------------------------------------------------------------
+
+
+class PipelinedConnection:
+    """One persistent socket carrying many requests at once.
+
+    The client encodes every message, sends the whole batch in one
+    ``sendall`` and then reads the replies back in order — it never
+    waits for one reply before sending the next request. That is the
+    whole win over a sequential client: the round-trip wait between
+    requests disappears, and the per-request syscall and framing
+    overhead is amortised over the batch.
+
+    The server still dispatches frames from one connection in order
+    (each waits on the previous frame's future), so a pipelined batch
+    does not run concurrently on the server — a slow request in the
+    middle still delays the ones behind it on that connection, exactly
+    as it would a sequential client. Pipelining removes the client's
+    wait, not the server's serial dispatch; the throughput ceiling
+    becomes the server's per-request processing time instead of the
+    round-trip latency. Use a separate connection per concurrent
+    stream if the requests must overlap server-side.
+
+    Replies are aligned with the requests by position: the i-th reply
+    answers the i-th message. A failed send or a missing reply marks
+    that position (and every unread position after it) ``None`` and
+    closes the socket — a half-read batch cannot be resumed, the
+    caller re-sends the missing requests on a fresh connection.
+    Retrying a batch is only safe for idempotent messages: a read
+    re-sent is just a read again, but a write re-sent after its reply
+    was lost may apply twice unless it carries a dedup session id.
+    """
+
+    def __init__(self, host: str, port: int, timeout: float = 12.0):
+        self.host = host
+        self.port = port
+        self.timeout = timeout
+        self._sock: socket.socket | None = None
+
+    def connect(self) -> bool:
+        """Open the socket. Returns False if the peer is unreachable."""
+        if self._sock is not None:
+            return True
+        try:
+            sock = socket.create_connection(
+                (self.host, self.port), timeout=self.timeout)
+        except OSError:
+            return False
+        sock.settimeout(self.timeout)
+        self._sock = sock
+        return True
+
+    def call_many(self, msgs: list[dict]) -> list[dict | None]:
+        """Send every message at once, read the replies in order.
+
+        Returns one entry per message: the reply dict, or ``None``
+        where no reply could be read. An empty batch returns an
+        empty list without touching the socket. A failed batch closes
+        the connection — the next call re-opens it.
+        """
+        if not msgs:
+            return []
+        if not self.connect():
+            return [None] * len(msgs)
+        assert self._sock is not None
+        try:
+            self._sock.sendall(b"".join(encode_message(m) for m in msgs))
+        except OSError:
+            self.close()
+            return [None] * len(msgs)
+        replies: list[dict | None] = []
+        for _ in msgs:
+            try:
+                replies.append(recv_message(self._sock))
+            except OSError:
+                replies.append(None)
+            if replies[-1] is None:
+                # The connection is gone mid-batch: the rest cannot
+                # arrive either, and a half-consumed stream cannot
+                # be trusted for the next batch.
+                self.close()
+                replies.extend([None] * (len(msgs) - len(replies)))
+                return replies
+        return replies
+
+    def close(self) -> None:
+        """Close the socket. The next call_many re-opens it."""
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self._sock = None
+
+    def __enter__(self) -> "PipelinedConnection":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+
+# ---------------------------------------------------------------------------
 # Server: one reactor thread + a bounded pool of dispatch workers.
 # ---------------------------------------------------------------------------
 

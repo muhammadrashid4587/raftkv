@@ -10,8 +10,13 @@ Starts a real 3-node cluster on localhost (subprocesses, like
     number of writes
   * sequential ReadIndex reads of the written keys
   * concurrent ReadIndex reads
+  * (with ``--pipelined``) pipelined reads of the written keys:
+    one client, one persistent connection, ``--pipeline-depth``
+    requests sent at a time without waiting for each reply
 
 Each phase reports ops/sec and per-op latency percentiles (p50/p95/p99).
+The pipelined phase reports mean per-op latency instead: per-op
+latencies are not observable inside a batch, only the batch time.
 A sample of the written keys is read back afterwards and checked, so a
 fast run that lost data still fails. Exits non-zero if any operation
 fails, a verification read disagrees, or the cluster never elects a
@@ -20,7 +25,8 @@ leader.
 Usage:
 
     python3 scripts/bench.py [--writes 200] [--threads 10]
-        [--pool-size 10] [--port-base 5100]
+        [--pool-size 10] [--pipelined] [--pipeline-depth 50]
+        [--port-base 5100]
         [--data-dir /tmp/raftkv-bench] [--keep]
 
 ``--pool-size N`` reuses N persistent connections per node instead
@@ -47,8 +53,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from raftkv.client import get_many
 from raftkv.client import request as client_request  # noqa: E402
-from raftkv.transport import ConnectionPool  # noqa: E402
+from raftkv.transport import ConnectionPool, send_rpc  # noqa: E402
 
 SEED_KEY = "__bench_probe__"
 VALUE = "v" * 32  # 32-byte values, like a small session token
@@ -164,6 +171,53 @@ def do_get(addr: tuple[str, int], i: int,
     return elapsed
 
 
+def find_leader(addrs: list[tuple[str, int]]) -> tuple[str, int]:
+    """Find the leader by asking each node directly: a follower
+    answers a get with ``not_leader``, the leader answers ``ok``.
+    Pipelined reads go straight to the leader's address, so this
+    runs once before the pipelined phase instead of paying a
+    redirect hop per batch."""
+    for addr in addrs:
+        resp = send_rpc(addr[0], addr[1],
+                        {"type": "client", "op": "get", "key": SEED_KEY},
+                        timeout=2.0)
+        if resp is not None and resp.get("status") == "ok":
+            return addr
+    raise RuntimeError("no node answered as leader")
+
+
+def run_pipelined_reads(addr: tuple[str, int], count: int,
+                        depth: int) -> None:
+    """One client, ``count`` reads, sent ``depth`` at a time over a
+    single persistent connection without waiting between requests.
+
+    Per-op latencies are not observable inside a batch — a batch is
+    one send and one stream of replies — so the row reports the mean
+    per-op latency (batch time / batch size) instead of percentiles.
+    Every reply is checked against the written value, so a fast run
+    that lost data still fails."""
+    keys = [f"bench:{i}" for i in range(count)]
+    start = time.perf_counter()
+    batch_times: list[float] = []
+    for i in range(0, count, depth):
+        batch_keys = keys[i:i + depth]
+        batch_start = time.perf_counter()
+        replies = get_many(addr, batch_keys, timeout=30.0, depth=depth)
+        batch_times.append(time.perf_counter() - batch_start)
+        for key, resp in zip(batch_keys, replies):
+            if resp.get("status") != "ok" or resp.get("value") != VALUE:
+                raise RuntimeError(f"pipelined get {key} failed: {resp}")
+    elapsed = time.perf_counter() - start
+    mean_ms = elapsed / count * 1000
+    print(
+        f"{'pipelined reads':<28} {count:>5} ops  {elapsed:>6.2f}s  "
+        f"{count / elapsed:>7.1f} ops/s  "
+        f"mean {mean_ms:>6.3f}ms/op  "
+        f"(batches of {depth}, "
+        f"batch p50 {percentile(batch_times, 50) * 1000:>6.1f}ms)"
+    )
+
+
 def run_phase(label: str, fn, count: int,
               threads: int, addr: tuple[str, int],
               pool: ConnectionPool | None = None) -> None:
@@ -193,6 +247,15 @@ def main(argv: list[str] | None = None) -> int:
                              "this many pooled connections per node "
                              "(default 0: one fresh TCP connection per "
                              "request, as before)")
+    parser.add_argument("--pipelined", action="store_true",
+                        help="also run a pipelined-reads phase: one "
+                             "client reads all keys over a single "
+                             "persistent connection, sending "
+                             "--pipeline-depth requests at a time "
+                             "without waiting for each reply")
+    parser.add_argument("--pipeline-depth", type=int, default=50,
+                        help="requests sent per pipelined batch "
+                             "(default 50)")
     parser.add_argument("--port-base", type=int, default=5100,
                         help="first of three consecutive ports "
                              "(default 5100)")
@@ -233,6 +296,10 @@ def main(argv: list[str] | None = None) -> int:
         run_phase("sequential reads", do_get, args.writes, 1, seed, pool)
         run_phase(f"concurrent reads x{args.threads}", do_get,
                   args.writes, args.threads, seed, pool)
+        if args.pipelined:
+            leader_addr = find_leader(cluster.addrs)
+            run_pipelined_reads(leader_addr, args.writes,
+                                args.pipeline_depth)
         # Verify a deterministic sample of the written keys.
         sample = list(range(0, args.writes, max(1, args.writes // 20)))
         for i in sample:
