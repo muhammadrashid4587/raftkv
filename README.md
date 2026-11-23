@@ -200,6 +200,15 @@ logic and the failure handling, not the key-value API on top.
   diverges. The same scenario runs in-process as `tests/test_chaos.py`
   (seeded, 4 kill/restart cycles, 2 writers). Same seed, same faults,
   so a failure is reproducible: `python3 scripts/chaos.py --seed 7`.
+  Since v0.22.0 `--membership` also drives a membership change
+  mid-run: a fourth node is started and added while the kill/restart
+  faults (and the partition, if enabled) are active, then the leader
+  is killed and restarted, and the run verifies the 4-node membership
+  is durable and every acked write still reads back on the enlarged
+  cluster. `tests/test_membership_chaos.py` covers the same
+  combination in-process: add under a partition, remove while a
+  follower is killed and restarted, and membership surviving a leader
+  restart mid-chaos.
 - **Linearizability checker** — `raftkv/linearizability.py` records
   the full history of concurrent operations (invocation/response
   times, client/session ids) during a chaos run — writer threads
@@ -269,7 +278,7 @@ make test
 # or: python3 -m unittest discover -s tests -v
 ```
 
-136 tests, plus a smoke test for the benchmark script, all passing:
+139 tests, plus a smoke test for the benchmark script, all passing:
 
 | Test | What it proves |
 |---|---|
@@ -316,6 +325,9 @@ make test
 | `test_old_majority_alone_cannot_commit_during_joint` | During a joint transition, holders that are a majority of C-old only do not commit a current-term entry; adding the new member's ack does |
 | `test_add_server_completes_joint_then_final` | A client add runs both phases: the cluster ends in the 4-node config with no joint phase left, and the new node serves reads |
 | `test_leader_change_mid_transition_completes` | Frozen mid-transition by partitioning two members, a snapshot carries the joint config, a restarted follower resumes in it, and the new leader after the old one dies finishes the change |
+| `test_add_node_under_partition` | Adding a node while one follower is partitioned: the majority side plus the catching-up node4 commit the joint and final entries, and after the heal every node reports the 4-node config |
+| `test_remove_node_while_follower_killed_and_restarted` | Removing a node while another follower is down: the joint entry waits out the restart, then commits, and writes continue on the 2-node cluster |
+| `test_membership_survives_leader_restart_mid_chaos` | Writers and kill/restart faults running throughout, a node added mid-run, then the leader killed and restarted: every acked write present on all four nodes, 4-node config everywhere, no joint phase left |
 | `test_lease_read_skips_heartbeat_round` | Five reads on a leased leader run zero confirmation rounds and return the right values |
 | `test_lease_expires_without_majority_acks` | With both followers down the lease goes stale, the read falls back to a round and errors instead of serving unconfirmed |
 | `test_step_down_clears_lease` | Stepping down clears the ack record, so a deposed leader holds no lease |
@@ -844,3 +856,22 @@ entries left in `log.jsonl` are dropped by their index on reload.
   by partitioning two members, snapshot carrying the joint config,
   a restarted follower resuming in it, the new leader finishing
   the change).
+- ~~Membership changes under chaos faults~~ — done in v0.22.0, Nov 23,
+  2026: the chaos harness (`scripts/chaos.py --membership`) now
+  drives a membership change mid-run — a fourth node is started and
+  added while kill/restart faults (and the partition, if enabled)
+  are active, then the leader is killed and restarted, and the run
+  verifies the 4-node membership is durable and every acked write
+  still reads back on the enlarged cluster. `tests/test_membership_chaos.py`
+  covers the same combination in-process: adding a node while one
+  follower is partitioned (the majority side plus the catching-up
+  node4 still form a majority of both configs, so the joint and
+  final entries commit without the isolated node's ack), removing a
+  node while another follower is killed and restarted (the joint
+  entry waits out the restart, then commits), and membership
+  surviving a leader restart mid-chaos (writers and kill/restart
+  faults running throughout, every acked write present on all four
+  nodes afterwards, no node left in a joint phase). Verified with
+  `scripts/chaos.py --membership` (seeds 7 and 42, the second with
+  a 3s partition overlapping the add): 81 and 129 acked writes, zero
+  lost, 4 nodes converged, linearizability ok.

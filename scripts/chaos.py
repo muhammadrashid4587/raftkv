@@ -56,6 +56,14 @@ all three nodes stay up, they just cannot hear each other). The
 majority must elect a new leader and keep committing while the
 split lasts; the isolated leader must not commit anything. The
 same end-of-run verification covers the split.
+
+With ``--membership`` the run also drives a membership change
+mid-run, while the kill/restart faults (and the partition, if
+enabled) are active: a fourth node is started and added to the
+cluster, then the current leader is killed and restarted, and the
+run verifies the new 4-node membership is durable — every node
+still reports it after the leader restart — and that every acked
+write still reads back on the enlarged cluster.
 """
 
 from __future__ import annotations
@@ -225,7 +233,7 @@ class Cluster:
         node_id = f"node{i + 1}"
         peers = ",".join(
             f"node{j + 1}=127.0.0.1:{self.port_base + j}"
-            for j in range(3) if j != i
+            for j in range(len(self.addrs)) if j != i
         )
         log = open(self.data_dir / f"{node_id}.log", "a")
         self._logs.append(log)
@@ -237,6 +245,17 @@ class Cluster:
             stdout=log, stderr=subprocess.STDOUT,
             cwd=str(Path(__file__).resolve().parent.parent),
         )
+
+    def add_extra_node(self) -> int:
+        """Start one more node (node4, node5, ...) that is not yet a
+        member of the cluster, with the current nodes as its peers.
+        It sits idle until the leader adds it with an add_server
+        client request. Returns its index."""
+        i = len(self.procs)
+        self.procs.append(None)
+        self.addrs.append(("127.0.0.1", self.port_base + i))
+        self._start_node(i)
+        return i
 
     def start(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -294,8 +313,8 @@ class Cluster:
 
     def heal_all(self) -> None:
         """Heal every partition on every node."""
-        for a in range(3):
-            for b in range(3):
+        for a in range(len(self.procs)):
+            for b in range(len(self.procs)):
                 if a != b:
                     self.heal_partition(a, b)
 
@@ -303,7 +322,7 @@ class Cluster:
         """Index of the node that currently reports role leader, or
         None if none (or more than one) does. Status RPCs still work
         while partitioned, so this sees through a split."""
-        leaders = [i for i in range(3)
+        leaders = [i for i in range(len(self.procs))
                    if self.status(i).get("role") == "leader"]
         return leaders[0] if len(leaders) == 1 else None
 
@@ -332,13 +351,14 @@ class Cluster:
 
     def wait_for_convergence(self, timeout: float = 15.0) -> dict:
         """Poll until every live node reports the same commit index and
-        last applied index, then return the three status dicts."""
+        last applied index, then return the status dicts."""
         deadline = time.monotonic() + timeout
+        n = len(self.procs)
         while time.monotonic() < deadline:
-            stats = [self.status(i) for i in range(3)]
+            stats = [self.status(i) for i in range(n)]
             if all(stats) and len({(s["commit_index"], s["last_applied"])
                                   for s in stats}) == 1:
-                return {f"node{i + 1}": stats[i] for i in range(3)}
+                return {f"node{i + 1}": stats[i] for i in range(n)}
             time.sleep(0.1)
         raise RuntimeError(
             "nodes did not converge: " +
@@ -347,7 +367,22 @@ class Cluster:
                 f"applied {s.get('last_applied')}" if s else
                 f"node{i + 1}=down"
                 for i, s in enumerate(
-                    [self.status(j) for j in range(3)])))
+                    [self.status(j) for j in range(n)])))
+
+    def wait_for_config(self, members: list[str],
+                        timeout: float = 10.0) -> bool:
+        """Poll until every live node reports ``members`` as its
+        voting config."""
+        deadline = time.monotonic() + timeout
+        want = sorted(members)
+        while time.monotonic() < deadline:
+            stats = [self.status(i) for i in range(len(self.procs))]
+            if (all(stats)
+                    and all(sorted(s.get("config", [])) == want
+                            for s in stats)):
+                return True
+            time.sleep(0.1)
+        return False
 
     def stop(self) -> None:
         for i, proc in enumerate(self.procs):
@@ -477,7 +512,7 @@ def partition_phase(cluster: Cluster, seconds: float,
     if leader is None:
         log.append("partition: skipped, no single leader found")
         return
-    others = [i for i in range(3) if i != leader]
+    others = [i for i in range(len(cluster.procs)) if i != leader]
     if not all(cluster.partition(leader, i) for i in others):
         log.append("partition: control RPC failed, split may be partial")
     log.append(f"partition: isolated node{leader + 1} (leader) "
@@ -485,6 +520,65 @@ def partition_phase(cluster: Cluster, seconds: float,
     time.sleep(seconds)
     cluster.heal_all()
     log.append("partition: healed")
+
+
+def membership_phase(cluster: Cluster, log: list[str],
+                     result: dict) -> None:
+    """Drive a membership change mid-run, while the kill/restart
+    faults (and the partition phase, if enabled) are active: start a
+    fourth node, add it to the cluster, then kill the current leader
+    and restart it, and verify the 4-node membership survived the
+    leader restart. The add is retried until it acks or the deadline
+    passes: a leader dying mid-add fails that attempt, and a joint
+    entry that cannot commit while the leader is isolated times out
+    — either way the next attempt goes to the leader that can finish
+    it, and the normal end-of-run verification (acked writes, node
+    convergence, linearizability) covers the enlarged cluster."""
+    time.sleep(2.0)
+    node4 = cluster.add_extra_node()
+    host, port = cluster.addrs[node4]
+    deadline = time.monotonic() + 90.0
+    resp = None
+    while time.monotonic() < deadline:
+        resp = client_request(
+            cluster.addrs[0],
+            {"type": "client", "op": "add_server", "server_id": "node4",
+             "addr": [host, port]},
+            timeout=20.0)
+        if resp.get("status") == "ok":
+            break
+        time.sleep(0.2)
+    if resp is None or resp.get("status") != "ok":
+        log.append(f"membership: add node4 never acked: {resp}")
+        result["ok"] = False
+        return
+    log.append("membership: node4 added")
+    members = [f"node{i + 1}" for i in range(len(cluster.procs))]
+    if not cluster.wait_for_config(members):
+        log.append("membership: 4-node config never converged")
+        result["ok"] = False
+        return
+    leader = cluster.leader_index()
+    if leader is None:
+        log.append("membership: no single leader for the restart check")
+        result["ok"] = False
+        return
+    cluster.kill_node(leader)
+    log.append(f"membership: killed leader node{leader + 1} after the add")
+    time.sleep(0.5)
+    cluster.restart_node(leader)
+    try:
+        cluster.wait_for_leader()
+    except RuntimeError:
+        log.append("membership: no leader after restarting the old one")
+        result["ok"] = False
+        return
+    if not cluster.wait_for_config(members):
+        log.append("membership: 4-node config lost across leader restart")
+        result["ok"] = False
+        return
+    log.append("membership: 4-node config durable across leader restart")
+    result["ok"] = True
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -508,6 +602,14 @@ def main(argv: list[str] | None = None) -> int:
                              "and the cluster must converge after the "
                              "heal — all checked by the normal end-of-"
                              "run verification.")
+    parser.add_argument("--membership", action="store_true",
+                        help="drive a membership change mid-run: start "
+                             "a fourth node and add it while the "
+                             "kill/restart faults (and the partition, if "
+                             "enabled) are active, then kill and restart "
+                             "the leader and verify the 4-node membership "
+                             "is durable and every acked write still "
+                             "reads back.")
     parser.add_argument("--threads", type=int, default=3,
                         help="concurrent writer threads (default 3)")
     parser.add_argument("--cas-threads", type=int, default=2,
@@ -588,6 +690,14 @@ def main(argv: list[str] | None = None) -> int:
                 args=(cluster, args.partition, fault_log),
                 daemon=True)
             partition_thread.start()
+        membership_thread = None
+        membership_result: dict = {}
+        if args.membership:
+            membership_thread = threading.Thread(
+                target=membership_phase,
+                args=(cluster, fault_log, membership_result),
+                daemon=True)
+            membership_thread.start()
         writers = [
             threading.Thread(target=writer,
                              args=(cluster, t, args.writes, acked, lock,
@@ -627,15 +737,22 @@ def main(argv: list[str] | None = None) -> int:
         if partition_thread is not None:
             partition_thread.join(timeout=args.partition + 10.0)
             cluster.heal_all()  # never verify with a split in place
+        if membership_thread is not None:
+            membership_thread.join(timeout=120.0)
+            cluster.heal_all()
         for line in fault_log:
             print(f"  {line}")
+        if membership_thread is not None and not membership_result.get("ok"):
+            print("membership phase failed (see log above)",
+                  file=sys.stderr)
+            return 1
         if errors:
             for err in errors:
                 print(f"writer error: {err}", file=sys.stderr)
             return 1
 
         # Every node back up, cluster settled, then verify.
-        for i in range(3):
+        for i in range(len(cluster.procs)):
             if not cluster.is_live(i):
                 cluster.restart_node(i)
         cluster.wait_for_leader()
@@ -644,6 +761,15 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {node_id}: commit {s['commit_index']}, "
                   f"applied {s['last_applied']}, term {s['term']}, "
                   f"role {s['role']}")
+        if args.membership:
+            members = [f"node{i + 1}"
+                       for i in range(len(cluster.procs))]
+            if not cluster.wait_for_config(members):
+                print("membership not durable: not every node reports "
+                      f"the {len(members)}-node config", file=sys.stderr)
+                return 1
+            print(f"membership ok: every node reports the "
+                  f"{len(members)}-node config")
         seed = cluster.addrs[0]
         lost = []
         for key, value in acked.items():
@@ -672,7 +798,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{len(lost)} acked writes lost", file=sys.stderr)
             return 1
         print(f"chaos ok: {len(acked)} acked writes all present, "
-              f"3 nodes converged at commit "
+              f"{len(cluster.procs)} nodes converged at commit "
               f"{converged['node1']['commit_index']} "
               f"after {args.faults} kill/restart faults "
               f"(seed {args.seed})")
