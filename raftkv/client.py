@@ -20,9 +20,13 @@ import json
 import sys
 import uuid
 
-from .transport import send_rpc
+from .transport import ConnectionPool, send_rpc
 
 MAX_REDIRECTS = 10
+# One pooled connection per concurrent in-flight request is enough;
+# past the cap, extra requests open an ephemeral connection instead
+# of blocking, so this bounds idle sockets, not throughput.
+DEFAULT_POOL_SIZE = 8
 
 
 class Session:
@@ -48,7 +52,8 @@ class Session:
     """
 
     def __init__(self, node_addr: tuple[str, int],
-                 client_id: str | None = None):
+                 client_id: str | None = None,
+                 pool_size: int = DEFAULT_POOL_SIZE):
         self.node_addr = node_addr
         self.client_id = client_id or uuid.uuid4().hex[:12]
         # Index/term of the last write this session saw acknowledged
@@ -62,6 +67,37 @@ class Session:
         self.last_read_index = 0
         self.last_read_term = 0
         self._next_request = 0
+        # Persistent connections to the cluster: every request reuses
+        # a pooled TCP connection instead of opening a fresh one, so
+        # a read stops paying a handshake and a fresh server thread.
+        # ``pool_size`` caps pooled connections per node, not
+        # concurrency — past the cap a request opens an ephemeral
+        # connection instead of waiting. Pass 0 for one-shot
+        # connections, exactly as before pooling.
+        self._pool_size = pool_size
+        self._pool: ConnectionPool | None = None
+
+    @property
+    def _pooled(self) -> ConnectionPool | None:
+        """The session's pool, created lazily so a closed session can
+        be used again — close() releases sockets, it does not retire
+        the session."""
+        if self._pool is None and self._pool_size > 0:
+            self._pool = ConnectionPool(max_size=self._pool_size)
+        return self._pool
+
+    def close(self) -> None:
+        """Release the session's pooled connections. The session stays
+        usable afterwards; the next request opens a fresh pool."""
+        if self._pool is not None:
+            self._pool.close()
+            self._pool = None
+
+    def __enter__(self) -> "Session":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
 
     @property
     def token(self) -> dict:
@@ -78,7 +114,7 @@ class Session:
         self._next_request += 1
         msg["client_id"] = self.client_id
         msg["request_id"] = str(self._next_request)
-        resp = request(self.node_addr, msg)
+        resp = request(self.node_addr, msg, pool=self._pooled)
         # Any response that names a committed entry advances the
         # watermark — a failed CAS still committed its entry, so its
         # index is a valid watermark too. Timeouts and errors carry no
@@ -117,7 +153,7 @@ class Session:
                      "client_id": self.client_id,
                      "min_commit_index": min_index,
                      "session_term": term}
-        resp = request(self.node_addr, msg)
+        resp = request(self.node_addr, msg, pool=self._pooled)
         # A served read advances the read watermark to the applied
         # index the value reflects — never backwards: a read that
         # was served from a newer applied state raises the floor
@@ -148,6 +184,9 @@ class Session:
         msg: dict = {"type": "watch", "key": key, "prefix": prefix,
                      "timeout": timeout}
         host, port = self.node_addr
+        # A watch is a long-poll, not a pooled request: it would pin
+        # a pooled connection for up to ``timeout`` seconds, so it
+        # stays one-shot and never touches the session's pool.
         resp = send_rpc(host, port, msg, timeout=timeout + 5.0)
         if resp is None:
             return {"type": "watch_response", "status": "error",
@@ -212,11 +251,17 @@ def _format_membership_status(status: dict) -> list[str]:
     return lines
 
 
-def request(node_addr: tuple[str, int], msg: dict, timeout: float = 12.0) -> dict:
-    """Send one client request, following leader redirects."""
+def request(node_addr: tuple[str, int], msg: dict, timeout: float = 12.0,
+            pool: ConnectionPool | None = None) -> dict:
+    """Send one client request, following leader redirects.
+
+    Pass a ``ConnectionPool`` to reuse persistent connections; with
+    no pool every request opens a fresh TCP connection, as before.
+    A redirect reuses the same pool — the leader's address just
+    becomes another pooled host."""
     host, port = node_addr
     for _ in range(MAX_REDIRECTS):
-        resp = send_rpc(host, port, msg, timeout=timeout)
+        resp = send_rpc(host, port, msg, timeout=timeout, pool=pool)
         if resp is None:
             return {"type": "client_response", "status": "error",
                     "error": f"node {host}:{port} did not answer"}

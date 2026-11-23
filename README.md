@@ -33,6 +33,18 @@ logic and the failure handling, not the key-value API on top.
   before group commit. The status RPC reports the config and the
   batching stats (`group_commit`: batches, entries, fsyncs,
   largest batch) so the batching ratio is visible live.
+- **Persistent client connections** — since v0.27.0 the client
+  reuses TCP connections instead of opening one per request: a
+  `ConnectionPool` in `transport.py`, one connection checked out
+  per in-flight request, configurable per session
+  (`Session(pool_size=...)`, default 8; 0 means one-shot as
+  before) and per benchmark run (`scripts/bench.py --pool-size`).
+  Concurrent reads went from ~172 to ~3000-5200 ops/s and
+  sequential reads from ~1030 to ~9400-16600 ops/s (see Benchmark);
+  writes are unchanged — they are fsync-bound. A failed call is
+  retried once on a fresh connection, so a stale pooled socket is
+  invisible, and watches stay one-shot so a long-poll never pins
+  a pooled connection.
 - **Leader lease reads** — a leader that heard acks from a majority
   within the last 100ms (shorter than any follower's 150ms minimum
   election timeout, so no new leader can have been elected since)
@@ -436,6 +448,15 @@ make test
 | `test_watch_rpc_event_index_matches_log` | A watch event's index is the index of the write's own log entry |
 | `test_session_watch_returns_events` | `Session.watch` returns the committed change over the wire |
 | `test_watch_cli_prints_event_as_json` | The `watch` CLI subcommand prints the event as one JSON line |
+| `test_pool_reuses_one_connection` | Five RPCs through a pool ride one server connection |
+| `test_pool_recovers_after_server_restart` | A pooled socket to a restarted server is retried on a fresh connection |
+| `test_idle_connection_expires` | An idle socket past its max age is dropped, not reused |
+| `test_pool_serves_concurrent_calls_past_the_cap` | Five concurrent slow calls past a cap of 1 all succeed without queueing |
+| `test_one_shot_send_rpc_unchanged` | `send_rpc` with no pool still opens a fresh connection per call |
+| `test_pool_rejects_bad_size` | A pool with `max_size` below 1 is rejected |
+| `test_session_uses_pool_and_close_releases_it` | A session reads and writes over pooled connections; close releases them and the session stays usable |
+| `test_session_pool_size_zero_means_one_shot` | A session with `pool_size=0` works with no pool at all |
+| `test_pooled_concurrent_reads_are_correct` | Ten threads reading through one shared pool all get the right values |
 
 Tests use real nodes (real TCP, real threads, real disk) on localhost —
 no mocks of the consensus path.
@@ -443,17 +464,24 @@ no mocks of the consensus path.
 ## Benchmark
 
 Measured with `scripts/bench.py` (real 3-node cluster on localhost,
-200 writes, 10 threads, 32-byte values), Nov 22, 2026, on this dev VM
-(three runs; the first two ran while ten sibling agents were pushing
-on the same box, so concurrent-write throughput dipped — the third
-run, on a quieter box, is back near the old number):
+200 writes, 10 threads, 32-byte values), Nov 23, 2026, on this dev VM
+— one one-shot run, then two pooled runs with `--pool-size 10`. The
+box is shared with sibling agents pushing on other repos, so the
+numbers move run to run; the ranges below are what was actually
+measured, not a best case picked out:
 
 ```
-$ python3 scripts/bench.py
-sequential writes          200 ops   ~104-111 ops/s   p50 ~8.6-9.1ms
-concurrent writes x10      200 ops   ~714 ops/s       p50 ~12.4ms
-sequential reads           200 ops   ~1300-3500 ops/s p50 ~0.3-0.6ms
-concurrent reads x10       200 ops   ~184-190 ops/s   p50 ~2.2-4.0ms
+$ python3 scripts/bench.py                  # one fresh TCP connection per request
+sequential writes          200 ops    84.0 ops/s   p50  9.0ms
+concurrent writes x10      200 ops   680.2 ops/s   p50 12.3ms
+sequential reads           200 ops  1030.5 ops/s   p50  0.7ms
+concurrent reads x10       200 ops   172.4 ops/s   p50  3.8ms  p99 1011.7ms
+
+$ python3 scripts/bench.py --pool-size 10  # persistent connections, 10 pooled per node
+sequential writes          200 ops    90.9-102.3 ops/s   p50  8.2-8.6ms
+concurrent writes x10      200 ops   740.9-757.7 ops/s   p50  9.0-10.3ms
+sequential reads           200 ops  9385-16565 ops/s     p50  0.0-0.1ms
+concurrent reads x10       200 ops  2983-5206 ops/s      p50  0.8-1.5ms  p99 4.5-36.7ms
 ```
 
 This is latency-bound, not throughput-bound: every committed write
@@ -474,13 +502,22 @@ reads did not move (~185-190 ops/s either way): with ten clients
 hammering the leader the bottleneck is the per-connection TCP
 handling, not the heartbeat round — a probe of 500 concurrent reads
 showed zero confirmation rounds served from the lease, yet one read
-still took ~1s in the transport layer.
+still took ~1s in the transport layer. Persistent client connections
+(v0.27.0) are what finally moved it: with `--pool-size 10` the same
+concurrent reads run at ~3000-5200 ops/s with p99 under 40ms, and
+sequential reads at ~9400-16600 ops/s, because a read no longer pays
+a fresh TCP connection and a fresh server thread each time. Writes
+did not move — they are fsync-bound, and pooling never claimed to
+help them. The remaining read ceiling is the single Raft lock and
+one thread per connection on the server: under heavier concurrency
+than 10 clients, or on a real network, those are the next things to
+measure, not assume.
 
 ## Architecture
 
 ```
 raftkv/
-  transport.py   Length-prefixed JSON framing, one-shot RPC, threaded TCP server
+  transport.py   Length-prefixed JSON framing, pooled or one-shot RPC, threaded TCP server
   raft.py        RaftNode: elections, log replication, commit, persistence
   store.py       KVStore: the deterministic state machine (SET/GET/DEL)
   linearizability.py  History/Op: record concurrent ops, verify linearizability
@@ -1014,11 +1051,36 @@ entries left in `log.jsonl` are dropped by their index on reload.
   acked batched writes all survive a leader stop/restart from the
   same data dir, window 0 costs 5 fsyncs for 5 concurrent writes
   and 1 per sequential write, and a max batch of 3 turns 6
-  concurrent writes into exactly 2 batches of 3. The membership /
-  snapshot story is complete, so the next real thing is the
-  concurrent-read transport bottleneck the benchmark already
-  measured: with ten clients hammering the leader, concurrent reads
-  sit at ~185 ops/s and one read took ~1s in the transport layer
-  even though zero confirmation rounds were served — persistent
-  client connections / connection pooling on the transport, so a
-  read stops paying a fresh TCP connection each time.
+  concurrent writes into exactly 2 batches of 3.
+- ~~Persistent client connections / connection pooling~~ — done in
+  v0.27.0, Nov 23, 2026: the concurrent-read bottleneck the
+  benchmark measured (~185 ops/s, one read taking ~1s in the
+  transport layer) was the fresh TCP connection per request, so
+  `transport.py` gains a `ConnectionPool` — one connection checked
+  out per in-flight request, so threads never share a socket;
+  `max_size` (default 8) caps pooled connections per host, and past
+  the cap a request opens an ephemeral connection instead of
+  blocking, so the cap bounds idle sockets, never throughput; a
+  failed call is retried once on a fresh connection, so a stale
+  pooled socket (server closed it after 30s idle, or restarted) is
+  invisible to the caller, and idle sockets older than 20s are
+  dropped on checkout. `Session` owns a pool (`pool_size`, default
+  8; 0 means one-shot as before), `request()` and `send_rpc()` take
+  an optional pool, and `scripts/bench.py` takes `--pool-size`.
+  Watches stay one-shot on purpose: a long-poll would pin a pooled
+  connection for up to 25s. The server needed no change — its
+  handler already loops on one connection. Measured honestly on
+  this shared box (see Benchmark): concurrent reads 172 → 2983-5206
+  ops/s with p99 from 1011.7ms to 4.5-36.7ms, sequential reads 1030
+  → 9385-16565 ops/s; writes unchanged, as expected — they are
+  fsync-bound. `tests/test_pool.py` proves it: 5 RPCs over 1 server
+  connection, recovery after a server restart on the same port,
+  idle expiry, 5 concurrent slow calls past a cap of 1 finishing in
+  one round, one-shot `send_rpc` unchanged, and a shared pool
+  serving concurrent reads correctly against a real cluster. Also
+  in this release: `__version__` is bumped to 0.27.0 — v0.26.0 never
+  updated it from 0.25.0. The next real thing is the remaining read
+  ceiling the Benchmark section now names: the single Raft lock and
+  one thread per connection on the server, under heavier concurrency
+  than 10 clients — measure first, then decide whether that is a
+  read path that skips the lock or a thread-pool server.
