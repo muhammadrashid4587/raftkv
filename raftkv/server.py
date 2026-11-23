@@ -57,6 +57,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--snapshot-threshold", type=int, default=1000,
                         help="compact the log past this many post-snapshot "
                              "entries (default 1000)")
+    parser.add_argument("--group-commit-window-ms", type=float, default=2.0,
+                        help="how long the first writer in a batch waits "
+                             "for concurrent writes to join it before "
+                             "flushing (default 2.0); 0 disables batching, "
+                             "one fsync per write")
+    parser.add_argument("--group-commit-max-batch", type=int, default=0,
+                        help="at most this many writes per group-commit "
+                             "batch (default 0: no cap)")
     args = parser.parse_args(argv)
 
     peers = parse_peers(args.peers)
@@ -64,7 +72,9 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--peers must list only the *other* nodes, not this node")
 
     node = RaftNode(args.id, peers, args.data_dir, KVStore(),
-                    snapshot_threshold=args.snapshot_threshold)
+                    snapshot_threshold=args.snapshot_threshold,
+                    group_commit_window_ms=args.group_commit_window_ms,
+                    group_commit_max_batch=args.group_commit_max_batch)
     node.start(args.host, args.port)
     print(
         f"[{args.id}] listening on {args.host}:{args.port} "

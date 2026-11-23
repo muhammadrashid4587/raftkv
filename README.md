@@ -23,7 +23,16 @@ logic and the failure handling, not the key-value API on top.
   joiners pile in, and the batch is appended and replicated as one
   unit. Follower-side batching does the same per AppendEntries batch.
   Concurrent write throughput more than doubled (see Benchmark); a
-  lone sequential write just pays the 2ms window.
+  lone sequential write just pays the 2ms window. Since v0.26.0 the
+  window and the per-batch cap are configurable
+  (`RaftNode(group_commit_window_ms=..., group_commit_max_batch=...)`,
+  `--group-commit-window-ms` / `--group-commit-max-batch` on the
+  server CLI): a full batch flushes as soon as it fills instead of
+  waiting out the window, and window 0 disables batching entirely —
+  every write is its own batch and pays its own fsync, exactly as
+  before group commit. The status RPC reports the config and the
+  batching stats (`group_commit`: batches, entries, fsyncs,
+  largest batch) so the batching ratio is visible live.
 - **Leader lease reads** — a leader that heard acks from a majority
   within the last 100ms (shorter than any follower's 150ms minimum
   election timeout, so no new leader can have been elected since)
@@ -299,7 +308,7 @@ make test
 # or: python3 -m unittest discover -s tests -v
 ```
 
-147 tests, plus a smoke test for the benchmark script, all passing:
+151 tests, plus a smoke test for the benchmark script, all passing:
 
 | Test | What it proves |
 |---|---|
@@ -335,6 +344,10 @@ make test
 | `test_lagging_follower_catches_up_quickly` | 200 entries to a down follower replicate and apply well inside 5s |
 | `test_concurrent_writes_share_one_leader_fsync` | 5 concurrent client writes cost the leader's log exactly 1 fsync, and all 5 replicate to every node |
 | `test_sequential_writes_each_fsync_once` | Sequential writes each pay their own fsync — batching only merges real concurrency |
+| `test_concurrent_writes_share_one_fsync_in_stats` | 5 concurrent writes cost 1 fsync and the group-commit stats (and status RPC) say so |
+| `test_acked_writes_survive_crash_restart` | 10 acked batched writes all survive a leader stop/restart from the same data dir |
+| `test_window_zero_disables_batching` | Window 0: 5 concurrent writes cost 5 fsyncs, sequential writes 1 each — exactly as before group commit |
+| `test_max_batch_caps_batch_and_flushes_early` | Max batch 3 turns 6 concurrent writes into exactly 2 batches of 3, flushed on fill, not on the window |
 | `test_add_fourth_node_catches_up_and_serves_reads` | A 4th node added to a live cluster catches up and serves reads |
 | `test_add_server_already_a_member_is_rejected` | Adding a server that is already a member is rejected |
 | `test_remove_node_cluster_keeps_working` | Removing a node leaves a working 2-node cluster; the removed node stops participating |
@@ -982,3 +995,30 @@ entries left in `log.jsonl` are dropped by their index on reload.
   the 12s client timeout leaves the first attempt running on the
   server and every retry answering "already in progress" instead of
   the change's outcome.
+- ~~Configurable group commit~~ — done in v0.26.0, Nov 23, 2026:
+  group commit (v0.7.0) had a hardcoded 2ms window and no
+  visibility; now the window and the per-batch cap are knobs
+  (`group_commit_window_ms`, `group_commit_max_batch`, on the
+  `RaftNode` constructor and the server CLI), a full batch flushes
+  as soon as it fills instead of waiting out the window, a writer
+  arriving at a full batch waits for the flusher to take it and
+  opens the next one (so no batch ever exceeds the cap), window 0
+  disables batching entirely — every write its own batch and fsync,
+  exactly as before group commit — and the status RPC carries a
+  `group_commit` object with the config and the stats (batches,
+  entries, fsyncs, largest batch). Safety is unchanged: the batch
+  fsync still happens before any waiter is woken, so no entry is
+  acked or considered committed before it is durable.
+  `tests/test_groupcommit_config.py` proves it: 5 concurrent writes
+  cost 1 fsync and the stats say so (and the status RPC agrees), 10
+  acked batched writes all survive a leader stop/restart from the
+  same data dir, window 0 costs 5 fsyncs for 5 concurrent writes
+  and 1 per sequential write, and a max batch of 3 turns 6
+  concurrent writes into exactly 2 batches of 3. The membership /
+  snapshot story is complete, so the next real thing is the
+  concurrent-read transport bottleneck the benchmark already
+  measured: with ten clients hammering the leader, concurrent reads
+  sit at ~185 ops/s and one read took ~1s in the transport layer
+  even though zero confirmation rounds were served — persistent
+  client connections / connection pooling on the transport, so a
+  read stops paying a fresh TCP connection each time.

@@ -127,8 +127,16 @@ MEMBERSHIP_CATCHUP_TIMEOUT = 5.0
 # for concurrent client writes to join it before flushing. 2ms is
 # long enough for threads woken together to pile in, and short enough
 # that a lone sequential write barely notices it — it pays one window
-# instead of one fsync per write either way.
-GROUP_COMMIT_WINDOW = 0.002
+# instead of one fsync per write either way. 0 disables batching: the
+# first writer flushes immediately, so every write pays its own fsync
+# exactly as before group commit existed (see group_commit_window_ms).
+GROUP_COMMIT_WINDOW_MS = 2.0
+# Leader-side group commit: at most this many client writes per batch.
+# 0 means no cap — the batch is whatever piles in during the window.
+# A positive cap makes the flusher flush as soon as the batch fills,
+# instead of waiting out the rest of the window (see
+# group_commit_max_batch).
+GROUP_COMMIT_MAX_BATCH = 0
 # Client session deduplication (at-most-once writes): how many applied
 # (client_id, request_id) pairs the dedup table keeps. 10000 is far
 # above what a retry window needs, and evicting the oldest is
@@ -176,6 +184,8 @@ class RaftNode:
         pipeline_window: int = PIPELINE_WINDOW,
         pipeline_batch_size: int = PIPELINE_BATCH_SIZE,
         membership_catchup_timeout: float = MEMBERSHIP_CATCHUP_TIMEOUT,
+        group_commit_window_ms: float = GROUP_COMMIT_WINDOW_MS,
+        group_commit_max_batch: int = GROUP_COMMIT_MAX_BATCH,
     ) -> None:
         """
         node_id: this node's id, e.g. "node1".
@@ -196,6 +206,18 @@ class RaftNode:
         membership_catchup_timeout: how long an add waits for the new
             server to catch up before giving up (see
             MEMBERSHIP_CATCHUP_TIMEOUT).
+        group_commit_window_ms: how long the first writer in a
+            leader-side group-commit batch waits for concurrent client
+            writes to join it before flushing (see
+            GROUP_COMMIT_WINDOW_MS). 0 disables batching: each write
+            flushes immediately, one fsync per write, exactly as
+            before group commit.
+        group_commit_max_batch: at most this many client writes per
+            leader-side batch (see GROUP_COMMIT_MAX_BATCH). 0 means no
+            cap. A positive cap flushes the batch as soon as it fills
+            instead of waiting out the window, and a writer arriving
+            at a full batch waits for the flusher to take it, then
+            opens the next batch — so no batch ever exceeds the cap.
         """
         self.id = node_id
         self.peers = dict(peers)
@@ -218,6 +240,20 @@ class RaftNode:
         self.pipeline_window = pipeline_window
         self.pipeline_batch_size = pipeline_batch_size
         self.membership_catchup_timeout = membership_catchup_timeout
+        # Group commit knobs (see _submit_write): the window in
+        # seconds, and the per-batch cap (0 = unbounded).
+        self.group_commit_window = max(0.0, group_commit_window_ms) / 1000.0
+        self.group_commit_window_ms = max(0.0, group_commit_window_ms)
+        self.group_commit_max_batch = max(0, group_commit_max_batch)
+        # Group-commit stats, for the status RPC (see
+        # _group_commit_status): every log append is one batch and one
+        # fsync, so batches == fsyncs for the log — the interesting
+        # numbers are entries per batch and the largest batch seen.
+        # In-memory only: a restart resets them. Updated in
+        # _append_log_entries, which every log append goes through
+        # with the lock held.
+        self._group_commit = {"batches": 0, "entries": 0, "fsyncs": 0,
+                              "largest_batch": 0}
 
         # Membership (Raft §6). ``config`` is the voting configuration:
         # every server that counts toward a majority, mapped to its
@@ -382,9 +418,17 @@ class RaftNode:
         # on their own, so one fsync covers several client requests.
         # A batch is a list of {"command", "index", "event", "result"};
         # None means no batch is open. The first writer in a batch is
-        # its flusher: it waits GROUP_COMMIT_WINDOW for joiners, then
+        # its flusher: it waits group_commit_window for joiners, then
         # appends the whole batch with a single fsync.
         self._write_batch: list[dict] | None = None
+        # _batch_ready is set when a batch fills up to
+        # group_commit_max_batch, so the flusher flushes at once
+        # instead of waiting out the window. _batch_taken is set when
+        # the flusher takes the open batch (see _flush_write_batch),
+        # so a writer that arrived at a full batch knows it can open
+        # the next one. Both are cleared when a new batch is opened.
+        self._batch_ready = threading.Event()
+        self._batch_taken = threading.Event()
         # Client session deduplication (at-most-once writes): applied
         # (client_id, request_id) -> cached {"status": "ok"} result.
         # A retry of a write whose response was lost returns the cached
@@ -584,8 +628,15 @@ class RaftNode:
         Every entry in the batch is written and flushed before the one
         fsync, so a crash can never leave a later entry durable while
         an earlier one is lost — the batch is durable as a unit. Call
-        with the lock held.
+        with the lock held. Also records the batch in the group-commit
+        stats (see _group_commit_status).
         """
+        if entries:
+            self._group_commit["batches"] += 1
+            self._group_commit["entries"] += len(entries)
+            self._group_commit["fsyncs"] += 1
+            self._group_commit["largest_batch"] = max(
+                self._group_commit["largest_batch"], len(entries))
         with open(self._log_path, "a", encoding="utf-8") as f:
             for entry in entries:
                 f.write(json.dumps(entry) + "\n")
@@ -1021,6 +1072,24 @@ class RaftNode:
             "removal_pending": dict(self._removal_pending),
         }
 
+    def _group_commit_status(self) -> dict:
+        """The group-commit config and stats, for the status RPC. Lock
+        held. ``batches`` counts log appends (leader batches, follower
+        AppendEntries batches, and single entries like the election
+        no-op — each is one fsync), ``entries`` counts the entries in
+        them, and ``fsyncs`` counts the log fsyncs, so the batching
+        ratio is entries / fsyncs: 1.0 with the window disabled, well
+        above it under concurrent load."""
+        stats = self._group_commit
+        return {
+            "window_ms": self.group_commit_window_ms,
+            "max_batch": self.group_commit_max_batch,
+            "batches": stats["batches"],
+            "entries": stats["entries"],
+            "fsyncs": stats["fsyncs"],
+            "largest_batch": stats["largest_batch"],
+        }
+
     def _init_peer_state(self, peer: str, next_index: int) -> None:
         """(Re)initialize all per-peer leader state for ``peer``. Lock
         held. Used by _become_leader for the whole cluster and when a
@@ -1401,6 +1470,7 @@ class RaftNode:
                     "lease_valid": self._lease_valid(),
                     "follower_lease_valid": self._follower_lease_valid(),
                     "confirm_rounds": self._confirm_rounds,
+                    "group_commit": self._group_commit_status(),
                     "config": sorted(self.config),
                     "joint_new": (sorted(self._joint_new)
                                   if self._joint_new is not None else None),
@@ -2176,11 +2246,17 @@ class RaftNode:
         Leader-side group commit: a write does not append on its own.
         It joins the currently open batch (or opens one, becoming its
         flusher), and the flusher appends the whole batch with a single
-        fsync once the batch window closes. Concurrent client writes
-        in the same window therefore share one fsync instead of paying
-        one each; a lone sequential write just pays the 2ms window.
-        Membership entries bypass this — they are rare, and their
-        caller tracks the entry's index directly.
+        fsync once the batch window closes — or as soon as the batch
+        fills up to group_commit_max_batch, if one is set. Concurrent
+        client writes in the same window therefore share one fsync
+        instead of paying one each; a lone sequential write just pays
+        the window. With group_commit_window_ms=0 the flusher does not
+        wait at all, so every write pays its own fsync exactly as
+        before group commit. A writer arriving at a full batch waits
+        for the flusher to take it, then opens the next batch, so no
+        batch ever exceeds the cap. Membership entries bypass this —
+        they are rare, and their caller tracks the entry's index
+        directly.
 
         Deduplication: a write carrying a (client_id, request_id) that
         is already applied returns the cached result without appending
@@ -2206,18 +2282,55 @@ class RaftNode:
                           "event": threading.Event(), "result": None}
                 if key is not None:
                     self._dedup_inflight[key] = waiter
-                if self._write_batch is None:
-                    self._write_batch = [waiter]
-                    flush_batch = True
-                else:
-                    self._write_batch.append(waiter)
             else:
                 waiter = join_waiter
+        if join_waiter is None:
+            # Place the waiter in a batch, outside the lock when we
+            # have to wait for a full batch to be taken. The flusher
+            # sets _batch_taken when it takes the batch; if it never
+            # does (it lost leadership without flushing, say) the wait
+            # times out and we join whatever batch is open instead of
+            # waiting forever — the cap is a batching knob, not a
+            # correctness gate.
+            place_deadline = time.monotonic() + CLIENT_COMMIT_TIMEOUT
+            while True:
+                with self.lock:
+                    if self._write_batch is None:
+                        self._write_batch = [waiter]
+                        self._batch_ready.clear()
+                        self._batch_taken.clear()
+                        flush_batch = True
+                        break
+                    full = (self.group_commit_max_batch > 0
+                            and len(self._write_batch)
+                            >= self.group_commit_max_batch)
+                    # With the window disabled there is no batching at
+                    # all: a writer never joins an open batch, it waits
+                    # for the flusher to take it and opens its own, so
+                    # every write is a batch of one and pays its own
+                    # fsync exactly as before group commit.
+                    if not full and self.group_commit_window > 0:
+                        self._write_batch.append(waiter)
+                        if (self.group_commit_max_batch > 0
+                                and len(self._write_batch)
+                                >= self.group_commit_max_batch):
+                            self._batch_ready.set()
+                        break
+                    if time.monotonic() >= place_deadline:
+                        # Stuck flusher: join anyway rather than wait
+                        # forever — the cap is a batching knob, not a
+                        # correctness gate.
+                        self._write_batch.append(waiter)
+                        break
+                    taken = self._batch_taken
+                taken.wait(timeout=1.0)
         if flush_batch:
             # Wait outside the lock so concurrent writes can join the
             # batch, then flush it: one append (one fsync) for all of
             # them, and one commit wait for the batch's last index.
-            time.sleep(GROUP_COMMIT_WINDOW)
+            # The wait ends early when the batch fills up
+            # (_batch_ready), and immediately when the window is 0.
+            self._batch_ready.wait(timeout=self.group_commit_window)
             self._flush_write_batch()
         waiter["event"].wait(timeout=CLIENT_COMMIT_TIMEOUT)
         result = waiter["result"]
@@ -2244,6 +2357,9 @@ class RaftNode:
             self._write_batch = None
             if not batch:
                 return
+            # The batch is taken: a writer waiting at a full batch may
+            # open the next one now (see _submit_write).
+            self._batch_taken.set()
             if self.role != "leader":
                 # Leadership was lost while the batch was forming: fail
                 # every waiter so it redirects instead of hanging.

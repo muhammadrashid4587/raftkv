@@ -25,12 +25,16 @@ class Cluster:
                  snapshot_threshold: int = 1000,
                  snapshot_chunk_size: int = 65536,
                  pipeline_window: int = 10,
-                 membership_catchup_timeout: float = 5.0):
+                 membership_catchup_timeout: float = 5.0,
+                 group_commit_window_ms: float = 2.0,
+                 group_commit_max_batch: int = 0):
         self.n = n
         self.snapshot_threshold = snapshot_threshold
         self.snapshot_chunk_size = snapshot_chunk_size
         self.pipeline_window = pipeline_window
         self.membership_catchup_timeout = membership_catchup_timeout
+        self.group_commit_window_ms = group_commit_window_ms
+        self.group_commit_max_batch = group_commit_max_batch
         self.tmp = tempfile.TemporaryDirectory(prefix="raftkv-test-")
         self.base = Path(base_dir) if base_dir else Path(self.tmp.name)
         self.nodes: dict[str, RaftNode] = {}
@@ -45,7 +49,9 @@ class Cluster:
                             snapshot_threshold=snapshot_threshold,
                             snapshot_chunk_size=snapshot_chunk_size,
                             pipeline_window=pipeline_window,
-                            membership_catchup_timeout=membership_catchup_timeout)
+                            membership_catchup_timeout=membership_catchup_timeout,
+                            group_commit_window_ms=group_commit_window_ms,
+                            group_commit_max_batch=group_commit_max_batch)
             self.nodes[node_id] = node
             self.addrs[node_id] = ("127.0.0.1", ports[node_id])
 
@@ -72,7 +78,9 @@ class Cluster:
                         snapshot_threshold=self.snapshot_threshold,
                         snapshot_chunk_size=self.snapshot_chunk_size,
                         pipeline_window=self.pipeline_window,
-                        membership_catchup_timeout=self.membership_catchup_timeout)
+                        membership_catchup_timeout=self.membership_catchup_timeout,
+                        group_commit_window_ms=self.group_commit_window_ms,
+                        group_commit_max_batch=self.group_commit_max_batch)
         self.nodes[node_id] = node
         host, port = self.addrs[node_id]
         node.start(host, port)
