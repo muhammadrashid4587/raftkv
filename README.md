@@ -99,6 +99,23 @@ logic and the failure handling, not the key-value API on top.
   first attempt's exact result — success or failure — instead of
   re-executing, and the result survives snapshots and leader changes
   with the dedup table.
+- **Read-your-writes sessions** — `raftkv.client.Session` is one
+  client under one `client_id`. Every write it acks advances its
+  watermark to the log index and term of that write's entry (write
+  responses now carry both, and a dedup retry reports the first
+  attempt's index), and every read it issues carries the watermark:
+  the serving node waits until it has applied up to that index
+  before answering, so a client that wrote through the leader and
+  then reads from any node — or from a new leader after a failover,
+  which holds the committed write in its log and applies it once it
+  commits its no-op entry — never sees its own write missing. A
+  session read never falls back to serving whatever happens to be
+  applied (that fallback exists only for plain reads); if the
+  watermark is not applied in time it times out and the client
+  retries. A watermark past the end of the node's log, or a term
+  that does not match the entry at that index, is an error, not a
+  wait. The CLI exposes the same read as `get --min-index N
+  --session-term T`.
 - **Watch/subscribe** — `node.watch.watch(key, callback)` (or
   `prefix=True` for a key prefix) fires the callback with
   `{"key", "value", "op"}` whenever a *committed* log entry changes
@@ -189,7 +206,7 @@ make test
 # or: python3 -m unittest discover -s tests -v
 ```
 
-100 tests, plus a smoke test for the benchmark script, all passing:
+107 tests, plus a smoke test for the benchmark script, all passing:
 
 | Test | What it proves |
 |---|---|
@@ -266,6 +283,13 @@ make test
 | `test_multi_writer_cas_expected_uses_weak_check` | A contended CAS expecting a value another writer wrote is legal; expecting a value nobody wrote is impossible |
 | `test_multi_writer_key_uses_weak_check` | A key written by several clients uses the weaker rule and is reported as such |
 | `test_concurrent_reads_and_writes_on_a_live_cluster` | Two writers and two readers on a real 3-node cluster: every observed read is linearizable |
+| `test_write_response_carries_log_index_and_term` | A write response names its log index and term; the session watermark tracks them |
+| `test_session_read_after_write_sees_write_from_any_node` | A session read from any node sees the session's own write, overwrite, and delete |
+| `test_read_your_writes_across_leader_failover` | A session read right after killing the leader still sees its write, via the new leader |
+| `test_session_read_with_unknown_index_errors_not_stale` | A read naming an index past the log errors instead of serving stale state |
+| `test_session_read_with_wrong_term_errors` | A read naming the right index with the wrong term errors; the right term serves |
+| `test_dedup_retry_returns_same_index` | A retried write reports the first attempt's index and appends no second entry |
+| `test_session_get_without_writes_reads_normally` | A fresh session (watermark 0) reads like a plain ReadIndex read; CAS advances the watermark |
 
 Tests use real nodes (real TCP, real threads, real disk) on localhost —
 no mocks of the consensus path.
@@ -315,7 +339,8 @@ raftkv/
   store.py       KVStore: the deterministic state machine (SET/GET/DEL)
   linearizability.py  History/Op: record concurrent ops, verify linearizability
   server.py      Node CLI: --id --port --peers --data-dir
-  client.py      Client CLI: set/get/del with leader-redirect following
+  client.py      Client CLI: set/get/del with leader-redirect following;
+                 Session: read-your-writes client sessions
 tests/
   harness.py     In-process 3-node cluster fixture
   test_raft.py       Election, replication, redirects, persistence
@@ -383,7 +408,13 @@ entries left in `log.jsonl` are dropped by their index on reload.
   new leader can have been elected since those acks, and the read is
   served straight from applied state. A stale lease falls back to
   the round, and stepping down clears the lease, so a deposed leader
-  can never serve from an old one.
+  can never serve from an old one. Since v0.16.0 a read may also
+  carry a session watermark (the index of the client's last
+  acknowledged write): the read index is then the max of the commit
+  index and the watermark, so the read waits until the session's own
+  writes are applied — across a failover as well as on the same
+  leader — and a session read times out instead of falling back to
+  stale applied state.
 - **Commit rule.** A leader only advances `commit_index` for entries
   from its *own* term, counting replicas — never for old-term entries
   alone. Committing a current-term entry transitively commits
@@ -613,3 +644,14 @@ entries left in `log.jsonl` are dropped by their index on reload.
   with seeds 7 and 42: 276 and 610 successful CAS respectively, 49
   and 107 failed races, zero lost, all nodes converged,
   linearizability ok.
+- ~~Read-your-writes client sessions~~ — done in v0.16.0, Nov 22,
+  2026: `raftkv.client.Session` carries a watermark — the log index
+  and term of the client's last acknowledged write — and every read
+  it issues waits until the serving node has applied that far, so a
+  client never sees its own write missing, including across a
+  leader failover; write responses now carry their entry's index
+  and term, a dedup retry reports the first attempt's index, and a
+  session read times out rather than falling back to stale applied
+  state. `tests/test_session.py` covers the watermark, reads from
+  any node, failover, unknown-index and wrong-term errors, and
+  dedup retries reporting the same index.

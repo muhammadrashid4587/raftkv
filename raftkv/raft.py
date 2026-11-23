@@ -817,7 +817,8 @@ class RaftNode:
                 # _flush_write_batch). Set/del return None: their
                 # outcome is always ok.
                 result = self.sm.apply(entry["command"])
-                self._record_dedup(entry["command"], result)
+                self._record_dedup(entry["command"], result,
+                                   self.last_applied, entry["term"])
                 # Watches fire on committed changes only, in log
                 # order, from the apply path — so a watcher on any
                 # node sees exactly the changes that committed, and a
@@ -853,22 +854,32 @@ class RaftNode:
         # covered by the state machine can be served.
         self._resolve_pending_reads()
 
-    def _record_dedup(self, command: dict, result: dict | None = None) -> None:
+    def _record_dedup(self, command: dict, result: dict | None = None,
+                      index: int | None = None,
+                      term: int | None = None) -> None:
         """Record an applied client write in the dedup table. Lock held.
         The cached result is what a retry with the same session id gets
         back instead of a second log entry. For set/del the result is
         always ok once committed; for CAS it is the apply-time outcome
         (success, mismatch, or missing key), so a retry returns the
-        first attempt's exact result. Evicting the oldest entry when
-        the table is full is deterministic — every node applies the
-        same log in the same order, so every node's table stays
-        identical."""
+        first attempt's exact result. The result also carries the log
+        index and term of the entry that produced it: a retried write
+        reports the same index as the first attempt, and a client
+        session uses that index as its read-your-writes watermark —
+        the index of its last acknowledged write. Evicting the oldest
+        entry when the table is full is deterministic — every node
+        applies the same log in the same order, so every node's table
+        stays identical."""
         key = _dedup_key(command)
         if key is None:
             return
-        self._dedup[key] = (
-            dict(result) if result is not None
-            else {"type": "client_response", "status": "ok"})
+        recorded = (dict(result) if result is not None
+                    else {"type": "client_response", "status": "ok"})
+        if index is not None:
+            recorded["index"] = index
+        if term is not None:
+            recorded["term"] = term
+        self._dedup[key] = recorded
         while len(self._dedup) > DEDUP_MAX_ENTRIES:
             self._dedup.pop(next(iter(self._dedup)))
 
@@ -1251,7 +1262,25 @@ class RaftNode:
             return {"type": "client_response", "status": "error",
                     "error": "this node was removed from the cluster"}
         if op == "get":
-            return self._serve_read(key)
+            # A read-your-writes session read carries the index (and
+            # term) of the client's last acknowledged write; the
+            # serving node waits until it has applied that far, so the
+            # client never sees its own write missing — including
+            # after a failover to a new leader. Plain reads send
+            # neither field and behave exactly as before.
+            try:
+                min_index = int(msg.get("min_commit_index") or 0)
+                session_term = msg.get("session_term")
+                session_term = (int(session_term)
+                                if session_term is not None else None)
+            except (TypeError, ValueError):
+                return {"type": "client_response", "status": "error",
+                        "error": "min_commit_index and session_term "
+                                 "must be integers"}
+            if min_index < 0:
+                return {"type": "client_response", "status": "error",
+                        "error": "min_commit_index must be >= 0"}
+            return self._serve_read(key, min_index, session_term)
         command = {"op": op, "key": key}
         if op == "set":
             command["value"] = msg.get("value")
@@ -1534,6 +1563,11 @@ class RaftNode:
             last_index = self._append_entries(entries)
             for i, w in enumerate(batch):
                 w["index"] = last_index - len(batch) + 1 + i
+                # The term of the entry itself, not the term when the
+                # waiter is woken: leadership may have changed hands
+                # in between, and the session token must name the
+                # entry's own term.
+                w["term"] = self.current_term
             peers = list(self.peers)
 
         # Replicate in parallel; each thread updates match/next and may
@@ -1582,7 +1616,14 @@ class RaftNode:
             for w in batch:
                 own = (self._apply_results.get(w["index"])
                        if result.get("status") == "ok" else None)
-                w["result"] = dict(own) if own is not None else result
+                w["result"] = dict(own) if own is not None else dict(result)
+                # Every committed write reports the log index (and term)
+                # of its own entry: the client session uses it as its
+                # read-your-writes watermark, and a retried write
+                # reports the same index as the first attempt.
+                if w["index"] is not None:
+                    w["result"]["index"] = w["index"]
+                    w["result"]["term"] = w.get("term")
                 w["event"].set()
                 self._clear_inflight(w)
             for w in batch:
@@ -1629,10 +1670,18 @@ class RaftNode:
             p["event"].set()
         self._pending_reads = []
 
-    def _serve_read(self, key: str) -> dict:
+    def _serve_read(self, key: str, min_index: int = 0,
+                    session_term: int | None = None) -> dict:
         """ReadIndex read (Raft dissertation §6.4).
 
-        1. Record read_index = commit_index while leader in this term.
+        1. Record read_index = commit_index while leader in this term —
+           or the session's last acknowledged write index, whichever is
+           higher: a read-your-writes session must not be served from
+           state that predates its own write, so the read waits until
+           the state machine has applied at least that far. A new
+           leader after a failover holds the committed write in its
+           log (Raft's election restriction), so the wait ends as soon
+           as it commits its no-op entry and applies the prefix.
         2. Confirm leadership — with a heartbeat round to a majority,
            unless the leader lease is still valid: a majority acked
            within LEADER_LEASE_DURATION, which is shorter than any
@@ -1642,23 +1691,43 @@ class RaftNode:
            round and is caught there.
         3. Wait until the state machine has applied up to read_index;
            only then is the local state guaranteed to include every
-           write committed before the read started. The wait registers
-           a pending read, resolved by _apply_committed once the apply
-           index catches up — no log entry is written for the read.
+           write committed before the read started, plus the session's
+           own writes. The wait registers a pending read, resolved by
+           _apply_committed once the apply index catches up — no log
+           entry is written for the read.
         4. If leadership is lost mid-read, redirect (the client follows
            it to the new leader) — never serve from a deposed leader.
            If apply stalls past READ_INDEX_TIMEOUT while we are still
-           leader in this term, fall back to the old heartbeat-confirmed
-           read of whatever is applied: on this leader apply is
-           synchronous with commit advancement under the same lock, so
-           last_applied == commit_index whenever we hold leadership,
-           and the fallback is exactly the previous behaviour.
+           leader in this term, a plain read falls back to the old
+           heartbeat-confirmed read of whatever is applied: on this
+           leader apply is synchronous with commit advancement under
+           the same lock, so last_applied == commit_index whenever we
+           hold leadership, and the fallback is exactly the previous
+           behaviour. A session read never takes that fallback — it
+           would serve state that predates the session's write — so
+           it times out instead and the client retries.
+        A session index past the end of this node's log, or a term
+        that does not match the entry at that index (while the entry
+        is still in the log — past the snapshot it cannot be checked,
+        but then it is already applied), is an error, not a wait: the
+        token names a write this node cannot have.
         """
         with self.lock:
             if self.role != "leader":
                 return self._redirect()
             term = self.current_term
-            read_index = self.commit_index
+            if min_index > self._last_log_index():
+                return {"type": "client_response", "status": "error",
+                        "error": f"session write at index {min_index} "
+                                 "is not in this node's log"}
+            if (session_term is not None
+                    and min_index > self.snapshot_index
+                    and self._term_at(min_index) != session_term):
+                return {"type": "client_response", "status": "error",
+                        "error": f"session term mismatch at index "
+                                 f"{min_index}: expected term "
+                                 f"{session_term}"}
+            read_index = max(self.commit_index, min_index)
             lease_ok = self._lease_valid()
         if not lease_ok and not self._confirm_leadership(term):
             with self.lock:
@@ -1687,8 +1756,17 @@ class RaftNode:
             with self.lock:
                 self._unregister_pending_read(event)
         # Fallback: apply stalled past the timeout, but we are still
-        # leader in this term — re-confirm leadership and read whatever
-        # is applied, exactly like the old heartbeat-confirmed read.
+        # leader in this term. A session read never takes it: serving
+        # whatever happens to be applied could return state that
+        # predates the session's own write, which is exactly the stale
+        # read the session exists to prevent — so it times out and the
+        # client retries against the leader once it has caught up.
+        if min_index > 0:
+            return {"type": "client_response", "status": "timeout",
+                    "error": "session write not yet applied; "
+                             "retry the read"}
+        # A plain read re-confirms leadership and reads whatever is
+        # applied, exactly like the old heartbeat-confirmed read.
         if not self._confirm_leadership(term):
             with self.lock:
                 if self.role != "leader":
