@@ -148,6 +148,22 @@ def _dedup_key(command: dict) -> tuple[str, str] | None:
     return (str(client_id), str(request_id))
 
 
+def _config_list_of(config: dict[str, tuple[str, int] | None]) -> list:
+    """A config dict as JSON: [[id, [host, port] | null], ...] in
+    sorted id order, so meta.json and snapshot.json agree."""
+    return [[mid, (list(addr) if addr else None)]
+            for mid, addr in sorted(config.items())]
+
+
+def _config_dict_of(entries: list | None) -> dict[str, tuple[str, int] | None] | None:
+    """The inverse of _config_list_of: a JSON config list back into a
+    dict, or None when there is no config to adopt."""
+    if entries is None:
+        return None
+    return {str(mid): (tuple(addr) if addr else None)
+            for mid, addr in entries}
+
+
 class RaftNode:
     def __init__(
         self,
@@ -235,6 +251,21 @@ class RaftNode:
         # is already out of self.config, so it cannot vote or count
         # toward a majority while it catches up on its own removal.
         self._removal_pending: dict[str, int] = {}
+        # Joint consensus (Raft dissertation §6). While a membership
+        # change is mid-flight, ``_joint_new`` holds C-new and
+        # ``config`` still holds C-old: the joint config C-old,new is
+        # in effect, and every quorum check (commit, election, lease)
+        # needs a majority of BOTH configs. The final config entry
+        # adopts C-new and clears this. Persisted in meta.json and
+        # snapshot.json, so a restart mid-transition resumes in joint
+        # phase instead of forgetting the change halfway.
+        self._joint_new: dict[str, tuple[str, int] | None] | None = None
+        # True while a thread is driving the final config entry that
+        # completes a joint transition (see _complete_joint_transition):
+        # exactly one driver, so a leader that applies a joint entry
+        # and the client thread that submitted it cannot each append
+        # their own final entry.
+        self._joint_completion_running = False
         # This node's own address once start() runs; recorded into the
         # config so other members learn it from the log/snapshot.
         self._self_addr: tuple[str, int] | None = None
@@ -383,6 +414,7 @@ class RaftNode:
 
     def _load_persistent_state(self) -> None:
         meta_config = False
+        meta_joint = False
         if self._meta_path.exists():
             with open(self._meta_path, "r", encoding="utf-8") as f:
                 meta = json.load(f)
@@ -400,6 +432,13 @@ class RaftNode:
                     str(mid): (tuple(addr) if addr else None)
                     for mid, addr in meta["config"]
                 }
+            # The joint phase as of the last applied prefix, same
+            # newest-first rule: meta.json written before joint
+            # consensus existed has no "joint_new" key, so the
+            # snapshot's value (or none) stands.
+            if "joint_new" in meta:
+                meta_joint = True
+                self._joint_new = _config_dict_of(meta["joint_new"])
         # The snapshot comes first: it defines the state machine's
         # starting point and which log indices are already covered.
         if self._snapshot_path.exists():
@@ -436,6 +475,10 @@ class RaftNode:
                     str(mid): (tuple(addr) if addr else None)
                     for mid, addr in snap["config"]
                 }
+            # The joint phase as of the snapshot, unless meta.json
+            # (newer) already supplied one above.
+            if snap.get("joint_new") is not None and not meta_joint:
+                self._joint_new = _config_dict_of(snap["joint_new"])
         # The address book follows the config: every voting member
         # except this node. A stale --peers list on the command line
         # cannot resurrect a removed server, and a server added since
@@ -480,6 +523,10 @@ class RaftNode:
             "voted_for": self.voted_for,
             "commit_index": self.commit_index,
             "config": self._config_list(),
+            # C-new while a joint transition is in flight (None
+            # otherwise): a restart mid-transition resumes in joint
+            # phase instead of forgetting the change halfway.
+            "joint_new": self._joint_list(),
         }
         tmp = self._meta_path.with_suffix(".json.tmp")
         with open(tmp, "w", encoding="utf-8") as f:
@@ -543,6 +590,10 @@ class RaftNode:
             "last_included_term": self.snapshot_term,
             "state": self.sm.items(),
             "config": self._config_list(),
+            # C-new while a joint transition is in flight: a snapshot
+            # taken mid-transition carries it, so a follower that
+            # installs the snapshot resumes in joint phase.
+            "joint_new": self._joint_list(),
             # The dedup table as [client_id, request_id, result]
             # triples: a CAS result is part of the reply a retry must
             # get back, so it rides in the snapshot with the key.
@@ -579,31 +630,133 @@ class RaftNode:
     def _config_list(self) -> list:
         """The voting config as JSON: [[id, [host, port] | null], ...]
         in sorted id order, so meta.json and snapshot.json agree."""
-        return [[mid, (list(addr) if addr else None)]
-                for mid, addr in sorted(self.config.items())]
+        return _config_list_of(self.config)
+
+    def _joint_list(self) -> list | None:
+        """C-new as JSON while a joint transition is in flight, else
+        None. Persisted alongside the config so a restart resumes in
+        the joint phase."""
+        if self._joint_new is None:
+            return None
+        return _config_list_of(self._joint_new)
+
+    def _has_quorum(self, holders: set[str]) -> bool:
+        """True if ``holders`` (servers holding an entry, granting a
+        vote, or acking recently — always including this node itself)
+        form a quorum. Outside a transition that is a majority of the
+        voting config; inside a joint transition (Raft dissertation
+        §6) it is a majority of BOTH C-old and C-new. That is the
+        whole safety point of joint consensus: a majority of the old
+        config alone cannot commit anything while the transition is
+        open, so an old leader and a new leader can never both win in
+        the same term, and a new leader that inherits the joint config
+        still needs the new servers' agreement."""
+        if self._joint_new is None:
+            return (len(holders & set(self.config))
+                    >= self._majority())
+        old = set(self.config)
+        new = set(self._joint_new)
+        return (len(holders & old) >= len(old) // 2 + 1
+                and len(holders & new) >= len(new) // 2 + 1)
 
     def _is_removed(self) -> bool:
         """True once this node has applied a config entry removing it:
         it is no longer a voting member, so it must not vote, run for
         election, or serve client requests. Derived from the config, so
-        a restart of a removed node stays removed."""
-        return self.id not in self.config
+        a restart of a removed node stays removed. During a joint
+        transition a server in C-new but not yet in C-old (being added)
+        is still a member — it votes in the new config — so it is not
+        removed; a server in C-old but not C-new (being removed) is
+        still a member until the final entry applies."""
+        if self.id in self.config:
+            return False
+        return self._joint_new is None or self.id not in self._joint_new
 
     def _rebuild_peers_from_config(self) -> None:
         """Reset the address book from the voting config (every member
         except this node). Non-voting catch-up peers are re-added by
         the leader when it drives an add; a plain restart never
-        resurrects a removed server from a stale --peers list."""
-        self.peers = {mid: addr for mid, addr in self.config.items()
+        resurrects a removed server from a stale --peers list. During
+        a joint transition the address book is the union of both
+        configs: the leader must replicate to every server in either
+        one, including a server being added (in C-new only) and a
+        server being removed (in C-old only)."""
+        members = dict(self._joint_new or {})
+        members.update(self.config)
+        self.peers = {mid: addr for mid, addr in members.items()
                       if mid != self.id and addr is not None}
 
     def _apply_config_entry(self, command: dict) -> None:
         """Apply one committed membership command to the config. Lock
         held. Called from _apply_committed instead of the KV state
-        machine: membership is Raft state, not key-value data."""
+        machine: membership is Raft state, not key-value data.
+
+        Two-phase changes (joint consensus, Raft dissertation §6):
+        a ``joint_config`` entry opens the transition — C-old,new is
+        in effect from here, so every quorum needs a majority of both
+        configs — and a ``final_config`` entry closes it by adopting
+        C-new. The old single-entry ``add_server`` / ``remove_server``
+        commands are still applied on replay (logs written before
+        joint consensus exist), but no new change uses them.
+        """
         op = command.get("op")
         server_id = command.get("server_id")
-        if op == "add_server":
+        if op == "joint_config":
+            # Enter the joint phase. The config itself stays C-old
+            # until the final entry applies; _joint_new holds C-new,
+            # and _has_quorum requires a majority of both from now
+            # on. The address book becomes the union, so the leader
+            # replicates to every server in either config.
+            self._joint_new = _config_dict_of(command.get("new"))
+            for mid, addr in (self._joint_new or {}).items():
+                if mid != self.id and addr is not None:
+                    self.peers.setdefault(mid, tuple(addr))
+                    if (self.role == "leader"
+                            and mid not in self.next_index):
+                        # A server the leader first meets through this
+                        # entry (no catch-up ran for it — e.g. a new
+                        # leader inherited the joint config) has no
+                        # leader state yet: replicate the whole log to
+                        # it from index 1. The driver would heal this
+                        # on its own via the reject/backoff path, but
+                        # starting at 1 skips the wasted round trip.
+                        # A catch-up peer that already has state keeps
+                        # it: the guard never clobbers match_index.
+                        self._init_peer_state(mid, 1)
+            # A leader that just applied a joint entry must drive the
+            # transition to its end: if it does not, the cluster sits
+            # in joint phase forever and every later membership change
+            # is rejected. This fires for the leader that submitted
+            # the entry (its own client thread joins the same driver)
+            # and for a leader that inherited an uncommitted joint
+            # entry from a dead predecessor and only just committed
+            # it with its no-op. Followers do nothing — they cannot
+            # drive it.
+            if self.role == "leader":
+                threading.Thread(
+                    target=self._complete_joint_transition,
+                    daemon=True).start()
+        elif op == "final_config":
+            # Close the transition: adopt C-new, leave the joint
+            # phase. The one server that differs between the configs
+            # is the change itself: an added server stops being
+            # non-voting, a removed server gets the removal treatment
+            # (a leader that removed itself steps down here).
+            new_config = _config_dict_of(command.get("new"))
+            if new_config is None:
+                return
+            old_config = self.config
+            self.config = new_config
+            self._joint_new = None
+            self._rebuild_peers_from_config()
+            for mid in new_config:
+                if mid not in old_config:
+                    self._non_voting.discard(mid)
+            for mid in old_config:
+                if mid not in new_config:
+                    self._non_voting.discard(mid)
+                    self._apply_removal(mid, old_config)
+        elif op == "add_server":
             addr = command.get("addr")
             self.config[server_id] = tuple(addr) if addr else None
             if server_id != self.id and addr is not None:
@@ -612,45 +765,61 @@ class RaftNode:
         elif op == "remove_server":
             self.config.pop(server_id, None)
             self._non_voting.discard(server_id)
-            if server_id == self.id:
-                # This node was removed: stop participating at once. It
-                # keeps its server socket (a status query still answers)
-                # but it will not vote, run for election, or serve
-                # client requests, and a leader that removed itself
-                # steps down here — the removal entry is committed, so
-                # the cluster has already agreed on it.
-                self.role = "follower"
-                self.leader_id = None
-                self._fail_pending_reads()
-                self._reset_election_timer()
-            if self.role == "leader":
-                # This node is the leader and the removed server is
-                # someone else: keep replicating to it until its commit
-                # index reaches this entry (see _apply_append_reply),
-                # so it actually learns it was removed. Dropping it
-                # from self.peers here would cut off the heartbeats
-                # that carry the commit index, and the removed server
-                # would election-time-out forever. It is already out of
-                # self.config, so it cannot vote or count toward a
-                # majority in the meantime. self.last_applied is this
-                # entry's index: _apply_committed increments it before
-                # calling here.
-                self._removal_pending[server_id] = self.last_applied
-            else:
-                # Follower (or a node that just stepped down): it does
-                # not replicate, so the peer can leave the address book
-                # and the leader-state tables at once.
-                self.peers.pop(server_id, None)
-                for table in (self.next_index, self.match_index):
-                    table.pop(server_id, None)
-                self._in_flight.pop(server_id, None)
-                self._next_to_send.pop(server_id, None)
-                self._pipeline_epoch.pop(server_id, None)
-                self._pipeline_acks.pop(server_id, None)
-                self._max_in_flight.pop(server_id, None)
-                self._peer_retry_after.pop(server_id, None)
-                self._pipeline_failures.pop(server_id, None)
-                self._replicating.discard(server_id)
+            self._apply_removal(server_id)
+
+    def _apply_removal(self, server_id: str,
+                       old_config: dict | None = None) -> None:
+        """Bookkeeping for a server leaving the config. Lock held.
+
+        A removed server stops participating at once: if it is this
+        node, step down (it will not vote, run for election, or serve
+        client requests). A leader that removed someone else keeps
+        replicating to it until its commit index reaches this entry
+        (see _apply_append_reply), so it actually learns it was
+        removed instead of timing out forever — the peer is already
+        out of the config, so it cannot vote or count toward a
+        majority in the meantime. Dropping it from self.peers here
+        would cut off the heartbeats that carry the commit index.
+        A follower (or a node that just stepped down) drops the peer
+        from the address book and the leader-state tables at once.
+        ``old_config`` is the pre-change config, so a leader closing
+        a joint removal can put the removed server's address back in
+        its address book: _rebuild_peers_from_config dropped it when
+        the config changed, and the removal-pending replication needs
+        an address to send to."""
+        if server_id == self.id:
+            # This node was removed: stop participating at once. It
+            # keeps its server socket (a status query still answers)
+            # but it will not vote, run for election, or serve
+            # client requests, and a leader that removed itself
+            # steps down here — the removal entry is committed, so
+            # the cluster has already agreed on it.
+            self.role = "follower"
+            self.leader_id = None
+            self._fail_pending_reads()
+            self._reset_election_timer()
+        if self.role == "leader":
+            addr = (old_config or {}).get(server_id)
+            if addr is not None and server_id != self.id:
+                self.peers[server_id] = tuple(addr)
+            # self.last_applied is this entry's index: _apply_committed
+            # increments it before calling here.
+            self._removal_pending[server_id] = self.last_applied
+        else:
+            # Follower (or a node that just stepped down): it does
+            # not replicate, so the peer can leave the address book
+            # and the leader-state tables at once.
+            self.peers.pop(server_id, None)
+            for table in (self.next_index, self.match_index):
+                table.pop(server_id, None)
+            self._in_flight.pop(server_id, None)
+            self._next_to_send.pop(server_id, None)
+            self._pipeline_epoch.pop(server_id, None)
+            self._pipeline_acks.pop(server_id, None)
+            self._max_in_flight.pop(server_id, None)
+            self._peer_retry_after.pop(server_id, None)
+            self._pipeline_failures.pop(server_id, None)
+            self._replicating.discard(server_id)
 
     def _has_uncommitted_config_entry(self) -> bool:
         """True if the log holds a membership entry past the commit
@@ -659,7 +828,9 @@ class RaftNode:
         enforces one change at a time."""
         return any(
             entry["index"] > self.commit_index
-            and entry["command"].get("op") in ("add_server", "remove_server")
+            and entry["command"].get("op") in (
+                "add_server", "remove_server",
+                "joint_config", "final_config")
             for entry in self.log
         )
 
@@ -667,7 +838,13 @@ class RaftNode:
         """True while a membership change is being driven or sits
         uncommitted in the log. Lock held. A flag whose entry has
         since committed is stale — the change is done, so clear it
-        and let the next change through."""
+        and let the next change through. A joint phase with no
+        uncommitted entry left (the joint entry committed, the final
+        one not yet appended — e.g. the driving leader just died) is
+        still a change in progress: the next change must wait until
+        the new leader completes this one."""
+        if self._joint_new is not None:
+            return True
         flag = self._membership_change
         if flag is not None:
             idx = flag.get("index")
@@ -852,7 +1029,8 @@ class RaftNode:
             # leader to commit earlier terms) changes no state at all.
             # Everything else applies to the KV store exactly as before.
             op = entry["command"].get("op")
-            if op in ("add_server", "remove_server"):
+            if op in ("add_server", "remove_server",
+                      "joint_config", "final_config"):
                 self._apply_config_entry(entry["command"])
             elif op == "noop":
                 pass
@@ -957,14 +1135,17 @@ class RaftNode:
         for n in range(self._last_log_index(), self.commit_index, -1):
             if self._term_at(n) != self.current_term:
                 continue
-            count = 1  # the leader itself has it
-            # Only voting members count: a server being added may hold
-            # the entry too, but it is not a voter until its config
-            # entry commits, so its match_index must not advance the
-            # commit index.
-            count += sum(1 for pid, m in self.match_index.items()
-                         if m >= n and pid in self.config)
-            if count >= self._majority():
+            # Who holds entry n: the leader itself, plus every peer
+            # whose match_index reaches it. A server being added may
+            # hold it too, but it is not a voter until its config
+            # entry commits — _has_quorum intersects with the voting
+            # config(s), so its match_index must not advance the
+            # commit index on its own. During a joint transition the
+            # same holders must form a majority of BOTH configs.
+            holders = {self.id}
+            holders.update(pid for pid, m in self.match_index.items()
+                           if m >= n)
+            if self._has_quorum(holders):
                 self.commit_index = n
                 self._apply_committed()
                 self.commit_cond.notify_all()
@@ -1036,6 +1217,8 @@ class RaftNode:
                     "follower_lease_valid": self._follower_lease_valid(),
                     "confirm_rounds": self._confirm_rounds,
                     "config": sorted(self.config),
+                    "joint_new": (sorted(self._joint_new)
+                                  if self._joint_new is not None else None),
                     "peers": sorted(self.peers),
                     "removed": self._is_removed(),
                 }
@@ -1258,7 +1441,7 @@ class RaftNode:
             return self._install_snapshot_payload(
                 last_included_index, last_included_term,
                 msg.get("data") or {}, msg.get("config"),
-                msg.get("dedup"))
+                msg.get("dedup"), msg.get("joint_new"))
 
     def _on_snapshot_chunk(self, msg: dict, last_included_index: int,
                            last_included_term: int) -> dict:
@@ -1321,11 +1504,12 @@ class RaftNode:
         return self._install_snapshot_payload(
             last_included_index, last_included_term,
             payload.get("data") or {}, payload.get("config"),
-            payload.get("dedup"))
+            payload.get("dedup"), payload.get("joint_new"))
 
     def _install_snapshot_payload(self, last_included_index: int,
                                   last_included_term: int, data: dict,
-                                  config, dedup) -> dict:
+                                  config, dedup,
+                                  joint_new=None) -> dict:
         """Install a fully received snapshot (lock held).
 
         The follower replaces its state machine with the snapshot's
@@ -1361,6 +1545,19 @@ class RaftNode:
                     for mid, addr in config
                 }
                 self._rebuild_peers_from_config()
+            # The joint phase as of the snapshot: adopt it when the
+            # snapshot carries one. When it carries none, clear ours
+            # — but only if our applied frontier is inside the
+            # snapshot: the snapshot then covers every entry that
+            # could have put us in joint phase, so its silence is
+            # authoritative. If we applied past the snapshot (our
+            # joint entry sits in the log after it), keep our state:
+            # the entry is still in our log and still in effect.
+            if joint_new is not None:
+                self._joint_new = _config_dict_of(joint_new)
+                self._rebuild_peers_from_config()
+            elif self.last_applied <= last_included_index:
+                self._joint_new = None
             # The snapshot carries the dedup table for the entries it
             # covers (see _write_snapshot_file): adopt it, merged with
             # any keys this node already holds for entries past the
@@ -1518,12 +1715,12 @@ class RaftNode:
         Only the leader drives a change, and only one change at a time
         (see _membership_change_in_progress). An add first replicates
         the log to the new server as a non-voting peer and waits for it
-        to catch up; only then is the config entry appended, so the
-        cluster's majority never depends on a server that does not
-        have the log yet. A remove appends the entry straight away; a
-        leader that removes itself steps down as soon as the entry
-        commits (in _apply_config_entry). Runs on a connection thread;
-        the catch-up and commit waits happen outside the lock.
+        to catch up; only then is the change submitted, in two phases
+        (see _submit_joint_change): a joint_config entry (C-old,new),
+        then a final_config entry (C-new). A leader that removes
+        itself steps down as soon as the final entry commits (in
+        _apply_config_entry). Runs on a connection thread; the
+        catch-up and commit waits happen outside the lock.
         """
         op = msg.get("op")
         server_id = msg.get("server_id")
@@ -1609,9 +1806,8 @@ class RaftNode:
                 self._drop_catchup_peer(server_id)
             return {"type": "client_response", "status": "error",
                     "error": f"{server_id} did not catch up in time"}
-        command = {"op": "add_server", "server_id": server_id,
-                   "addr": [addr[0], addr[1]]}
-        return self._submit_config_entry(command)
+        # Caught up: the two-phase change (joint entry, then final).
+        return self._submit_joint_change("add_server", server_id, addr)
 
     def _drop_catchup_peer(self, server_id: str) -> None:
         """Forget a server whose add failed before its config entry was
@@ -1631,12 +1827,11 @@ class RaftNode:
         self._replicating.discard(server_id)
 
     def _remove_server(self, server_id: str) -> dict:
-        """Remove one server: append the config entry and wait for it to
-        commit. The entry is replicated to the removed server too (it
+        """Remove one server: the two-phase change (joint entry, then
+        final). The entry is replicated to the removed server too (it
         is still a peer until the entry is applied), so it learns of
         its own removal and stops participating. Caller holds no lock."""
-        command = {"op": "remove_server", "server_id": server_id}
-        return self._submit_config_entry(command)
+        return self._submit_joint_change("remove_server", server_id, None)
 
     def _submit_config_entry(self, command: dict) -> dict:
         """Append a membership command to the log, replicate it, wait
@@ -1671,6 +1866,96 @@ class RaftNode:
                             "error": "membership change did not commit in time"}
                 self.commit_cond.wait(timeout=remaining)
         return {"type": "client_response", "status": "ok"}
+
+    def _final_config_command(self) -> dict | None:
+        """The final_config entry that closes the joint transition in
+        progress: adopt C-new. Lock held; None when no transition is
+        open."""
+        if self._joint_new is None:
+            return None
+        return {"op": "final_config",
+                "new": _config_list_of(self._joint_new)}
+
+    def _complete_joint_transition(self) -> dict:
+        """Drive the open joint transition to its end: append the
+        final_config entry and wait for it to commit. Caller holds no
+        lock.
+
+        Exactly one thread drives: if another thread is already
+        driving, wait for it and report its outcome instead of
+        appending a second final entry. The driver can be the client
+        thread that submitted the joint entry, the thread
+        _apply_config_entry spawned when this leader applied it, or
+        the thread _become_leader spawned when a new leader inherited
+        it — all three funnel here. A driver that loses leadership
+        reports the failure; the next leader picks the transition up
+        again from _become_leader.
+        """
+        with self.lock:
+            if self._joint_new is None:
+                return {"type": "client_response", "status": "ok"}
+            if self._joint_completion_running:
+                driver = False
+            else:
+                self._joint_completion_running = True
+                driver = True
+        if not driver:
+            deadline = time.monotonic() + CLIENT_COMMIT_TIMEOUT
+            while time.monotonic() < deadline:
+                with self.lock:
+                    if self._joint_new is None:
+                        return {"type": "client_response", "status": "ok"}
+                    if not self._joint_completion_running:
+                        break
+                time.sleep(0.02)
+            with self.lock:
+                if self._joint_new is None:
+                    return {"type": "client_response", "status": "ok"}
+            return {"type": "client_response", "status": "timeout",
+                    "error": "joint transition did not complete in time"}
+        try:
+            with self.lock:
+                command = self._final_config_command()
+            if command is None:
+                return {"type": "client_response", "status": "ok"}
+            return self._submit_config_entry(command)
+        finally:
+            with self.lock:
+                self._joint_completion_running = False
+
+    def _submit_joint_change(self, change_op: str, server_id: str,
+                             addr: tuple[str, int] | None) -> dict:
+        """Two-phase membership change (Raft dissertation §6).
+
+        Phase one appends a joint_config entry (C-old,new): from the
+        moment it commits, every quorum — commit, election, lease —
+        needs a majority of BOTH configs, so an old-majority-only
+        quorum cannot commit anything and two leaders in one term
+        stay impossible while the configs differ. Phase two appends
+        the final_config entry (C-new) and waits for it to commit;
+        only then is the change done. If the leader dies between the
+        phases, the next leader completes the transition from
+        _become_leader, and a client that sees an error can retry:
+        the change is either already done (the final entry committed)
+        or still open (a new leader finishes it). Caller holds no lock.
+        """
+        with self.lock:
+            if self.role != "leader":
+                return self._redirect()
+            new_config = dict(self.config)
+            if change_op == "add_server":
+                new_config[server_id] = tuple(addr) if addr else None
+            else:  # remove_server
+                new_config.pop(server_id, None)
+            joint = {"op": "joint_config", "change_op": change_op,
+                     "server_id": server_id,
+                     "addr": [addr[0], addr[1]] if addr else None,
+                     "old": _config_list_of(self.config),
+                     "new": _config_list_of(new_config)}
+        result = self._submit_config_entry(joint)
+        if result.get("status") != "ok":
+            return result
+        return self._complete_joint_transition()
 
     def _redirect(self) -> dict:
         leader_id, addr = self.leader_info()
@@ -2063,13 +2348,17 @@ class RaftNode:
         if self.role != "leader":
             return False
         now = time.monotonic()
-        count = 1  # the leader itself
-        count += sum(
-            1 for p in self.config
-            if p != self.id
-            and now - self._last_ack.get(p, 0.0) <= LEADER_LEASE_DURATION
+        # The leader itself counts as one; a peer counts if it acked
+        # recently. _has_quorum intersects with the voting config(s),
+        # so a server being added never extends the lease — and during
+        # a joint transition the acking set must be a majority of BOTH
+        # configs.
+        holders = {self.id}
+        holders.update(
+            p for p, t in self._last_ack.items()
+            if now - t <= LEADER_LEASE_DURATION
         )
-        return count >= self._majority()
+        return self._has_quorum(holders)
 
     def _confirm_leadership(self, term: int) -> bool:
         """Heartbeat round: succeed only if a majority acks in this term.
@@ -2094,9 +2383,9 @@ class RaftNode:
         with self.lock:
             self._confirm_rounds += 1
             still_leader = self.role == "leader" and self.current_term == term
-            voting_acks = sum(1 for p, ok in acks.items()
-                              if ok and p in self.config)
-        return still_leader and (1 + voting_acks) >= self._majority()
+            holders = {self.id}
+            holders.update(p for p, ok in acks.items() if ok)
+        return still_leader and self._has_quorum(holders)
 
     # ------------------------------------------------------------------
     # Leader replication
@@ -2467,6 +2756,10 @@ class RaftNode:
             payload = json.dumps({
                 "data": self.sm.items(),
                 "config": self._config_list(),
+                # C-new while a joint transition is in flight, so a
+                # follower that installs this snapshot resumes in
+                # joint phase instead of forgetting the change.
+                "joint_new": self._joint_list(),
                 # The dedup table for the covered prefix, so the
                 # follower adopts it (see _on_install_snapshot) and a
                 # retry of a compacted-away write still dedups there.
@@ -2542,6 +2835,14 @@ class RaftNode:
                     # unlike an established follower, it is not assumed
                     # caught up to the log end.
                     self._init_peer_state(p, 1)
+                elif (self._joint_new is not None
+                        and p in self._joint_new and p not in self.config):
+                    # A server in C-new only (being added) may not
+                    # have the log yet. _non_voting is not persisted,
+                    # so a new leader that inherited the joint config
+                    # cannot tell a caught-up new server from a fresh
+                    # one — start it from 1 and let the log flow.
+                    self._init_peer_state(p, 1)
                 else:
                     self._init_peer_state(p, last + 1)
             # Append a no-op entry in this term. The commit rule only
@@ -2555,6 +2856,14 @@ class RaftNode:
             # the no-op is exactly the one entry left to dispatch.)
             self._append_entry({"term": self.current_term,
                                 "command": {"op": "noop"}})
+            # A leader that inherits a joint config must complete the
+            # transition: the change's driver may have died after the
+            # joint entry committed, and until the final entry lands
+            # the cluster refuses every new membership change.
+            complete_joint = self._joint_new is not None
+        if complete_joint:
+            threading.Thread(target=self._complete_joint_transition,
+                             daemon=True).start()
         # Assert leadership immediately so followers learn about it and
         # the commit index starts flowing.
         self._send_heartbeats()
@@ -2596,7 +2905,10 @@ class RaftNode:
         grant_lock = threading.Lock()
         max_term = [term_before]
         with self.lock:
-            voters = set(self.config)
+            # Voters are the union of both configs during a joint
+            # transition: a server in C-new only still votes, and
+            # _has_quorum needs its grant for the new majority.
+            voters = set(self.config) | set(self._joint_new or {})
 
         def _ask(peer: str) -> None:
             resp = self._send_peer_rpc(peer, msg)
@@ -2618,7 +2930,9 @@ class RaftNode:
         with self.lock:
             if max_term[0] > self.current_term:
                 self._step_down(max_term[0])
-        return len(grants) >= self._majority(), term_before, heartbeat_mark
+            # A pre-vote win needs a quorum: a majority of the config,
+            # or of BOTH configs during a joint transition.
+            return self._has_quorum(grants), term_before, heartbeat_mark
 
     def _run_election(self) -> None:
         """Start an election in this term. Runs on the timer thread.
@@ -2668,8 +2982,14 @@ class RaftNode:
             resp = self._send_peer_rpc(peer, msg)
             if resp and resp.get("vote_granted") and int(resp.get("term", 0)) == term:
                 with self.lock:
-                    # Only a voting member's vote counts.
-                    if peer in self.config:
+                    # Only a voting member's vote counts. During a
+                    # joint transition the voters are the union of
+                    # both configs, so a server in C-new only (being
+                    # added) still votes — its vote is what makes the
+                    # new majority.
+                    if (peer in self.config
+                            or (self._joint_new is not None
+                                and peer in self._joint_new)):
                         self.votes.add(peer)
 
         threads = [threading.Thread(target=_ask, args=(p,), daemon=True)
@@ -2682,7 +3002,7 @@ class RaftNode:
             if (
                 self.role == "candidate"
                 and self.current_term == term
-                and len(self.votes) >= self._majority()
+                and self._has_quorum(self.votes)
             ):
                 won = True
             else:

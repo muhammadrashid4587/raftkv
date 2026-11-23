@@ -88,13 +88,21 @@ logic and the failure handling, not the key-value API on top.
 - **Membership changes** — a client can add or remove a server while
   the cluster is live (`python3 -m raftkv.client add-server node4
   127.0.0.1:5004`, `remove-server node4`). Single-server changes, one
-  at a time (Raft dissertation §6): the change is a log entry, the
-  config is persisted with it, a new server replicates the whole log
-  via AppendEntries/InstallSnapshot before it starts voting, and a
+  at a time (Raft dissertation §6), now in two phases — a
+  `joint_config` entry (C-old,new) then a `final_config` entry
+  (C-new) — instead of one entry: while the transition is open, a
+  commit, an election, or a lease needs a majority of BOTH configs,
+  so an old-majority-only quorum can never commit anything and two
+  leaders in one term stay impossible. The config is persisted with
+  it, a new server replicates the whole log via
+  AppendEntries/InstallSnapshot before it starts voting, and a
   removed server stops participating. A leader that removes itself
   steps down. The leader keeps replicating to a removed server until
   that server's commit index reaches the removal entry, so the removed
   server actually learns it was removed instead of timing out forever.
+  If the driving leader dies mid-transition, the next leader finishes
+  it on election; a snapshot taken mid-transition carries the joint
+  config, and a node restarted mid-transition resumes in it.
 - **Leader redirects** — a write or read sent to a follower returns the
   current leader's address; the client follows it automatically.
 - **Client session deduplication** — a write may carry a
@@ -261,7 +269,7 @@ make test
 # or: python3 -m unittest discover -s tests -v
 ```
 
-133 tests, plus a smoke test for the benchmark script, all passing:
+136 tests, plus a smoke test for the benchmark script, all passing:
 
 | Test | What it proves |
 |---|---|
@@ -305,6 +313,9 @@ make test
 | `test_remove_unknown_server_is_rejected` | Removing a server that is not a member is rejected |
 | `test_concurrent_membership_changes_rejected` | Two concurrent membership changes are rejected/serialized, and the cluster is not wedged afterwards |
 | `test_membership_survives_restart` | Membership persists across restarts of every node; the 4-node cluster keeps serving |
+| `test_old_majority_alone_cannot_commit_during_joint` | During a joint transition, holders that are a majority of C-old only do not commit a current-term entry; adding the new member's ack does |
+| `test_add_server_completes_joint_then_final` | A client add runs both phases: the cluster ends in the 4-node config with no joint phase left, and the new node serves reads |
+| `test_leader_change_mid_transition_completes` | Frozen mid-transition by partitioning two members, a snapshot carries the joint config, a restarted follower resumes in it, and the new leader after the old one dies finishes the change |
 | `test_lease_read_skips_heartbeat_round` | Five reads on a leased leader run zero confirmation rounds and return the right values |
 | `test_lease_expires_without_majority_acks` | With both followers down the lease goes stale, the read falls back to a round and errors instead of serving unconfirmed |
 | `test_step_down_clears_lease` | Stepping down clears the ack record, so a deposed leader holds no lease |
@@ -526,16 +537,32 @@ entries left in `log.jsonl` are dropped by their index on reload.
   grants and failed attempts too, so reusing it for the voter rule
   would make nodes that just attempted an election keep rejecting
   each other, and a fresh cluster could never elect a leader at all.
-- **Membership changes.** Single-server changes, one at a time, no
-  joint consensus — old and new majorities overlap by one server, so
-  two leaders in the same term are impossible. The config lives in
-  the log (and in `meta.json` / `snapshot.json`), so a restart never
-  resurrects a removed server or forgets an added one. A new server
-  is added to the address book as non-voting first and only joins
-  the config once its config entry commits, after it has caught up.
-  A removed server is dropped from the config at once (so it cannot
-  vote or count toward a majority), but the leader keeps replicating
-  to it until its commit index reaches the removal entry — the
+- **Membership changes.** Single-server changes, one at a time, in
+  two phases — joint consensus (Raft dissertation §6): a
+  `joint_config` entry opens the transition (C-old,new) and a
+  `final_config` entry closes it (C-new). While the joint phase is
+  open, every quorum — commit advancement, pre-vote and election
+  wins, the leader lease, leadership confirmation — needs a majority
+  of BOTH configs (`_has_quorum`), so an old-majority-only quorum
+  cannot commit anything and two leaders in the same term stay
+  impossible even while the configs differ. The single-entry scheme
+  it replaced relied on old and new majorities overlapping by one
+  server; joint consensus drops that assumption, which is what makes
+  the change safe when the leader dies mid-transition: the next
+  leader inherits the joint config and drives the final entry
+  itself (from `_become_leader`, and from `_apply_config_entry`
+  when it commits a predecessor's joint entry with its no-op), and
+  exactly one thread drives it (`_joint_completion_running`), so the
+  cluster can never wedge in joint phase. The config and the joint
+  config both live in the log (and in `meta.json` /
+  `snapshot.json`, and in InstallSnapshot), so a restart never
+  resurrects a removed server, forgets an added one, or forgets a
+  transition halfway. A new server is added to the address book as
+  non-voting first and only joins the config once its change
+  completes, after it has caught up. A removed server leaves the
+  config only at the final entry (so it can still vote in C-old
+  during the joint phase), but the leader keeps replicating to it
+  until its commit index reaches the removal entry — the
   AppendEntries response carries the follower's commit index for
   exactly that check. Removing the last member and removing a server
   that is not a member are both rejected.
@@ -603,12 +630,13 @@ entries left in `log.jsonl` are dropped by their index on reload.
   RPC for lagging followers, automatic compaction past 1000 entries,
   snapshot loading on restart.
 - ~~Membership changes~~ — done in v0.6.0: single-server add/remove
-  as log entries (one change at a time, no joint consensus), config
-  persisted in the log/meta/snapshot, new servers catch up before
-  voting, removed servers stop participating, a leader that removes
-  itself steps down; plus the two liveness fixes the work exposed —
-  a no-op entry on election so prior-term entries commit, and a
-  heartbeat that does not wait for an ack first.
+  as log entries (one change at a time, no joint consensus — that
+  changed in v0.21.0, see below), config persisted in the
+  log/meta/snapshot, new servers catch up before voting, removed
+  servers stop participating, a leader that removes itself steps
+  down; plus the two liveness fixes the work exposed — a no-op entry
+  on election so prior-term entries commit, and a heartbeat that
+  does not wait for an ack first.
 - Pre-vote to avoid disruptive re-elections when a partitioned node
   rejoins with a stale-but-high term — done in v0.3.0: RequestPreVote
   round before every election, voters refuse when they are the leader
@@ -797,3 +825,22 @@ entries left in `log.jsonl` are dropped by their index on reload.
   reply, a plain read still redirecting, lease expiry after
   isolation, the session-read redirect, and a node with no leader
   contact redirecting.
+- ~~Joint-consensus membership changes~~ — done in v0.21.0, Nov 23,
+  2026: a membership change is now two log entries, not one — a
+  `joint_config` entry opens the transition (C-old,new) and a
+  `final_config` entry closes it (C-new), per the Raft dissertation
+  §6. While the joint phase is open, every quorum — commit
+  advancement, pre-vote and election wins, the leader lease, and
+  leadership confirmation — needs a majority of BOTH configs, so an
+  old-majority-only quorum cannot commit anything. The joint config
+  is persisted in `meta.json` and `snapshot.json` and rides along in
+  InstallSnapshot, so a restart or a lagging follower mid-transition
+  resumes in the joint phase; a leader that inherits a joint config
+  (or commits one with its no-op) drives the final entry itself, so a
+  leader dying mid-transition cannot wedge the cluster. Exactly one
+  thread drives the final entry. `tests/test_joint_consensus.py`
+  covers the old-majority-only commit refusal, the client add
+  completing both phases, and a leader change mid-transition (frozen
+  by partitioning two members, snapshot carrying the joint config,
+  a restarted follower resuming in it, the new leader finishing
+  the change).
