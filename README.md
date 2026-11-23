@@ -127,7 +127,14 @@ logic and the failure handling, not the key-value API on top.
   local to one node and in-memory only: not replicated, not
   persisted, not rebuilt on restart; a watcher re-registers after
   reconnecting. Callbacks run synchronously on the applying thread,
-  so keep them short and non-blocking.
+  so keep them short and non-blocking. Since v0.17.0 the same
+  primitive is reachable over the wire: a client sends a `watch`
+  RPC (`python3 -m raftkv.client --node 127.0.0.1:5001 watch k`,
+  or `Session.watch("k")`) and the node long-polls — it waits up to
+  the timeout for the first committed change and replies with every
+  event that arrived, each carrying the log index of the entry that
+  caused it. Any node can serve a watch, leader or follower, and a
+  timed-out watch leaves nothing registered behind.
 - **Chaos/fault-injection harness** — `scripts/chaos.py` starts a real
   3-node cluster and, on a seeded random schedule, SIGKILLs a node
   (a real crash, no clean shutdown) and restarts it while writer
@@ -206,7 +213,7 @@ make test
 # or: python3 -m unittest discover -s tests -v
 ```
 
-107 tests, plus a smoke test for the benchmark script, all passing:
+116 tests, plus a smoke test for the benchmark script, all passing:
 
 | Test | What it proves |
 |---|---|
@@ -290,6 +297,15 @@ make test
 | `test_session_read_with_wrong_term_errors` | A read naming the right index with the wrong term errors; the right term serves |
 | `test_dedup_retry_returns_same_index` | A retried write reports the first attempt's index and appends no second entry |
 | `test_session_get_without_writes_reads_normally` | A fresh session (watermark 0) reads like a plain ReadIndex read; CAS advances the watermark |
+| `test_watch_rpc_returns_event_on_set` | A watch RPC long-polls and returns the set event with its log index |
+| `test_watch_rpc_times_out_with_no_change` | A watch with no change times out with no events and leaves nothing registered |
+| `test_watch_rpc_on_follower_sees_committed_write` | A watch on a follower fires when the leader's write commits and applies there |
+| `test_watch_rpc_prefix_matches_only_matching_keys` | A prefix watch fires only for keys under the prefix |
+| `test_watch_rpc_delete_event_has_none_value` | A delete over RPC fires with value None and op del |
+| `test_watch_rpc_rejects_empty_key` | A watch with an empty or missing key is an error, not a wait |
+| `test_watch_rpc_event_index_matches_log` | A watch event's index is the index of the write's own log entry |
+| `test_session_watch_returns_events` | `Session.watch` returns the committed change over the wire |
+| `test_watch_cli_prints_event_as_json` | The `watch` CLI subcommand prints the event as one JSON line |
 
 Tests use real nodes (real TCP, real threads, real disk) on localhost —
 no mocks of the consensus path.
@@ -655,3 +671,19 @@ entries left in `log.jsonl` are dropped by their index on reload.
   state. `tests/test_session.py` covers the watermark, reads from
   any node, failover, unknown-index and wrong-term errors, and
   dedup retries reporting the same index.
+- ~~Watch/subscribe over RPC~~ — done in v0.17.0, Nov 22, 2026: the
+  local watch primitive is now reachable over the wire as a
+  long-poll RPC — a client sends `{"type": "watch", "key": ...,
+  "prefix": ..., "timeout": ...}` and the node waits up to the
+  timeout for the first committed change and replies with every
+  event that arrived, each carrying the log index of the entry that
+  caused it, so a client re-registering after a disconnect can
+  order events and spot a gap. Any node serves a watch, leader or
+  follower, since the apply path fires on every node; a timed-out
+  watch leaves nothing registered, and the wait holds no lock, so
+  it cannot stall the apply path. `Session.watch(key, prefix,
+  timeout)` and the `watch` CLI subcommand (one JSON line per
+  event, `--prefix` for a key prefix) expose it;
+  `tests/test_watch_rpc.py` covers set/delete/prefix watches,
+  follower watches, timeouts, empty-key rejection, the event index
+  matching the write's log index, and the CLI.

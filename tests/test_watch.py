@@ -128,9 +128,16 @@ class TestWatchIntegration(unittest.TestCase):
                              "ok")
             self.assertTrue(leader_log.wait_for(1), leader_log.events)
             self.assertTrue(follower_log.wait_for(1), follower_log.events)
-            self.assertEqual(leader_log.events,
-                             [{"key": "k", "value": "v1", "op": "set"}])
-            self.assertEqual(follower_log.events, leader_log.events)
+            # Events now also carry the log index of the entry that
+            # caused them (v0.17.0, for RPC watchers resuming after a
+            # disconnect); the local-watch tests compare the fields
+            # they own and check the index separately.
+            self.assertEqual(
+                [{k: v for k, v in e.items() if k != "index"}
+                 for e in leader_log.events],
+                [{"key": "k", "value": "v1", "op": "set"}])
+            self.assertEqual(leader_log.events, follower_log.events)
+            self.assertIsInstance(leader_log.events[0].get("index"), int)
         finally:
             cluster.stop_all()
 
@@ -181,8 +188,11 @@ class TestWatchIntegration(unittest.TestCase):
             leader.watch.watch("k", log)
             self.assertEqual(delete(addr).get("status"), "ok")
             self.assertTrue(log.wait_for(1), log.events)
-            self.assertEqual(log.events, [{"key": "k", "value": None,
-                                           "op": "del"}])
+            self.assertEqual(
+                [{k: v for k, v in e.items() if k != "index"}
+                 for e in log.events],
+                [{"key": "k", "value": None, "op": "del"}])
+            self.assertIsInstance(log.events[0].get("index"), int)
         finally:
             cluster.stop_all()
 
@@ -202,8 +212,11 @@ class TestWatchIntegration(unittest.TestCase):
             resp = cas(addr, expected="v1", value="v2")
             self.assertEqual(resp.get("status"), "ok", resp)
             self.assertTrue(log.wait_for(1), log.events)
-            self.assertEqual(log.events, [{"key": "k", "value": "v2",
-                                           "op": "set"}])
+            self.assertEqual(
+                [{k: v for k, v in e.items() if k != "index"}
+                 for e in log.events],
+                [{"key": "k", "value": "v2", "op": "set"}])
+            self.assertIsInstance(log.events[0].get("index"), int)
         finally:
             cluster.stop_all()
 

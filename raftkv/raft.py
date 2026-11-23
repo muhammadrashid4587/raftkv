@@ -58,6 +58,10 @@ HEARTBEAT_INTERVAL = 0.05
 RPC_TIMEOUT = 0.5
 CLIENT_COMMIT_TIMEOUT = 10.0
 LEADER_LEASE_TIMEOUT = 1.0
+# A watch RPC waits at most this long for an event. The transport
+# handler thread's socket timeout is 30s, so a watch must answer
+# before that or its reply can never be sent; 25s leaves headroom.
+WATCH_MAX_TIMEOUT = 25.0
 # Leader lease for reads (Raft dissertation §6.4): how long a majority
 # ack stays fresh. Must be shorter than ELECTION_TIMEOUT_MIN (150ms):
 # a follower that acked at time T heard from the leader no later than
@@ -825,13 +829,16 @@ class RaftNode:
                 # failed CAS (no state change) fires nothing.
                 if op == "set":
                     self.watch.notify(entry["command"]["key"],
-                                      entry["command"]["value"], "set")
+                                      entry["command"]["value"], "set",
+                                      index=self.last_applied)
                 elif op == "del":
-                    self.watch.notify(entry["command"]["key"], None, "del")
+                    self.watch.notify(entry["command"]["key"], None, "del",
+                                      index=self.last_applied)
                 elif (op == "cas" and result is not None
                         and result.get("status") == "ok"):
                     self.watch.notify(entry["command"]["key"],
-                                      entry["command"]["value"], "set")
+                                      entry["command"]["value"], "set",
+                                      index=self.last_applied)
                 if (op == "cas" and result is not None
                         and self.role == "leader"):
                     # Record the outcome only when a local waiter is
@@ -963,6 +970,8 @@ class RaftNode:
             return self._on_install_snapshot(msg)
         if msg_type == "client":
             return self._on_client(msg)
+        if msg_type == "watch":
+            return self._on_watch(msg)
         if msg_type == "status":
             with self.lock:
                 return {
@@ -1304,6 +1313,62 @@ class RaftNode:
             if msg.get(field):
                 command[field] = msg[field]
         return self._submit_write(command)
+
+    def _on_watch(self, msg: dict) -> dict:
+        """Serve a watch RPC by long-polling the local WatchManager.
+
+        ``{"type": "watch", "key": ..., "prefix": ..., "timeout": ...}``
+        registers a callback, waits up to ``timeout`` seconds for the
+        first committed change to the key (or prefix), and replies
+        with every event that arrived in that window. Any node can
+        serve a watch — the apply path fires on leader and followers
+        alike — so there is no leader redirect and no read-index
+        round: a watch on a lagging follower simply fires later, once
+        that node applies the entry. The wait happens on this handler
+        thread with no lock held (the callback only appends to a list
+        under its own condition), so it cannot stall the apply path
+        or the node's lock; a raising or slow watcher is impossible
+        here because the callback does no work beyond recording the
+        event. The watch is cancelled before replying either way, so
+        a timed-out watch leaves nothing registered behind.
+        """
+        key = msg.get("key")
+        if not isinstance(key, str) or not key:
+            return {"type": "watch_response", "status": "error",
+                    "error": "watch needs a non-empty key"}
+        try:
+            timeout = float(msg.get("timeout") or 0.0)
+        except (TypeError, ValueError):
+            return {"type": "watch_response", "status": "error",
+                    "error": "timeout must be a number of seconds"}
+        timeout = max(0.0, min(timeout, WATCH_MAX_TIMEOUT))
+        prefix = bool(msg.get("prefix", False))
+        events: list[dict] = []
+        cond = threading.Condition()
+
+        def _record(event: dict) -> None:
+            with cond:
+                events.append(event)
+                cond.notify_all()
+
+        watch_id = self.watch.watch(key, _record, prefix=prefix)
+        try:
+            deadline = time.monotonic() + timeout
+            with cond:
+                while not events:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    cond.wait(remaining)
+                # Any further events that landed while we were waking
+                # ride along too; the client re-issues to keep
+                # watching either way.
+                seen = list(events)
+        finally:
+            self.watch.cancel(watch_id)
+        return {"type": "watch_response",
+                "status": "ok" if seen else "timeout",
+                "events": seen}
 
     # ------------------------------------------------------------------
     # Membership changes (Raft §6, single-server)

@@ -25,6 +25,18 @@ Deliberate limits of this slice (v0.11.0):
   resulting value, which for a no-op delete is ``None``. There is no
   initial-value delivery: a watch sees changes *after* registration,
   never the current value at registration time.
+- Since v0.17.0 a watch is also reachable over the wire: a client
+  sends ``{"type": "watch", "key": ..., "prefix": ..., "timeout": ...}``
+  and the node long-polls — it registers a callback, waits up to
+  ``timeout`` seconds for the first event, and replies with every
+  event that arrived (``{"type": "watch_response", "status": "ok" |
+  "timeout", "events": [...]}``). Any node can serve a watch, leader
+  or follower, because the apply path fires on every node. Each event
+  carries the log ``index`` of the entry that caused it, so a client
+  re-registering after a disconnect can order events and spot a gap.
+  The watch is still local and in-memory: it lives only for the
+  duration of the one RPC, and the client re-issues it to keep
+  watching.
 """
 
 from __future__ import annotations
@@ -46,7 +58,10 @@ class WatchManager:
         or to every key starting with ``key`` when ``prefix=True``.
 
         The callback receives one event dict per change:
-        ``{"key": ..., "value": ... | None, "op": "set" | "del"}``.
+        ``{"key": ..., "value": ... | None, "op": "set" | "del"}`` —
+        plus ``"index"`` (the log index of the entry that caused it)
+        when the event comes from the apply path; direct ``notify``
+        calls without an index get the three-field event.
         Returns a watch id for ``cancel``.
         """
         with self._lock:
@@ -64,7 +79,8 @@ class WatchManager:
         with self._lock:
             return len(self._watches)
 
-    def notify(self, key: str, value: str | None, op: str) -> None:
+    def notify(self, key: str, value: str | None, op: str,
+               index: int | None = None) -> None:
         """Fire every watch matching ``key`` with this change.
 
         Called by the apply path after a committed entry changed the
@@ -72,9 +88,15 @@ class WatchManager:
         invoked outside it, so a callback registering or cancelling a
         watch cannot deadlock against the registry. A callback that
         raises is swallowed: one broken watcher must not break the
-        apply path or the other watchers.
+        apply path or the other watchers. ``index`` is the log index
+        of the entry that caused the change; when given it rides in
+        the event dict, so a remote watcher can order events and spot
+        a gap after reconnecting. Local callers that omit it get the
+        original three-field event.
         """
         event = {"key": key, "value": value, "op": op}
+        if index is not None:
+            event["index"] = index
         with self._lock:
             callbacks = [cb for (k, is_prefix, cb) in self._watches.values()
                          if (key.startswith(k) if is_prefix else key == k)]

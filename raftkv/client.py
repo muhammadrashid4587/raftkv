@@ -10,11 +10,13 @@ Examples:
     python -m raftkv.client --node 127.0.0.1:5001 get mykey
     python -m raftkv.client --node 127.0.0.1:5001 del mykey
     python -m raftkv.client --node 127.0.0.1:5001 cas mykey myvalue newvalue
+    python -m raftkv.client --node 127.0.0.1:5001 watch mykey --timeout 10
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import uuid
 
@@ -94,6 +96,29 @@ class Session:
                      "session_term": self.last_write_term}
         return request(self.node_addr, msg)
 
+    def watch(self, key: str, prefix: bool = False,
+              timeout: float = 5.0) -> dict:
+        """Long-poll for committed changes to ``key`` (or to every key
+        starting with ``key`` when ``prefix=True``).
+
+        One call is one long-poll: the node waits up to ``timeout``
+        seconds for the first change and returns ``{"status": "ok" |
+        "timeout", "events": [...]}``; each event carries ``key``,
+        ``value`` (``None`` on delete), ``op`` (``"set"`` | ``"del"``)
+        and the log ``index`` of the entry that caused it. Any node
+        can serve a watch — call this again to keep watching. The RPC
+        timeout is the watch timeout plus headroom, so a slow node
+        reports a timeout instead of the client giving up first.
+        """
+        msg: dict = {"type": "watch", "key": key, "prefix": prefix,
+                     "timeout": timeout}
+        host, port = self.node_addr
+        resp = send_rpc(host, port, msg, timeout=timeout + 5.0)
+        if resp is None:
+            return {"type": "watch_response", "status": "error",
+                    "error": f"node {host}:{port} did not answer"}
+        return resp
+
 
 def request(node_addr: tuple[str, int], msg: dict, timeout: float = 12.0) -> dict:
     """Send one client request, following leader redirects."""
@@ -160,12 +185,41 @@ def main(argv: list[str] | None = None) -> int:
                            help="add a server to the cluster (Raft §6)")
     p_add.add_argument("server_id")
     p_add.add_argument("addr", help="the new server as host:port")
+    p_watch = sub.add_parser(
+        "watch",
+        help="long-poll for committed changes to a key (or key prefix): "
+             "waits up to --timeout for the first change and prints "
+             "each event as one JSON line; run again to keep watching")
+    p_watch.add_argument("key")
+    p_watch.add_argument("--prefix", action="store_true",
+                         help="watch every key starting with KEY")
+    p_watch.add_argument("--timeout", type=float, default=5.0,
+                         help="seconds to wait for the first event "
+                              "(default 5, max 25)")
     p_remove = sub.add_parser("remove-server",
                               help="remove a server from the cluster")
     p_remove.add_argument("server_id")
     args = parser.parse_args(argv)
 
     host, _, port = args.node.rpartition(":")
+    if args.op == "watch":
+        # A watch is a long-poll, not a client-protocol op: any node
+        # serves it, so no redirect following, and the RPC timeout
+        # must outlive the watch timeout or the client gives up first.
+        resp = send_rpc(host, int(port),
+                        {"type": "watch", "key": args.key,
+                         "prefix": args.prefix, "timeout": args.timeout},
+                        timeout=args.timeout + 5.0)
+        if resp is None:
+            print(f"error: node {args.node} did not answer",
+                  file=sys.stderr)
+            return 1
+        if resp.get("status") == "error":
+            print(f"error: {resp.get('error') or resp}", file=sys.stderr)
+            return 1
+        for event in resp.get("events") or []:
+            print(json.dumps(event))
+        return 0
     msg: dict = {"type": "client", "op": args.op}
     if args.op in ("set", "get", "del", "cas"):
         msg["key"] = args.key
