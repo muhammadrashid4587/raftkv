@@ -8,6 +8,12 @@ must hold exactly the same data. An acked write is a promise — a
 write the cluster confirmed — so losing one, or letting two nodes
 diverge, is a correctness bug, not flakiness.
 
+Two reader threads read acked keys concurrently with the writes and
+the faults and record every observation in a shared history; the
+linearizability check at the end proves no read ever returned a stale
+value or a value from the future, so the chaos run checks the
+observable consistency property, not just durability.
+
 The fault schedule is seeded (seed 7), so the same kill/restart
 sequence runs every time; a failure is reproducible, not a one-off.
 The writers keep writing until the fault thread has finished all
@@ -21,6 +27,7 @@ import time
 import unittest
 
 from harness import Cluster, client_request, wait_for_key
+from raftkv.linearizability import History, record_client_op
 
 
 class TestChaos(unittest.TestCase):
@@ -37,6 +44,9 @@ class TestChaos(unittest.TestCase):
             errors: list[str] = []
             faults_done = threading.Event()
             fault_count = [0]
+            history = History()
+            written_counts = [0, 0]
+            stop_readers = threading.Event()
 
             def writer(thread_id: int) -> None:
                 # Keep writing until the fault thread has run all its
@@ -51,11 +61,16 @@ class TestChaos(unittest.TestCase):
                            "client_id": f"chaos-{thread_id}",
                            "request_id": str(i)}
                     deadline = time.monotonic() + 60.0
+                    first_invoke = time.monotonic()
                     while True:
                         resp = client_request(addr, msg, timeout=3.0)
                         if resp.get("status") == "ok":
                             with lock:
                                 acked[key] = value
+                                written_counts[thread_id] = i + 1
+                            record_client_op(
+                                history, f"chaos-{thread_id}", i, msg,
+                                resp, first_invoke, time.monotonic())
                             break
                         if time.monotonic() > deadline:
                             errors.append(
@@ -63,6 +78,33 @@ class TestChaos(unittest.TestCase):
                             break
                         time.sleep(0.1)
                     i += 1
+
+            def reader(thread_id: int) -> None:
+                # Read keys the writers have already acked, concurrently
+                # with the writes and the faults, and record every
+                # observation: the linearizability check at the end
+                # proves no read ever saw a stale value or a value
+                # from the future.
+                rng = random.Random(1000 + thread_id)
+                seq = 0
+                while not stop_readers.is_set():
+                    with lock:
+                        counts = list(written_counts)
+                    candidates = [(t, i) for t in range(2)
+                                  for i in range(counts[t])]
+                    if not candidates:
+                        time.sleep(0.05)
+                        continue
+                    t, i = rng.choice(candidates)
+                    msg = {"type": "client", "op": "get",
+                           "key": f"chaos:t{t}:{i}"}
+                    invoke = time.monotonic()
+                    resp = client_request(addr, msg, timeout=3.0)
+                    record_client_op(history, f"reader-{thread_id}",
+                                     seq, msg, resp, invoke,
+                                     time.monotonic())
+                    seq += 1
+                    time.sleep(0.005)
 
             def faults() -> None:
                 # Four kill/restart cycles on a seeded schedule, while
@@ -86,10 +128,19 @@ class TestChaos(unittest.TestCase):
                 threading.Thread(target=writer, args=(t,))
                 for t in range(2)
             ]
+            readers = [
+                threading.Thread(target=reader, args=(t,))
+                for t in range(2)
+            ]
             for w in writers:
                 w.start()
+            for r in readers:
+                r.start()
             for w in writers:
                 w.join()
+            stop_readers.set()
+            for r in readers:
+                r.join(timeout=5.0)
             fault_thread.join(timeout=5.0)
 
             self.assertEqual(errors, [], "writes that never acked")
@@ -97,6 +148,14 @@ class TestChaos(unittest.TestCase):
                              "all four kill/restart cycles should run")
             self.assertGreaterEqual(len(acked), 30,
                                     "every write should have acked")
+
+            # Linearizability across the whole fault schedule: every
+            # concurrent read must have returned a value some
+            # linearization could produce.
+            lin = history.check()
+            self.assertTrue(lin.ok, str(lin))
+            self.assertGreaterEqual(lin.reads_checked, 10,
+                                    "readers should have observed reads")
 
             # The cluster settles, then every node must hold every
             # acked write — and nothing else.

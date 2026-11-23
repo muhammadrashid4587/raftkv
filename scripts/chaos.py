@@ -9,16 +9,21 @@ Starts a real 3-node cluster on localhost (subprocesses, like
     a session id (``client_id`` / ``request_id``), retrying on error
     until the write is acknowledged — an acked write is one the cluster
     promised to keep, so losing one is a correctness bug, not noise;
+  * reader threads reading keys the writers have already acked,
+    recording every observation in a shared history;
   * a fault thread that, on a seeded random schedule, SIGKILLs a random
     node (a real crash, no clean shutdown, so the disk log has to save
     us) and restarts it a moment later.
 
 When the writers finish and the cluster settles, the script verifies:
 
-  * every acked write reads back with its exact value, and
+  * every acked write reads back with its exact value,
   * every node reports the same ``commit_index`` and ``last_applied`` —
     the same applied prefix on every node, so no node diverged or
-    fell behind for good.
+    fell behind for good, and
+  * the recorded history is linearizable (``raftkv.linearizability``):
+    no concurrent read returned a stale value or a value from the
+    future, across the whole fault schedule.
 
 The fault schedule is seeded, so ``--seed N`` reproduces the exact
 same kill/restart sequence for debugging a failure. Exits non-zero if
@@ -47,6 +52,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from raftkv.client import request as client_request  # noqa: E402
+from raftkv.linearizability import History, record_client_op  # noqa: E402
 from raftkv.transport import send_rpc  # noqa: E402
 
 SEED_KEY = "__chaos_probe__"
@@ -164,13 +170,18 @@ class Cluster:
 
 def writer(cluster: Cluster, thread_id: int, min_count: int,
            acked: dict[str, str], lock: threading.Lock,
-           errors: list[str], faults_done: threading.Event) -> None:
+           errors: list[str], faults_done: threading.Event,
+           history: History, written_counts: list[int]) -> None:
     """Write unique keys until the fault thread has run its whole
     schedule (and at least ``min_count`` writes), retrying each until
     it is acked. A write that never acks is recorded as an error, not
     silently dropped — but a retry uses the same session id, so a
     write whose first attempt actually committed is deduped, not
-    applied twice."""
+    applied twice. Each acked write is recorded in the shared history
+    with its *first* attempt's invocation time: the write may have
+    committed any time after that, and recording the retry's later
+    invocation would make a read that legitimately saw the write
+    look stale."""
     addr = cluster.addrs[0]
     i = 0
     while not faults_done.is_set() or i < min_count:
@@ -179,17 +190,52 @@ def writer(cluster: Cluster, thread_id: int, min_count: int,
         msg = {"type": "client", "op": "set", "key": key, "value": value,
                "client_id": f"chaos-{thread_id}", "request_id": str(i)}
         deadline = time.monotonic() + 60.0
+        first_invoke = time.monotonic()
         while True:
             resp = client_request(addr, msg, timeout=3.0)
             if resp.get("status") == "ok":
                 with lock:
                     acked[key] = value
+                    written_counts[thread_id] = i + 1
+                record_client_op(history, f"chaos-{thread_id}", i, msg,
+                                 resp, first_invoke, time.monotonic())
                 break
             if time.monotonic() > deadline:
                 errors.append(f"{key}: never acked, last reply {resp}")
                 break
             time.sleep(0.1)
         i += 1
+
+
+def reader(cluster: Cluster, thread_id: int, threads: int,
+           lock: threading.Lock, written_counts: list[int],
+           stop_readers: threading.Event, history: History,
+           rng: random.Random) -> None:
+    """Read keys the writers have already acked, concurrently with
+    the writes and the faults, and record every observation in the
+    shared history. A read that returns a value no linearization
+    could produce — a stale value after a newer write completed, or
+    a value from the future — is a correctness bug, and the
+    linearizability check at the end catches it."""
+    addr = cluster.addrs[0]
+    seq = 0
+    while not stop_readers.is_set():
+        with lock:
+            counts = list(written_counts)
+        candidates = [(t, i) for t in range(threads)
+                      for i in range(counts[t])]
+        if not candidates:
+            time.sleep(0.05)
+            continue
+        t, i = rng.choice(candidates)
+        key = f"chaos:t{t}:{i}"
+        msg = {"type": "client", "op": "get", "key": key}
+        invoke = time.monotonic()
+        resp = client_request(addr, msg, timeout=3.0)
+        record_client_op(history, f"reader-{thread_id}", seq, msg,
+                         resp, invoke, time.monotonic())
+        seq += 1
+        time.sleep(0.005)
 
 
 def fault_loop(cluster: Cluster, rng: random.Random, faults: int,
@@ -225,6 +271,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="kill/restart cycles (default 6)")
     parser.add_argument("--threads", type=int, default=3,
                         help="concurrent writer threads (default 3)")
+    parser.add_argument("--readers", type=int, default=2,
+                        help="concurrent reader threads recording a "
+                             "history for the linearizability check "
+                             "(default 2)")
     parser.add_argument("--port-base", type=int, default=5200,
                         help="first of three consecutive ports "
                              "(default 5200)")
@@ -258,6 +308,9 @@ def main(argv: list[str] | None = None) -> int:
         errors: list[str] = []
         fault_log: list[str] = []
         faults_done = threading.Event()
+        history = History()
+        written_counts = [0] * args.threads
+        stop_readers = threading.Event()
 
         faults = threading.Thread(
             target=fault_loop,
@@ -267,13 +320,27 @@ def main(argv: list[str] | None = None) -> int:
         writers = [
             threading.Thread(target=writer,
                              args=(cluster, t, args.writes, acked, lock,
-                                   errors, faults_done))
+                                   errors, faults_done, history,
+                                   written_counts))
             for t in range(args.threads)
+        ]
+        readers = [
+            threading.Thread(target=reader,
+                             args=(cluster, t, args.threads, lock,
+                                   written_counts, stop_readers, history,
+                                   random.Random(args.seed + 1000 + t)),
+                             daemon=True)
+            for t in range(args.readers)
         ]
         for w in writers:
             w.start()
+        for r in readers:
+            r.start()
         for w in writers:
             w.join()
+        stop_readers.set()
+        for r in readers:
+            r.join(timeout=5.0)
         faults.join(timeout=5.0)
         for line in fault_log:
             print(f"  {line}")
@@ -310,6 +377,16 @@ def main(argv: list[str] | None = None) -> int:
               f"{converged['node1']['commit_index']} "
               f"after {args.faults} kill/restart faults "
               f"(seed {args.seed})")
+        # Linearizability: every concurrent read must have returned a
+        # value some linearization could produce — no stale reads, no
+        # values from the future — across the whole fault schedule.
+        lin = history.check()
+        print(f"linearizability: {lin}")
+        if lin.multi_writer_keys:
+            print(f"  note: {len(lin.multi_writer_keys)} key(s) had "
+                  f"multiple writers, checked with the weaker rule")
+        if not lin.ok:
+            return 1
         return 0 if not stop else 130
     except (RuntimeError, AssertionError) as exc:
         print(f"chaos failed: {exc}", file=sys.stderr)

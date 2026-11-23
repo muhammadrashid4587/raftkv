@@ -120,6 +120,22 @@ logic and the failure handling, not the key-value API on top.
   diverges. The same scenario runs in-process as `tests/test_chaos.py`
   (seeded, 4 kill/restart cycles, 2 writers). Same seed, same faults,
   so a failure is reproducible: `python3 scripts/chaos.py --seed 7`.
+- **Linearizability checker** — `raftkv/linearizability.py` records
+  the full history of concurrent operations (invocation/response
+  times, client/session ids) during a chaos run — writer threads
+  record their acked writes, reader threads record every read they
+  observe — and verifies the history is linearizable: every read must
+  return the latest write that completed before it was invoked, or
+  the value of a write concurrent with it. A stale read after an
+  overwrite, a read of a value from the future, or a read after a
+  delete returning the old value all fail the check with the exact
+  write the read should have seen. Failed CAS counts as a read of
+  its reported current value; a key written by several clients falls
+  back to a weaker rule (the value must have been written before the
+  read finished) and is reported as such. The checker runs at the
+  end of `scripts/chaos.py` and of `tests/test_chaos.py`, and
+  `tests/test_linearizability.py` covers it with synthetic histories
+  plus a live-cluster test.
 - **Real failure handling** — tested end to end: kill the leader, the
   cluster re-elects, writes continue, the old leader rejoins and
   catches up instead of forking.
@@ -155,7 +171,7 @@ make test
 # or: python3 -m unittest discover -s tests -v
 ```
 
-74 tests, plus a smoke test for the benchmark script, all passing:
+90 tests, plus a smoke test for the benchmark script, all passing:
 
 | Test | What it proves |
 |---|---|
@@ -217,7 +233,14 @@ make test
 | `test_cas_retry_with_same_session_id_returns_same_result` | Retried CAS returns the first attempt's result, one log entry |
 | `test_cas_failed_result_survives_snapshot_and_restart` | A failed CAS result survives compaction and a leader restart |
 | `test_cas_cli` | The `cas` CLI subcommand works end to end |
-| `test_random_kill_restart_mid_write_loses_nothing` | Seeded chaos: 4 kill/restart cycles mid-write, every acked write survives on every node, all nodes converge to identical state |
+| `test_random_kill_restart_mid_write_loses_nothing` | Seeded chaos: 4 kill/restart cycles mid-write, every acked write survives on every node, all nodes converge to identical state, and the recorded read history is linearizable |
+| `test_stale_read_after_overwrite_is_flagged` | A read invoked after an overwrite completed but returning the old value fails the linearizability check |
+| `test_concurrent_read_may_see_old_or_new_value` | A read overlapping an overwrite may return either value |
+| `test_read_returning_a_future_value_is_flagged` | A read returning a value written only after the read finished fails the check |
+| `test_delete_then_read_returns_none` | A read after a delete returns None; returning the old value fails |
+| `test_failed_cas_counts_as_a_read_of_current_value` | A failed CAS is checked like a read of its reported current value |
+| `test_multi_writer_key_uses_weak_check` | A key written by several clients uses the weaker rule and is reported as such |
+| `test_concurrent_reads_and_writes_on_a_live_cluster` | Two writers and two readers on a real 3-node cluster: every observed read is linearizable |
 
 Tests use real nodes (real TCP, real threads, real disk) on localhost —
 no mocks of the consensus path.
@@ -265,6 +288,7 @@ raftkv/
   transport.py   Length-prefixed JSON framing, one-shot RPC, threaded TCP server
   raft.py        RaftNode: elections, log replication, commit, persistence
   store.py       KVStore: the deterministic state machine (SET/GET/DEL)
+  linearizability.py  History/Op: record concurrent ops, verify linearizability
   server.py      Node CLI: --id --port --peers --data-dir
   client.py      Client CLI: set/get/del with leader-redirect following
 tests/
@@ -275,6 +299,7 @@ tests/
   test_membership.py   Add/remove server, serialization, persistence
   test_dedup.py        Client session deduplication
   test_cas.py          Linearizable compare-and-swap
+  test_linearizability.py  Linearizability checker: synthetic histories + live cluster
 ```
 
 **Threading.** One TCP server thread (a thread per connection), one
@@ -409,6 +434,18 @@ entries left in `log.jsonl` are dropped by their index on reload.
   InstallSnapshot carries the table too, so a lagging follower that
   installs a snapshot adopts the dedup results for the covered
   prefix.
+- **Linearizability checker.** The checker only trusts what clients
+  actually observed, so the timestamps have to mean what the check
+  assumes: a retried write is recorded with its *first* attempt's
+  invocation time, because the write may have committed any time
+  after that — recording the retry's later invocation would make a
+  read that legitimately saw the write look stale. Errored ops are
+  skipped entirely: a client that heard nothing cannot contradict a
+  linearization. The strict per-key rule needs each key written by
+  one client in program order (true for the chaos workload, where
+  each writer owns its keys); a key with several writers falls back
+  to the weaker rule and is flagged in the result, so a run never
+  looks stricter than it was.
 - **No dependencies.** Pure stdlib: `socket`, `threading`, `json`,
   `socketserver`. Nothing to install, nothing to break.
 
@@ -491,3 +528,14 @@ entries left in `log.jsonl` are dropped by their index on reload.
   scenario runs in-process as `tests/test_chaos.py`. Verified with
   seeds 7 and 42: 283 and 199 acked writes respectively, zero lost,
   all nodes converged, including a leader kill and re-election.
+- ~~Linearizability checker on the chaos harness~~ — done in v0.13.0,
+  Nov 22, 2026: `raftkv/linearizability.py` records the full history
+  of concurrent operations during a chaos run (writers record acked
+  writes with first-attempt invocation times, readers record every
+  read they observe) and verifies it is linearizable — each read must
+  return the latest write completed before it was invoked, or a
+  concurrent write's value; failed CAS counts as a read, multi-writer
+  keys fall back to a weaker rule and are reported. Runs at the end
+  of `scripts/chaos.py` and `tests/test_chaos.py`, with synthetic
+  histories plus a live-cluster test in
+  `tests/test_linearizability.py`.
