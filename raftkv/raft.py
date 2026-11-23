@@ -69,6 +69,14 @@ WATCH_MAX_TIMEOUT = 25.0
 # snapshot chunk. A client that needs more splits the batch itself —
 # get_many already does exactly that, one pipelined batch at a time.
 MAX_MGET_KEYS = 1000
+# A keys/scan RPC returns at most this many keys in one reply, for
+# the same reason as the mget cap: one frame carries the whole list,
+# so an unbounded scan could hold a worker (and its connection) for
+# an arbitrarily long encode. The reply carries ``truncated`` when
+# more keys matched than the limit, so a client that needs the rest
+# re-issues with a narrower prefix — the same split-the-work rule
+# as mget's batching.
+MAX_KEYS_SCAN = 1000
 # Leader lease for reads (Raft dissertation §6.4): how long a majority
 # ack stays fresh. Must be shorter than ELECTION_TIMEOUT_MIN (150ms):
 # a follower that acked at time T heard from the leader no later than
@@ -1922,6 +1930,45 @@ class RaftNode:
                                 session_term=session_term,
                                 stale_ok=bool(msg.get("stale_ok")))
 
+    def _on_keys(self, msg: dict) -> dict:
+        """Serve a key enumeration: every key in the applied state
+        machine, sorted, optionally restricted to a prefix, capped
+        at MAX_KEYS_SCAN. It rides the same ReadIndex/lease path as
+        ``get`` and ``mget`` — one leadership confirmation and one
+        apply wait — so a scan is exactly as linearizable as a
+        single read: it reflects the committed state as of the
+        read index it names, never a half-applied prefix. The reply
+        carries ``keys`` (the matching keys in sorted order, at most
+        ``limit`` of them), ``truncated`` (True when more keys
+        matched than the limit returned, so the caller knows to
+        narrow the prefix and re-scan), and the same ``read_index``
+        / ``read_term`` a session uses to advance its read
+        watermark."""
+        prefix = msg.get("prefix") or ""
+        if not isinstance(prefix, str):
+            return {"type": "client_response", "status": "error",
+                    "error": "keys prefix must be a string"}
+        limit = msg.get("limit")
+        if limit is None:
+            limit = MAX_KEYS_SCAN
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            return {"type": "client_response", "status": "error",
+                    "error": "keys limit must be an integer"}
+        if isinstance(msg.get("limit"), bool) or limit < 1 \
+                or limit > MAX_KEYS_SCAN:
+            return {"type": "client_response", "status": "error",
+                    "error": "keys limit must be between 1 and "
+                             f"{MAX_KEYS_SCAN}"}
+        min_index, session_term, error = self._parse_read_params(msg)
+        if error is not None:
+            return error
+        return self._serve_read(scan_prefix=prefix, scan_limit=limit,
+                                min_index=min_index,
+                                session_term=session_term,
+                                stale_ok=bool(msg.get("stale_ok")))
+
     def _on_client(self, msg: dict) -> dict:
         op = msg.get("op")
         if op in ("add_server", "remove_server"):
@@ -1931,6 +1978,11 @@ class RaftNode:
                 return {"type": "client_response", "status": "error",
                         "error": "this node was removed from the cluster"}
             return self._on_mget(msg)
+        if op == "keys":
+            if self._is_removed():
+                return {"type": "client_response", "status": "error",
+                        "error": "this node was removed from the cluster"}
+            return self._on_keys(msg)
         key = msg.get("key")
         if op not in ("set", "get", "del", "cas") or key is None:
             return {"type": "client_response", "status": "error",
@@ -2538,16 +2590,23 @@ class RaftNode:
                     min_index: int = 0,
                     session_term: int | None = None,
                     keys: list[str] | None = None,
-                    stale_ok: bool = False) -> dict:
+                    stale_ok: bool = False,
+                    scan_prefix: str | None = None,
+                    scan_limit: int = MAX_KEYS_SCAN) -> dict:
         """ReadIndex read (Raft dissertation §6.4).
 
         ``key`` serves one key; ``keys`` serves a multi-get instead —
         the same leadership confirmation and apply wait for the whole
         batch, and the reply carries ``values`` aligned with
-        ``keys`` instead of ``value``. Everything else — the lease
-        fast path, the pending-read wait, the fallback, the redirect
-        on leadership loss — is identical, so a multi-get is exactly
-        as linearizable as a single ``get``.
+        ``keys`` instead of ``value``. ``scan_prefix`` serves a key
+        enumeration instead — every key in the applied state machine
+        starting with the prefix, sorted, at most ``scan_limit`` of
+        them, with ``truncated`` when more matched — and the reply
+        carries ``keys`` plus the same ``read_index`` / ``read_term``.
+        Everything else — the lease fast path, the pending-read wait,
+        the fallback, the redirect on leadership loss — is identical
+        for all three shapes, so a scan is exactly as linearizable
+        as a single ``get``.
 
         A stale read (``stale_ok``) is the one exception to the
         leader-only rule: a follower holding a fresh leader lease
@@ -2607,7 +2666,13 @@ class RaftNode:
             (lock held at every call site): ``value`` for one key,
             ``values`` aligned with ``keys`` for a multi-get — None
             in a position whose key is missing, so a batch never
-            shifts after a miss."""
+            shifts after a miss — or ``keys`` plus ``truncated``
+            for a scan, the matching keys in sorted order capped at
+            the scan limit."""
+            if scan_prefix is not None:
+                matching = self.sm.keys(scan_prefix)
+                return {"keys": matching[:scan_limit],
+                        "truncated": len(matching) > scan_limit}
             if keys is not None:
                 return {"values": [self.sm.get(k) for k in keys]}
             return {"value": self.sm.get(key)}

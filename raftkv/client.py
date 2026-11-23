@@ -9,6 +9,7 @@ Examples:
     python -m raftkv.client --node 127.0.0.1:5001 set mykey myvalue
     python -m raftkv.client --node 127.0.0.1:5001 get mykey
     python -m raftkv.client --node 127.0.0.1:5001 mget mykey otherkey
+    python -m raftkv.client --node 127.0.0.1:5001 keys --prefix my
     python -m raftkv.client --node 127.0.0.1:5001 del mykey
     python -m raftkv.client --node 127.0.0.1:5001 cas mykey myvalue newvalue
     python -m raftkv.client --node 127.0.0.1:5001 watch mykey --timeout 10
@@ -188,6 +189,46 @@ class Session:
             min_index = self.last_write_index
             term = self.last_write_term
         msg: dict = {"type": "client", "op": "mget", "keys": list(keys),
+                     "client_id": self.client_id,
+                     "min_commit_index": min_index,
+                     "session_term": term}
+        resp = request(self.node_addr, msg, pool=self._pooled)
+        if (resp.get("status") == "ok"
+                and resp.get("read_index") is not None):
+            read_index = int(resp["read_index"])
+            if read_index > self.last_read_index:
+                self.last_read_index = read_index
+                self.last_read_term = int(resp.get("read_term") or 0)
+        return resp
+
+    def keys(self, prefix: str = "", limit: int = 1000) -> dict:
+        """Enumerate keys with one ``keys`` RPC: every key in the
+        applied state machine starting with ``prefix`` (empty
+        prefix means all keys), sorted, at most ``limit`` of them
+        (default 1000, the server cap). The reply carries ``keys``
+        plus ``truncated`` — True when more keys matched than the
+        limit returned, so the caller narrows the prefix and
+        re-scans. Carries the same session watermark as ``get`` and
+        advances the read watermark from the reply's ``read_index``
+        exactly the same way, so a scan is read-your-writes and
+        monotonic like any other session read. A bad limit is a
+        client error — the server rejects it — so this returns the
+        error response instead of sending it."""
+        if not isinstance(prefix, str):
+            return {"type": "client_response", "status": "error",
+                    "error": "keys prefix must be a string"}
+        if not isinstance(limit, int) or isinstance(limit, bool) \
+                or limit < 1 or limit > 1000:
+            return {"type": "client_response", "status": "error",
+                    "error": "keys limit must be between 1 and 1000"}
+        if self.last_read_index > self.last_write_index:
+            min_index = self.last_read_index
+            term = self.last_read_term
+        else:
+            min_index = self.last_write_index
+            term = self.last_write_term
+        msg: dict = {"type": "client", "op": "keys",
+                     "prefix": prefix, "limit": limit,
                      "client_id": self.client_id,
                      "min_commit_index": min_index,
                      "session_term": term}
@@ -386,6 +427,30 @@ def mget(node_addr: tuple[str, int], keys: list[str],
                                "keys": list(keys)}, timeout=timeout)
 
 
+def keys(node_addr: tuple[str, int], prefix: str = "",
+         limit: int = 1000, timeout: float = 12.0) -> dict:
+    """Enumerate keys with one ``keys`` RPC, following leader
+    redirects like ``request``.
+
+    One request serves the whole scan through the leader's
+    ReadIndex path, so the list reflects the committed state as of
+    one read index — never a half-applied prefix. The reply is the
+    plain ``keys`` response (``status`` ``ok`` with ``keys`` in
+    sorted order, ``truncated`` True when more matched than the
+    limit). A bad prefix or limit never goes on the wire and
+    returns the server's error shape instead."""
+    if not isinstance(prefix, str):
+        return {"type": "client_response", "status": "error",
+                "error": "keys prefix must be a string"}
+    if not isinstance(limit, int) or isinstance(limit, bool) \
+            or limit < 1 or limit > 1000:
+        return {"type": "client_response", "status": "error",
+                "error": "keys limit must be between 1 and 1000"}
+    return request(node_addr, {"type": "client", "op": "keys",
+                               "prefix": prefix, "limit": limit},
+                   timeout=timeout)
+
+
 def request(node_addr: tuple[str, int], msg: dict, timeout: float = 12.0,
             pool: ConnectionPool | None = None) -> dict:
     """Send one client request, following leader redirects.
@@ -456,6 +521,17 @@ def main(argv: list[str] | None = None) -> int:
              "one JSON list, null for a missing key, in key order")
     p_mget.add_argument("keys", nargs="+",
                         help="keys to read, in order")
+    p_keys = sub.add_parser(
+        "keys",
+        help="list keys in the store, sorted: prints them as one "
+             "JSON list, optionally restricted to a prefix and "
+             "capped at --limit (default 1000)")
+    p_keys.add_argument("--prefix", default="",
+                        help="only keys starting with PREFIX "
+                             "(default: all keys)")
+    p_keys.add_argument("--limit", type=int, default=1000,
+                        help="at most this many keys (1-1000, "
+                             "default 1000)")
     p_del = sub.add_parser("del")
     p_del.add_argument("key")
     p_del.add_argument("--client-id", default=None)
@@ -547,6 +623,9 @@ def main(argv: list[str] | None = None) -> int:
         msg["key"] = args.key
     elif op == "mget":
         msg["keys"] = args.keys
+    elif op == "keys":
+        msg["prefix"] = args.prefix
+        msg["limit"] = args.limit
     elif op == "add_server":
         msg["server_id"] = args.server_id
         ahost, _, aport = args.addr.rpartition(":")
@@ -589,6 +668,8 @@ def main(argv: list[str] | None = None) -> int:
             print(resp.get("value") if resp.get("value") is not None else "(nil)")
         elif op == "mget":
             print(json.dumps(resp.get("values")))
+        elif op == "keys":
+            print(json.dumps(resp.get("keys")))
         else:
             print("OK")
         return 0

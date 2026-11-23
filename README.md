@@ -98,6 +98,22 @@ logic and the failure handling, not the key-value API on top.
   faster per key than pipelining, since the dispatch still
   dominates. `scripts/bench.py --mget` runs the phase
   (`--mget-batch` sets the batch size).
+- **Key enumeration** — since v0.31.0 one `keys` RPC lists the
+  store's keys (`client.keys(prefix, limit)`,
+  `Session.keys(prefix, limit)`, `keys --prefix p --limit 100` on
+  the CLI): every matching key in sorted order, at most 1000 per
+  reply, with `truncated` saying whether more matched, so a client
+  that needs the rest narrows the prefix and re-scans. The scan
+  rides the same ReadIndex/lease path as a single `get` — one
+  leadership confirmation, one apply wait — so the list reflects
+  the committed state as of one read index, exactly as
+  linearizable, and a stale scan is served from a follower lease
+  exactly like a stale `get`. The reply carries the same
+  `read_index` / `read_term`, so a session advances its read
+  watermark from a scan like any other read. Sorting the whole
+  keyspace per call is the honest cost: this is an enumeration for
+  operators and small stores, not a streaming cursor — paging a
+  very large keyspace is the next step (see Roadmap).
 - **Leader lease reads** — a leader that heard acks from a majority
   within the last 100ms (shorter than any follower's 150ms minimum
   election timeout, so no new leader can have been elected since)
@@ -373,7 +389,7 @@ make test
 # or: python3 -m unittest discover -s tests -v
 ```
 
-183 tests, plus a smoke test for the benchmark script, all passing:
+194 tests, plus a smoke test for the benchmark script, all passing:
 
 | Test | What it proves |
 |---|---|
@@ -525,6 +541,17 @@ make test
 | `test_mget_rejects_bad_read_params` | A non-integer or negative min_commit_index is an error, exactly as for a single get |
 | `test_session_mget_is_read_your_writes` | A session mget carries the write watermark, sees its own write, and advances the read watermark |
 | `test_mget_matches_pipelined_get_many` | The same 50 keys read by one mget and by pipelined get_many agree exactly |
+| `test_keys_returns_all_keys_sorted` | A scan with no prefix returns every key in sorted order, with the read index/term |
+| `test_keys_prefix_filters` | A prefix scan returns only keys under that prefix; a non-matching prefix returns [] |
+| `test_keys_limit_truncates` | A limit below the match count returns the first keys in order with truncated True |
+| `test_keys_empty_store` | A scan of an empty store returns an empty list, not an error |
+| `test_keys_reflects_deletes` | A deleted key is gone from the next scan |
+| `test_keys_from_follower_redirects` | A scan sent to a follower is redirected to the leader and still answers |
+| `test_keys_stale_served_from_follower_lease` | A scan with stale_ok is served by a follower holding a fresh leader lease |
+| `test_keys_rejects_bad_params` | A non-string prefix or a limit outside 1-1000 is an error, not a scan |
+| `test_keys_rejects_bad_read_params` | A non-integer or negative min_commit_index is an error, exactly as for a single get |
+| `test_session_keys_is_read_your_writes` | A session scan sees its own write and advances the session's read watermark |
+| `test_keys_cli` | The `keys` CLI subcommand prints the keys as one JSON list, honoring --prefix and --limit |
 
 Tests use real nodes (real TCP, real threads, real disk) on localhost —
 no mocks of the consensus path.
@@ -1284,3 +1311,31 @@ entries left in `log.jsonl` are dropped by their index on reload.
   follower, stale service from a follower lease, bad key lists
   and bad read params rejected, session read-your-writes, and
   agreement with pipelined `get_many` on the same 50 keys.
+- ~~Key enumeration~~ — done in v0.31.0, Nov 23, 2026: a `keys`
+  RPC lists the store's keys through the same ReadIndex/lease path
+  as a single `get`, so a scan is exactly as linearizable — it
+  reflects the committed state as of one read index, never a
+  half-applied prefix. `KVStore.keys(prefix)` returns the matching
+  keys sorted (sorted so the answer is deterministic and a
+  limit-based re-scan is well-defined); `_serve_read` serves the
+  scan from the same `_values()` payload builder as `get`/`mget`,
+  with `scan_prefix` / `scan_limit` parameters alongside `key` /
+  `keys`, so the lease fast path, the pending-read wait, the
+  fallback, and the redirect on leadership loss are all shared,
+  not re-implemented. The reply carries `keys` (at most
+  `MAX_KEYS_SCAN` = 1000, the same cap rationale as mget) plus
+  `truncated` when more matched, and the same `read_index` /
+  `read_term` a session uses to advance its read watermark. The
+  client exposes it as `client.keys(prefix, limit)`,
+  `Session.keys(prefix, limit)` (same watermark, same
+  read-your-writes guarantees), and `keys --prefix p --limit N`
+  on the CLI (one JSON list). `tests/test_keys.py` proves it: all
+  keys sorted, prefix filtering, limit truncation, empty store,
+  deletes reflected, redirect from a follower, stale service from
+  a follower lease, bad prefixes/limits and bad read params
+  rejected, session read-your-writes, and the CLI end to end.
+  The next real thing is cursor-based paging: a scan currently
+  sorts the whole keyspace on every call, so enumerating a very
+  large store means repeated full sorts — a `start_after` cursor
+  (resume past the last key returned) would let a client page
+  through it in bounded calls instead.

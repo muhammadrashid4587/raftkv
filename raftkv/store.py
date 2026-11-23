@@ -59,6 +59,16 @@ class KVStore:
     def get(self, key: str) -> str | None:
         return self._data.get(key)
 
+    def keys(self, prefix: str = "") -> list[str]:
+        """Every key in the store, sorted, optionally restricted to
+        keys starting with ``prefix``. Sorted so a scan's answer is
+        deterministic — the same state always enumerates in the same
+        order, which is what makes a paged scan (limit + repeat)
+        well-defined. Pure read: no log entry, no state change."""
+        if prefix:
+            return sorted(k for k in self._data if k.startswith(prefix))
+        return sorted(self._data)
+
     def load(self, state: dict[str, str]) -> None:
         """Replace the whole state with ``state`` (used when installing
         a snapshot: the snapshot *is* the state as of its last included
