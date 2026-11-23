@@ -74,6 +74,21 @@ LEADER_LEASE_DURATION = 0.1
 # How long a ReadIndex read waits for the state machine to apply up to
 # its read index before falling back to a plain heartbeat-confirmed read.
 READ_INDEX_TIMEOUT = 2.0
+# Follower lease for reads: how long a follower may serve a plain read
+# from its applied state after hearing from the leader. Same length as
+# the leader lease (100ms, shorter than ELECTION_TIMEOUT_MIN): the last
+# heartbeat proves the leader was alive and leading at that moment, and
+# no new leader can be elected before the follower's election timeout
+# (150ms) expires, so within the window every entry the follower has
+# applied still came from that same leader's committed log. The read is
+# NOT linearizable — a write committed after the last heartbeat may be
+# missing — but its staleness is bounded: it reflects the leader's
+# committed state as of the last heartbeat, at most ~one heartbeat
+# interval (50ms) plus apply lag behind the leader, and a partitioned
+# follower stops serving within 100ms of losing contact. Session reads
+# never take this path: they carry a watermark the follower may not
+# have applied, so they still redirect to the leader.
+FOLLOWER_LEASE_DURATION = LEADER_LEASE_DURATION
 # Compact the log once it holds more than this many post-snapshot
 # entries. 1000 is large enough that compaction is rare in normal use
 # but still bounds log.jsonl on a long-lived cluster. Tests pass a
@@ -266,6 +281,12 @@ class RaftNode:
         # to grant one to a peer, or a fresh cluster could never elect
         # a leader at all. None means "never heard from a leader".
         self._last_leader_contact: float | None = None
+        # The term the last leader contact arrived in. The follower
+        # lease (see _follower_lease_valid) only holds while the term
+        # is unchanged: a higher term means a new election happened
+        # since the contact, so the old leader may be deposed even
+        # though the contact itself is still recent.
+        self._last_leader_contact_term: int | None = None
         self._last_heartbeat_sent = 0.0
         # ReadIndex reads waiting for the state machine to apply up to
         # their read index. Each entry is {"read_index": int,
@@ -1012,6 +1033,7 @@ class RaftNode:
                     "pending_reads": len(self._pending_reads),
                     "dedup_entries": len(self._dedup),
                     "lease_valid": self._lease_valid(),
+                    "follower_lease_valid": self._follower_lease_valid(),
                     "confirm_rounds": self._confirm_rounds,
                     "config": sorted(self.config),
                     "peers": sorted(self.peers),
@@ -1132,6 +1154,7 @@ class RaftNode:
             self._fail_pending_reads()
             self._reset_election_timer()
             self._last_leader_contact = time.monotonic()
+            self._last_leader_contact_term = term
 
             # Log matching property: the log must contain an entry at
             # prev_log_index with term prev_log_term, or the RPC fails
@@ -1227,6 +1250,7 @@ class RaftNode:
             self._fail_pending_reads()
             self._reset_election_timer()
             self._last_leader_contact = time.monotonic()
+            self._last_leader_contact_term = term
 
             if "chunk_index" in msg:
                 return self._on_snapshot_chunk(msg, last_included_index,
@@ -1399,7 +1423,12 @@ class RaftNode:
             if min_index < 0:
                 return {"type": "client_response", "status": "error",
                         "error": "min_commit_index must be >= 0"}
-            return self._serve_read(key, min_index, session_term)
+            # An explicit stale read asks to be served from any node
+            # holding a fresh leader lease (see _serve_read): bounded
+            # staleness, no redirect hop. Off by default — a plain
+            # read stays linearizable through the leader.
+            return self._serve_read(key, min_index, session_term,
+                                    stale_ok=bool(msg.get("stale_ok")))
         command = {"op": op, "key": key}
         if op == "set":
             command["value"] = msg.get("value")
@@ -1846,8 +1875,19 @@ class RaftNode:
         self._pending_reads = []
 
     def _serve_read(self, key: str, min_index: int = 0,
-                    session_term: int | None = None) -> dict:
+                    session_term: int | None = None,
+                    stale_ok: bool = False) -> dict:
         """ReadIndex read (Raft dissertation §6.4).
+
+        A stale read (``stale_ok``) is the one exception to the
+        leader-only rule: a follower holding a fresh leader lease
+        serves it from its applied state instead of redirecting.
+        Bounded staleness, not linearizability — it reflects the
+        leader's committed state as of the follower's last heartbeat
+        — and it is opt-in only: a plain read without the flag still
+        redirects to the leader and is served linearizably, and a
+        stale read that also carries a session watermark redirects
+        too, since the follower may not have applied that far.
 
         1. Record read_index = commit_index while leader in this term —
            or the session's last acknowledged write index, whichever is
@@ -1894,6 +1934,26 @@ class RaftNode:
         """
         with self.lock:
             if self.role != "leader":
+                # A follower with a fresh leader lease serves an
+                # explicit stale read from its applied state instead
+                # of redirecting: it heard from the current term's
+                # leader within FOLLOWER_LEASE_DURATION, so no new
+                # leader can exist yet and its applied state is a
+                # committed prefix of that leader's log. Bounded
+                # staleness, not linearizability — a write committed
+                # after the last heartbeat may be missing — so the
+                # flag is required: a plain read without it still
+                # redirects to the leader and stays linearizable,
+                # and a session read (which carries a watermark the
+                # follower may not have applied) redirects too.
+                if (stale_ok and min_index == 0 and session_term is None
+                        and self._follower_lease_valid()):
+                    value = self.sm.get(key)
+                    return {"type": "client_response", "status": "ok",
+                            "value": value,
+                            "read_index": self.last_applied,
+                            "read_term": self._term_at(self.last_applied),
+                            "lease": "follower"}
                 return self._redirect()
             term = self.current_term
             if min_index > self._last_log_index():
@@ -1963,6 +2023,29 @@ class RaftNode:
             read_term = self._term_at(read_index)
         return {"type": "client_response", "status": "ok", "value": value,
                 "read_index": read_index, "read_term": read_term}
+
+    def _follower_lease_valid(self) -> bool:
+        """True if this follower heard from the current term's leader
+        within FOLLOWER_LEASE_DURATION. Lock held.
+
+        The contact must be in the current term: a higher term means
+        an election happened since, so the leader we heard from may
+        be deposed even though the contact is still recent. Safe for
+        the same reason as the leader lease — the window is shorter
+        than the minimum election timeout, so no new leader can have
+        been elected since the contact, and every entry this node has
+        applied came from that leader's committed log. A candidate
+        holds no lease (role check), and a removed node never reaches
+        here — _on_client rejects it first.
+        """
+        if self.role != "follower":
+            return False
+        if self._last_leader_contact is None:
+            return False
+        if self._last_leader_contact_term != self.current_term:
+            return False
+        return (time.monotonic() - self._last_leader_contact
+                <= FOLLOWER_LEASE_DURATION)
 
     def _lease_valid(self) -> bool:
         """True if a majority of voters acked us within

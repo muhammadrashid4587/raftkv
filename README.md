@@ -33,6 +33,27 @@ logic and the failure handling, not the key-value API on top.
   ~250-730 to ~1300-3500 ops/s (see Benchmark). If the lease is stale
   the read falls back to the ReadIndex heartbeat round, and a deposed
   leader holds no lease — stepping down clears it.
+- **Follower lease reads** — since v0.20.0 a follower that heard
+  from the current term's leader within the last 100ms (shorter
+  than any follower's 150ms minimum election timeout, so no new
+  leader can have been elected since) serves an explicit stale
+  read (`get --stale`, `"stale_ok": true`) straight from its
+  applied state instead of redirecting to the leader — no
+  heartbeat round, no redirect hop, and the reply carries the
+  applied index and term like any other read. The read is
+  bounded-stale, not linearizable: it reflects the leader's
+  committed state as of the follower's last heartbeat, so a write
+  committed after that heartbeat may be missing — at most ~one
+  heartbeat interval (50ms) plus apply lag behind the leader in a
+  healthy cluster, and a partitioned follower stops serving within
+  100ms of losing contact and redirects instead. Its applied state
+  is always a committed prefix of that leader's log, never
+  divergent state. The flag is opt-in on purpose: a plain read
+  without it still redirects to the leader and is served
+  linearizably, so the chaos harness's linearizability checks
+  keep passing. Session reads never take this path either: they
+  carry a watermark the follower may not have applied, so they
+  still redirect to the leader, which waits for it.
 - **ReadIndex reads** — a read records the leader's commit index,
   confirms leadership with a heartbeat round to a majority, and only
   returns once the state machine has applied up to that index, so the
@@ -240,7 +261,7 @@ make test
 # or: python3 -m unittest discover -s tests -v
 ```
 
-126 tests, plus a smoke test for the benchmark script, all passing:
+133 tests, plus a smoke test for the benchmark script, all passing:
 
 | Test | What it proves |
 |---|---|
@@ -288,6 +309,13 @@ make test
 | `test_lease_expires_without_majority_acks` | With both followers down the lease goes stale, the read falls back to a round and errors instead of serving unconfirmed |
 | `test_step_down_clears_lease` | Stepping down clears the ack record, so a deposed leader holds no lease |
 | `test_lease_counts_only_voting_members` | Only voting members' acks extend the lease; a non-voter's fresh ack does not help |
+| `test_follower_serves_plain_read_from_lease` | A follower with a fresh leader lease serves an explicit stale read itself, no confirmation round, no log entry |
+| `test_plain_read_still_redirects_from_follower` | A plain read without the stale flag still redirects to the leader, even with a fresh lease |
+| `test_follower_lease_read_sees_latest_committed_value` | A follower lease read returns the latest value it has applied |
+| `test_follower_lease_read_carries_applied_index` | A follower lease read names the applied index and term its value reflects |
+| `test_follower_lease_expires_after_isolation` | An isolated follower stops serving within 100ms of losing contact and redirects |
+| `test_session_read_still_redirects_from_follower` | A session read never takes the follower lease path; it redirects to the leader |
+| `test_follower_without_leader_contact_redirects` | A node that never heard from a leader holds no lease and redirects |
 | `test_retry_with_same_request_id_appends_once` | A retried write returns ok and appends no second log entry |
 | `test_concurrent_duplicate_writes_append_once` | Five identical concurrent writes produce exactly one log entry |
 | `test_different_request_ids_are_distinct_writes` | Different request ids are distinct writes |
@@ -751,3 +779,21 @@ entries left in `log.jsonl` are dropped by their index on reload.
   catch-up through 64-byte chunks, partial transfers installing
   nothing, out-of-order and duplicate chunks, stale-term
   rejection, and a superseded transfer never mixing pieces.
+- ~~Follower lease reads~~ — done in v0.20.0, Nov 23, 2026: a
+  follower that heard from the current term's leader within 100ms
+  serves an explicit stale read (`get --stale`, `"stale_ok":
+  true`) from its applied state instead of redirecting — no
+  heartbeat round, no redirect hop — with the reply carrying the
+  applied index and term and a `"lease": "follower"` marker.
+  Bounded staleness, not linearizability: the read reflects the
+  leader's committed state as of the last heartbeat, at most ~one
+  heartbeat interval plus apply lag behind in a healthy cluster,
+  and a partitioned follower stops serving within 100ms and
+  redirects. The flag is opt-in on purpose, so a plain read
+  without it still redirects to the leader and stays
+  linearizable; session reads still redirect too.
+  `tests/test_follower_lease.py` covers serving a stale read from
+  the lease, the latest committed value, the applied index in the
+  reply, a plain read still redirecting, lease expiry after
+  isolation, the session-read redirect, and a node with no leader
+  contact redirecting.

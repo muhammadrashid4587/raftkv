@@ -206,6 +206,13 @@ def main(argv: list[str] | None = None) -> int:
     p_get.add_argument("--read-term", type=int, default=0,
                        help="term of the entry at --min-read-index, "
                             "checked against the serving node's log")
+    p_get.add_argument("--stale", action="store_true",
+                       help="allow a follower holding a fresh leader "
+                            "lease to serve the read from its applied "
+                            "state: bounded staleness (at most ~one "
+                            "heartbeat behind the leader), no redirect "
+                            "hop. Ignored when a session watermark is "
+                            "given — that read still goes to the leader")
     p_del = sub.add_parser("del")
     p_del.add_argument("key")
     p_del.add_argument("--client-id", default=None)
@@ -299,6 +306,8 @@ def main(argv: list[str] | None = None) -> int:
         elif args.min_index:
             msg["min_commit_index"] = args.min_index
             msg["session_term"] = args.session_term
+        if args.stale:
+            msg["stale_ok"] = True
     resp = request((host, int(port)), msg, timeout=args.timeout)
     status = resp.get("status")
     if status == "ok":
