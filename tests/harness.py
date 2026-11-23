@@ -94,6 +94,32 @@ class Cluster:
         self.live.add(node_id)
         return node
 
+    def partition(self, a: str, b: str) -> None:
+        """Split the link between nodes ``a`` and ``b`` in both
+        directions: neither sends peer RPCs to the other, and each
+        drops the other's RPCs on arrival. Client and status traffic
+        is unaffected, so a partitioned node still answers status
+        and still claims leadership to a client that asks it."""
+        self.nodes[a].partition(b)
+        self.nodes[b].partition(a)
+
+    def heal_partition(self, a: str, b: str) -> None:
+        """Restore the link between nodes ``a`` and ``b``."""
+        self.nodes[a].heal(b)
+        self.nodes[b].heal(a)
+
+    def isolate(self, node_id: str) -> None:
+        """Partition ``node_id`` from every other node in the
+        cluster — the node is on its own side of the split."""
+        for other in self.nodes:
+            if other != node_id:
+                self.partition(node_id, other)
+
+    def heal_all(self) -> None:
+        """Heal every partition on every node."""
+        for node in self.nodes.values():
+            node.heal_all()
+
     def status(self, node_id: str) -> dict:
         """Ask one node for its status RPC (role, term, config, ...)."""
         host, port = self.addrs[node_id]

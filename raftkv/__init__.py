@@ -6,4 +6,4 @@ from .watch import WatchManager
 from .linearizability import History, Op
 
 __all__ = ["RaftNode", "KVStore", "WatchManager", "History", "Op"]
-__version__ = "0.13.0"
+__version__ = "0.14.0"

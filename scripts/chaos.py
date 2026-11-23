@@ -34,7 +34,14 @@ Usage:
 
     python3 scripts/chaos.py [--seed 7] [--writes 60] [--faults 6]
         [--threads 3] [--port-base 5200] [--data-dir /tmp/raftkv-chaos]
-        [--keep]
+        [--keep] [--partition SECONDS]
+
+With ``--partition SECONDS`` the run also isolates the current
+leader from both followers for that long mid-run (a real split:
+all three nodes stay up, they just cannot hear each other). The
+majority must elect a new leader and keep committing while the
+split lasts; the isolated leader must not commit anything. The
+same end-of-run verification covers the split.
 """
 
 from __future__ import annotations
@@ -102,6 +109,58 @@ class Cluster:
 
     def restart_node(self, i: int) -> None:
         self._start_node(i)
+
+    def _partition_rpc(self, src: int, dst: int, action: str) -> bool:
+        """One partition control RPC, retried while the target node is
+        down: the fault thread kills nodes on its own schedule, so a
+        node can be mid-restart when the partition phase runs. A
+        restarted node comes back with an empty partition set
+        (partitions are in-memory only), so a control RPC that fails
+        while the node is down must be retried after it is back, or
+        the split would silently be one-sided on that link."""
+        host, port = self.addrs[src]
+        deadline = time.monotonic() + 5.0
+        while True:
+            resp = send_rpc(host, port,
+                            {"type": "partition",
+                             "peer": f"node{dst + 1}", "action": action},
+                            timeout=2.0)
+            if resp and resp.get("status") == "ok":
+                return True
+            if time.monotonic() > deadline:
+                return False
+            time.sleep(0.2)
+
+    def partition(self, a: int, b: int) -> bool:
+        """Split the link between nodes ``a`` and ``b`` (0-based) in
+        both directions, via the node's partition control RPC: neither
+        sends peer RPCs to the other, and each drops the other's RPCs
+        on arrival. Client and status traffic still flow, so a
+        partitioned node still answers status and still claims
+        leadership — a real split, not a crash. Returns False if a
+        control RPC did not answer even after retries."""
+        return (self._partition_rpc(a, b, "drop")
+                and self._partition_rpc(b, a, "drop"))
+
+    def heal_partition(self, a: int, b: int) -> bool:
+        """Restore the link between nodes ``a`` and ``b``."""
+        return (self._partition_rpc(a, b, "heal")
+                and self._partition_rpc(b, a, "heal"))
+
+    def heal_all(self) -> None:
+        """Heal every partition on every node."""
+        for a in range(3):
+            for b in range(3):
+                if a != b:
+                    self.heal_partition(a, b)
+
+    def leader_index(self) -> int | None:
+        """Index of the node that currently reports role leader, or
+        None if none (or more than one) does. Status RPCs still work
+        while partitioned, so this sees through a split."""
+        leaders = [i for i in range(3)
+                   if self.status(i).get("role") == "leader"]
+        return leaders[0] if len(leaders) == 1 else None
 
     def is_live(self, i: int) -> bool:
         proc = self.procs[i]
@@ -258,6 +317,31 @@ def fault_loop(cluster: Cluster, rng: random.Random, faults: int,
     faults_done.set()
 
 
+def partition_phase(cluster: Cluster, seconds: float,
+                    log: list[str]) -> None:
+    """Jepsen-style split, mid-run: isolate the current leader from
+    both followers for ``seconds``, then heal. The majority must
+    elect a new leader and keep committing while the split lasts;
+    the isolated leader cannot commit (its commit index must not
+    move) and rejoins cleanly after the heal. Runs on its own
+    thread, concurrently with the writers and the kill/restart
+    faults; the normal end-of-run verification (acked writes,
+    convergence, linearizability) covers the whole phase."""
+    time.sleep(1.0)
+    leader = cluster.leader_index()
+    if leader is None:
+        log.append("partition: skipped, no single leader found")
+        return
+    others = [i for i in range(3) if i != leader]
+    if not all(cluster.partition(leader, i) for i in others):
+        log.append("partition: control RPC failed, split may be partial")
+    log.append(f"partition: isolated node{leader + 1} (leader) "
+               f"for {seconds:g}s")
+    time.sleep(seconds)
+    cluster.heal_all()
+    log.append("partition: healed")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seed", type=int, default=7,
@@ -269,6 +353,16 @@ def main(argv: list[str] | None = None) -> int:
                              "fault schedule finishes)")
     parser.add_argument("--faults", type=int, default=6,
                         help="kill/restart cycles (default 6)")
+    parser.add_argument("--partition", type=float, default=0.0,
+                        help="isolate the current leader from both "
+                             "followers for this many seconds mid-run "
+                             "(default 0: no partition phase). The "
+                             "majority must elect a new leader and keep "
+                             "committing while the split lasts; the "
+                             "isolated leader must not commit anything, "
+                             "and the cluster must converge after the "
+                             "heal — all checked by the normal end-of-"
+                             "run verification.")
     parser.add_argument("--threads", type=int, default=3,
                         help="concurrent writer threads (default 3)")
     parser.add_argument("--readers", type=int, default=2,
@@ -317,6 +411,13 @@ def main(argv: list[str] | None = None) -> int:
             args=(cluster, rng, args.faults, faults_done, fault_log),
             daemon=True)
         faults.start()
+        partition_thread = None
+        if args.partition > 0:
+            partition_thread = threading.Thread(
+                target=partition_phase,
+                args=(cluster, args.partition, fault_log),
+                daemon=True)
+            partition_thread.start()
         writers = [
             threading.Thread(target=writer,
                              args=(cluster, t, args.writes, acked, lock,
@@ -342,6 +443,9 @@ def main(argv: list[str] | None = None) -> int:
         for r in readers:
             r.join(timeout=5.0)
         faults.join(timeout=5.0)
+        if partition_thread is not None:
+            partition_thread.join(timeout=args.partition + 10.0)
+            cluster.heal_all()  # never verify with a split in place
         for line in fault_log:
             print(f"  {line}")
         if errors:

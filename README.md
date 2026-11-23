@@ -539,3 +539,22 @@ entries left in `log.jsonl` are dropped by their index on reload.
   of `scripts/chaos.py` and `tests/test_chaos.py`, with synthetic
   histories plus a live-cluster test in
   `tests/test_linearizability.py`.
+- ~~Jepsen-style partition test on the chaos harness~~ — done in
+  v0.14.0, Nov 22, 2026: `RaftNode.partition()` / `heal()` drops peer
+  RPCs in both directions (outgoing sends return nothing, incoming
+  peer RPCs are dropped on arrival) while client and status traffic
+  still flow, so a partitioned node still answers status and still
+  claims leadership — a real split, not a crash — plus a `partition`
+  control RPC so the subprocess chaos harness can split a live
+  cluster too. `tests/test_partition.py` proves both shapes: isolating
+  the leader (the two followers elect a new leader, writes keep
+  acking through it, the isolated leader's commit index does not
+  move and a write sent to it directly never acks) and a 2-vs-1
+  follower split (the same leader stays leader, the minority falls
+  behind). After the heal every acked write reads back on every node,
+  all three state machines hold exactly the acked writes, and the
+  recorded history is linearizable. `scripts/chaos.py --partition
+  SECONDS` runs the leader-isolation split mid-chaos-run, covered by
+  the same end-of-run verification. Verified with seeds 42 and 7
+  plus a 3s partition: 242 and 191 acked writes respectively, zero
+  lost, all nodes converged, linearizability ok.

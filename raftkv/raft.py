@@ -195,6 +195,14 @@ class RaftNode:
         # This node's own address once start() runs; recorded into the
         # config so other members learn it from the log/snapshot.
         self._self_addr: tuple[str, int] | None = None
+        # Simulated network partition (see partition()/heal()): peer
+        # ids this node refuses to talk to — no peer RPC is sent to
+        # them, and their peer RPCs are dropped on arrival. Client and
+        # status traffic is unaffected, so a partitioned node still
+        # answers status and still claims leadership to a client that
+        # asks it directly — exactly like a real partition. In-memory
+        # only, never persisted: a restart heals every partition.
+        self._partitioned: set[str] = set()
 
         self.lock = threading.RLock()
         self.commit_cond = threading.Condition(self.lock)
@@ -670,6 +678,57 @@ class RaftNode:
             self._timer_thread.join(timeout=2.0)
             self._timer_thread = None
 
+    # ------------------------------------------------------------------
+    # Simulated network partitions (test tooling, see also handle_rpc)
+    # ------------------------------------------------------------------
+    def partition(self, peer_id: str) -> None:
+        """Drop all peer RPC traffic with ``peer_id``, both ways: this
+        node sends nothing to the peer, and the peer's RPCs are
+        dropped on arrival. Partition both directions (each node
+        partitions the other) for a clean split; a one-sided partition
+        still isolates the peer because its RPCs never get a reply
+        here and its own sends to us are dropped at our dispatch.
+        A partitioned leader keeps its role — it simply cannot commit
+        anything, because no majority can ack it — and a partitioned
+        follower times out and (with pre-vote) cannot depose the live
+        leader on the other side."""
+        with self.lock:
+            self._partitioned.add(peer_id)
+
+    def heal(self, peer_id: str) -> None:
+        """Restore peer RPC traffic with ``peer_id``."""
+        with self.lock:
+            self._partitioned.discard(peer_id)
+
+    def heal_all(self) -> None:
+        """Restore peer RPC traffic with every peer."""
+        with self.lock:
+            self._partitioned.clear()
+
+    def partitioned_peers(self) -> set[str]:
+        """Peer ids currently partitioned from this node."""
+        with self.lock:
+            return set(self._partitioned)
+
+    def _is_partitioned(self, peer_id: str | None) -> bool:
+        if peer_id is None:
+            return False
+        with self.lock:
+            return peer_id in self._partitioned
+
+    def _send_peer_rpc(self, peer: str, msg: dict,
+                       timeout: float = RPC_TIMEOUT) -> dict | None:
+        """One-shot RPC to a peer, or None without touching the
+        network when the peer is partitioned (callers already treat
+        None as "peer did not answer")."""
+        if self._is_partitioned(peer):
+            return None
+        addr = self.peers.get(peer)
+        if addr is None:
+            return None
+        host, port = addr
+        return send_rpc(host, port, msg, timeout=timeout)
+
     @property
     def is_leader(self) -> bool:
         with self.lock:
@@ -842,6 +901,36 @@ class RaftNode:
     # ------------------------------------------------------------------
     def handle_rpc(self, msg: dict) -> dict:
         msg_type = msg.get("type")
+        if msg_type in ("request_vote", "request_pre_vote"):
+            # Peer RPCs from a partitioned sender are dropped on
+            # arrival, so a one-sided partition isolates the peer
+            # even though its sends to us still land on the socket.
+            if self._is_partitioned(msg.get("candidate_id")):
+                return {"type": "error", "error": "partitioned"}
+        if msg_type in ("append_entries", "install_snapshot"):
+            if self._is_partitioned(msg.get("leader_id")):
+                return {"type": "error", "error": "partitioned"}
+        if msg_type == "partition":
+            # Control message for the chaos harness (subprocess
+            # clusters have no in-process handle on the node):
+            # {"type": "partition", "peer": "node2",
+            #  "action": "drop" | "heal"}. Replies ok, or an error
+            # for an unknown peer/action. Never persisted.
+            peer = msg.get("peer")
+            action = msg.get("action")
+            if peer not in self.peers and peer != self.id:
+                return {"type": "error",
+                        "error": f"unknown peer: {peer!r}"}
+            if action == "drop":
+                self.partition(peer)
+            elif action == "heal":
+                self.heal(peer)
+            else:
+                return {"type": "error",
+                        "error": f"unknown action: {action!r}"}
+            return {"type": "partition_response", "status": "ok",
+                    "peer": peer, "action": action,
+                    "partitioned": sorted(self.partitioned_peers())}
         if msg_type == "request_vote":
             return self._on_request_vote(msg)
         if msg_type == "request_pre_vote":
@@ -1797,11 +1886,9 @@ class RaftNode:
         """Send one pipelined AppendEntries batch and apply its reply.
         Runs on its own thread; network I/O outside the lock, the
         reply applied under it by _apply_append_reply."""
-        addr = self.peers.get(peer)
-        if addr is None:
-            return  # Peer was removed while this batch was in flight.
-        host, port = addr
-        resp = send_rpc(host, port, msg, timeout=RPC_TIMEOUT)
+        # _send_peer_rpc returns None for a partitioned (or removed)
+        # peer, which _apply_append_reply treats as a timeout.
+        resp = self._send_peer_rpc(peer, msg)
         with self.lock:
             self._apply_append_reply(peer, resp, prev, end, start, epoch)
 
@@ -1874,7 +1961,6 @@ class RaftNode:
         addr = self.peers.get(peer)
         if addr is None:
             return False  # Peer was removed while this call was queued.
-        host, port = addr
         deadline = time.monotonic() + RPC_TIMEOUT * 4
         tried_this_call = False
         while time.monotonic() < deadline:
@@ -1984,8 +2070,7 @@ class RaftNode:
             if send_snapshot:
                 return self._send_install_snapshot(peer)
             if heartbeat_msg is not None:
-                resp = send_rpc(host, port, heartbeat_msg,
-                                timeout=RPC_TIMEOUT)
+                resp = self._send_peer_rpc(peer, heartbeat_msg)
                 with self.lock:
                     prev, end, epoch = heartbeat_meta
                     self._apply_append_reply(peer, resp, prev, end,
@@ -2002,7 +2087,8 @@ class RaftNode:
         addr = self.peers.get(peer)
         if addr is None:
             return False  # Peer was removed while this call was queued.
-        host, port = addr
+        if self._is_partitioned(peer):
+            return False  # Partitioned: the snapshot never arrives.
         with self.lock:
             if self.role != "leader":
                 return False
@@ -2020,7 +2106,7 @@ class RaftNode:
                 "dedup": [[c, r, res]
                           for (c, r), res in self._dedup.items()],
             }
-        resp = send_rpc(host, port, msg, timeout=RPC_TIMEOUT)
+        resp = self._send_peer_rpc(peer, msg)
         with self.lock:
             if resp is None:
                 return False
@@ -2127,11 +2213,7 @@ class RaftNode:
             voters = set(self.config)
 
         def _ask(peer: str) -> None:
-            addr = self.peers.get(peer)
-            if addr is None:
-                return  # Peer was removed while this round was running.
-            host, port = addr
-            resp = send_rpc(host, port, msg, timeout=RPC_TIMEOUT)
+            resp = self._send_peer_rpc(peer, msg)
             if resp is None:
                 return
             with grant_lock:
@@ -2197,11 +2279,7 @@ class RaftNode:
         }
 
         def _ask(peer: str) -> None:
-            addr = self.peers.get(peer)
-            if addr is None:
-                return  # Peer was removed while this round was running.
-            host, port = addr
-            resp = send_rpc(host, port, msg, timeout=RPC_TIMEOUT)
+            resp = self._send_peer_rpc(peer, msg)
             if resp and resp.get("vote_granted") and int(resp.get("term", 0)) == term:
                 with self.lock:
                     # Only a voting member's vote counts.
