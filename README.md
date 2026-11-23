@@ -33,6 +33,19 @@ logic and the failure handling, not the key-value API on top.
   before group commit. The status RPC reports the config and the
   batching stats (`group_commit`: batches, entries, fsyncs,
   largest batch) so the batching ratio is visible live.
+- **Thread-pool server** — since v0.28.0 one reactor thread owns
+  every socket (accept, read, write) via a selector and dispatch
+  runs on a bounded pool of 32 daemon workers, instead of one
+  thread per connection. Idle connections hold no thread at all,
+  so 50 pooled client connections cost a reactor plus a few workers
+  instead of 50 handler threads contending on the GIL — that
+  contention was the read ceiling (see Benchmark). Frames from one
+  connection still dispatch in order, a bad frame still closes its
+  connection, and idle connections are still closed after 30s; a
+  long dispatch (a watch long-poll, a write waiting on
+  replication) occupies one worker exactly as it occupied one
+  handler thread before, so a handful of watches can never starve
+  reads.
 - **Persistent client connections** — since v0.27.0 the client
   reuses TCP connections instead of opening one per request: a
   `ConnectionPool` in `transport.py`, one connection checked out
@@ -320,7 +333,7 @@ make test
 # or: python3 -m unittest discover -s tests -v
 ```
 
-151 tests, plus a smoke test for the benchmark script, all passing:
+167 tests, plus a smoke test for the benchmark script, all passing:
 
 | Test | What it proves |
 |---|---|
@@ -457,6 +470,13 @@ make test
 | `test_session_uses_pool_and_close_releases_it` | A session reads and writes over pooled connections; close releases them and the session stays usable |
 | `test_session_pool_size_zero_means_one_shot` | A session with `pool_size=0` works with no pool at all |
 | `test_pooled_concurrent_reads_are_correct` | Ten threads reading through one shared pool all get the right values |
+| `test_idle_connections_use_bounded_threads` | Thirty idle connections cost no extra threads: one reactor owns them all |
+| `test_concurrent_requests_all_correct` | Twenty threads x ten requests through the pool server all get the right replies |
+| `test_split_frame_is_reassembled` | A frame split across two TCP reads is reassembled and answered |
+| `test_pipelined_frames_reply_in_order` | Two frames sent back-to-back reply in order, even when the first is slow |
+| `test_slow_dispatch_does_not_starve_pool` | Eight 1s dispatches run in parallel on the pool instead of serially |
+| `test_idle_connection_is_closed` | A connection idle past the timeout is closed by the server |
+| `test_watch_does_not_starve_reads` | Reads stay fast while a 5s watch long-polls on the leader |
 
 Tests use real nodes (real TCP, real threads, real disk) on localhost —
 no mocks of the consensus path.
@@ -482,6 +502,19 @@ sequential writes          200 ops    90.9-102.3 ops/s   p50  8.2-8.6ms
 concurrent writes x10      200 ops   740.9-757.7 ops/s   p50  9.0-10.3ms
 sequential reads           200 ops  9385-16565 ops/s     p50  0.0-0.1ms
 concurrent reads x10       200 ops  2983-5206 ops/s      p50  0.8-1.5ms  p99 4.5-36.7ms
+
+$ python3 scripts/bench.py --pool-size 50 --threads 50  # thread-pool server, v0.28.0, six runs
+sequential reads           200 ops  3373-9058 ops/s     p50  0.1-0.2ms
+concurrent reads x50       200 ops  3496-6628 ops/s     p50  0.8-3.1ms  p99 3.2-7.5ms
+```
+
+And a longer, steadier load — 50 threads of pooled reads for 20
+seconds against a real cluster, with per-process CPU sampled — before
+and after the server change:
+
+```
+v0.27.0 (thread per connection):  3459 ops/s sustained (client 0.71 cores, leader 0.17)
+v0.28.0 (reactor + worker pool):  6985 ops/s sustained (client 0.71 cores, leader 0.63)
 ```
 
 This is latency-bound, not throughput-bound: every committed write
@@ -508,16 +541,35 @@ concurrent reads run at ~3000-5200 ops/s with p99 under 40ms, and
 sequential reads at ~9400-16600 ops/s, because a read no longer pays
 a fresh TCP connection and a fresh server thread each time. Writes
 did not move — they are fsync-bound, and pooling never claimed to
-help them. The remaining read ceiling is the single Raft lock and
-one thread per connection on the server: under heavier concurrency
-than 10 clients, or on a real network, those are the next things to
-measure, not assume.
+help them. At 50 clients the read ceiling was measured, not assumed,
+before v0.28.0 changed anything: reads served straight from the
+leader (no TCP at all) run at ~40,000 ops/s with 50 threads, and a
+probe thread acquiring the Raft lock while 50 readers run waits ~1us
+on average — the lock is not the bottleneck, so no lock-skipping read
+path was built. The bottleneck was one thread per connection on the
+server: 50 handler threads plus 50 client threads contending on the
+GIL of a 1.5-CPU box, with the leader burning only 0.17 cores while
+a read waited ~3.4ms. The thread-pool server (v0.28.0) is the fix
+for exactly that: one reactor thread owns the sockets and dispatch
+runs on a bounded pool of 32 workers, so 50 pooled connections cost
+a reactor plus a few workers. Sustained concurrent reads doubled
+(~3450 to ~7000 ops/s) and the bench's concurrent reads at 50
+clients went from ~3100 to ~3500-6600 ops/s with p99 down from
+~10ms to ~3-8ms. The cost is on the other side: a lone sequential
+reader now pays one extra thread hop (reactor to worker), so
+sequential reads run at ~3400-9100 ops/s instead of ~9400-16600,
+p50 ~0.2ms instead of ~0.1ms — the server trades a little
+single-client latency for a lot of concurrent throughput. The box
+is now near CPU-saturated under the sustained load (1.36 of 1.5
+cores, client 0.71 + leader 0.63), so the next ceiling is raw CPU
+on this VM, not scheduling — a faster client or a real network
+would move it before any more server threading will.
 
 ## Architecture
 
 ```
 raftkv/
-  transport.py   Length-prefixed JSON framing, pooled or one-shot RPC, threaded TCP server
+  transport.py   Length-prefixed JSON framing, pooled or one-shot RPC, reactor + worker-pool TCP server
   raft.py        RaftNode: elections, log replication, commit, persistence
   store.py       KVStore: the deterministic state machine (SET/GET/DEL)
   linearizability.py  History/Op: record concurrent ops, verify linearizability
@@ -535,12 +587,13 @@ tests/
   test_linearizability.py  Linearizability checker: synthetic histories + live cluster
 ```
 
-**Threading.** One TCP server thread (a thread per connection), one
-timer thread driving elections/heartbeats, client requests on connection
-threads. All Raft state is guarded by a single lock, and network I/O is
-always done *outside* the lock — two nodes RPC-ing each other at the
-same time must never hold each other's lock while waiting on the
-network.
+**Threading.** One reactor thread owns every socket (a selector
+accepts, reads, and writes), a bounded pool of 32 daemon workers
+runs dispatch, and one timer thread drives elections/heartbeats.
+Client requests run on pool workers. All Raft state is guarded by a
+single lock, and network I/O is always done *outside* the lock —
+two nodes RPC-ing each other at the same time must never hold each
+other's lock while waiting on the network.
 
 **Persistence format.** Per node, in `--data-dir`:
 

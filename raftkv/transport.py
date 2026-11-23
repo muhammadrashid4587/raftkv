@@ -9,9 +9,11 @@ moves dicts between sockets. Both node-to-node RPC and the client protocol
 use the same framing.
 """
 
+import concurrent.futures
 import json
+import queue
+import selectors
 import socket
-import socketserver
 import struct
 import threading
 import time
@@ -296,38 +298,432 @@ class ConnectionPool:
             return sum(len(s["idle"]) for s in self._hosts.values())
 
 
-class _Handler(socketserver.BaseRequestHandler):
-    def handle(self) -> None:
-        self.request.settimeout(30.0)
+# ---------------------------------------------------------------------------
+# Server: one reactor thread + a bounded pool of dispatch workers.
+# ---------------------------------------------------------------------------
+
+# Dispatch workers. A long dispatch (a watch long-poll, a write waiting
+# on replication) occupies one worker for its duration, exactly as it
+# occupied one handler thread before; 32 leaves room for a handful of
+# concurrent watches without ever starving reads, while staying far
+# below one thread per connection.
+_DEFAULT_POOL_WORKERS = 32
+# An idle connection is closed after this long with no bytes either
+# way, like the old handler's 30s socket timeout. A pending watch
+# (max 25s) always answers inside it.
+_DEFAULT_IDLE_TIMEOUT = 30.0
+_RECV_SIZE = 65536
+
+
+class _TaskPool:
+    """Bounded pool of daemon worker threads running dispatch tasks.
+
+    A plain ThreadPoolExecutor is the wrong tool here: its workers are
+    non-daemon, so a node stopping while a 25s watch is in flight
+    would hang its process exit on that worker. These workers are
+    daemon like the old thread-per-connection handlers, so stop()
+    never waits on them. Each task gets a Future, so a caller can wait
+    on an earlier task — the per-connection ordering below relies on
+    that.
+    """
+
+    def __init__(self, max_workers: int):
+        self._queue: queue.Queue = queue.Queue()
+        self._threads = []
+        for i in range(max_workers):
+            thread = threading.Thread(
+                target=self._run, name=f"raftkv-worker-{i}", daemon=True)
+            thread.start()
+            self._threads.append(thread)
+
+    def submit(self, fn) -> concurrent.futures.Future:
+        fut: concurrent.futures.Future = concurrent.futures.Future()
+        self._queue.put((fn, fut))
+        return fut
+
+    def _run(self) -> None:
         while True:
-            msg = recv_message(self.request)
-            if msg is None:
+            fn, fut = self._queue.get()
+            if fn is None:
                 return
             try:
-                resp = self.server.dispatch(msg)
+                fut.set_result(fn())
+            except BaseException as exc:  # noqa: BLE001 - a failed task must settle its future
+                fut.set_exception(exc)
+
+    def shutdown(self) -> None:
+        """Release the workers. Queued tasks drain first (a watch in
+        flight finishes on its own time); the caller does not wait,
+        and the daemon threads never block process exit."""
+        for _ in self._threads:
+            self._queue.put((None, None))
+
+
+class _Connection:
+    """One client socket on the reactor: its read buffer, its queued
+    reply bytes, and the future of the last frame submitted from it.
+
+    ``inbuf`` and ``last_future`` are reactor-only. ``outbuf``,
+    ``closed`` and ``want_write`` are touched by worker threads too
+    (a worker appends a reply), so they live under ``guard``.
+    ``last_active`` is reactor-only: it moves whenever bytes arrive
+    or a reply is written.
+    """
+
+    __slots__ = ("sock", "inbuf", "outbuf", "closed", "last_future",
+                 "last_active", "want_write", "guard")
+
+    def __init__(self, sock: socket.socket):
+        self.sock = sock
+        self.inbuf = bytearray()
+        self.outbuf = bytearray()
+        self.closed = False
+        self.last_future: concurrent.futures.Future | None = None
+        self.last_active = time.monotonic()
+        self.want_write = False
+        self.guard = threading.Lock()
+
+
+class NodeServer:
+    """TCP server that dispatches each framed message to ``dispatch``.
+
+    One reactor thread owns every socket (accept, read, write) via a
+    selector; the actual dispatch runs on a bounded pool of daemon
+    worker threads. Idle connections hold no thread at all, so 50
+    pooled client connections cost one reactor thread plus a few
+    workers instead of 50 handler threads contending on the GIL —
+    that contention was the read ceiling (see README Benchmark).
+
+    Frames from one connection still dispatch in order, like the old
+    one-thread-per-connection handler: each submitted task waits on
+    the previous frame's future first, and the pool queue is FIFO,
+    so the wait can only ever be for a task already dequeued. A bad
+    frame closes the connection, exactly as a failed ``recv_message``
+    ended the old handler. Idle connections are closed after
+    ``idle_timeout`` seconds with no bytes either way.
+
+    Only the reactor thread touches the selector; a worker that
+    queued a reply sends it straight from its own thread when the
+    socket takes it, and only pokes the wakeup socketpair when
+    bytes remain queued, so the reactor re-syncs its write
+    registrations. ``shutdown()`` / ``server_close()`` mirror
+    ``socketserver``: stop the reactor, then release everything.
+    """
+
+    def __init__(self, host: str, port: int, dispatch,
+                 max_workers: int = _DEFAULT_POOL_WORKERS,
+                 idle_timeout: float = _DEFAULT_IDLE_TIMEOUT):
+        self.dispatch = dispatch
+        self.max_workers = max_workers
+        self.idle_timeout = idle_timeout
+        self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._listener.bind((host, port))
+        self._listener.listen(128)
+        self._listener.setblocking(False)
+        self.server_address = self._listener.getsockname()
+        self._selector = selectors.DefaultSelector()
+        self._selector.register(self._listener, selectors.EVENT_READ, None)
+        self._wake_r, self._wake_w = socket.socketpair()
+        self._wake_r.setblocking(False)
+        self._wake_w.setblocking(False)
+        self._selector.register(self._wake_r, selectors.EVENT_READ, None)
+        self._pool = _TaskPool(max_workers)
+        self._conns: dict[socket.socket, _Connection] = {}
+        # Connections a worker found broken (a send failed): workers
+        # must never touch the selector themselves — it is only safe
+        # on the reactor thread — so they queue the connection here
+        # and poke the reactor, which closes it on wakeup.
+        self._close_queue: queue.SimpleQueue = queue.SimpleQueue()
+        self._shutdown = False
+        self._shutdown_event = threading.Event()
+        self._last_sweep = time.monotonic()
+
+    # -- reactor ------------------------------------------------------
+
+    def serve_forever(self, poll_interval: float = 0.05) -> None:
+        """Run the reactor until shutdown() is called."""
+        try:
+            while not self._shutdown:
+                try:
+                    events = self._selector.select(timeout=poll_interval)
+                except OSError:
+                    break
+                for key, mask in events:
+                    if key.fileobj is self._listener:
+                        self._accept()
+                    elif key.fileobj is self._wake_r:
+                        self._drain_wake()
+                    else:
+                        conn = key.data
+                        if conn.closed:
+                            continue
+                        if mask & selectors.EVENT_READ:
+                            self._readable(conn)
+                        if not conn.closed and mask & selectors.EVENT_WRITE:
+                            self._writable(conn)
+                now = time.monotonic()
+                if now - self._last_sweep >= 1.0:
+                    self._last_sweep = now
+                    self._sweep_idle(now)
+        finally:
+            self._shutdown_event.set()
+
+    def _accept(self) -> None:
+        while True:
+            try:
+                sock, _ = self._listener.accept()
+            except (BlockingIOError, InterruptedError):
+                return
+            except OSError:
+                return
+            sock.setblocking(False)
+            conn = _Connection(sock)
+            self._conns[sock] = conn
+            try:
+                self._selector.register(sock, selectors.EVENT_READ, conn)
+            except (KeyError, ValueError, OSError):
+                self._close(conn)
+
+    def _readable(self, conn: _Connection) -> None:
+        try:
+            data = conn.sock.recv(_RECV_SIZE)
+        except (BlockingIOError, InterruptedError):
+            return
+        except OSError:
+            self._close(conn)
+            return
+        if not data:
+            self._close(conn)
+            return
+        conn.last_active = time.monotonic()
+        conn.inbuf += data
+        for msg in self._extract_frames(conn):
+            if conn.closed:
+                return
+            self._submit(conn, msg)
+
+    def _extract_frames(self, conn: _Connection) -> list:
+        """Each complete framed message in the read buffer.
+
+        A frame is a 4-byte big-endian length plus that many JSON
+        bytes — the same framing ``recv_message`` reads. A bad frame
+        closes the connection and the frames already extracted still
+        dispatch (their replies are dropped: the connection is gone).
+        """
+        frames = []
+        buf = conn.inbuf
+        while len(buf) >= _HEADER.size:
+            (length,) = _HEADER.unpack(buf[:_HEADER.size])
+            if length > _MAX_MESSAGE_BYTES:
+                self._close(conn)
+                return frames
+            if len(buf) < _HEADER.size + length:
+                return frames
+            payload = bytes(buf[_HEADER.size:_HEADER.size + length])
+            del buf[:_HEADER.size + length]
+            try:
+                frames.append(json.loads(payload.decode("utf-8")))
+            except (ValueError, UnicodeDecodeError):
+                self._close(conn)
+                return frames
+        return frames
+
+    def _submit(self, conn: _Connection, msg: dict) -> None:
+        prev = conn.last_future
+
+        def run() -> None:
+            if prev is not None:
+                try:
+                    prev.result()
+                except Exception:
+                    pass
+            with conn.guard:
+                if conn.closed:
+                    return
+            try:
+                resp = self.dispatch(msg)
             except Exception as exc:  # never kill a connection on a bad handler
                 resp = {"type": "error", "error": f"handler failed: {exc}"}
-            if not send_message(self.request, resp):
+            self._queue_reply(conn, encode_message(resp))
+
+        conn.last_future = self._pool.submit(run)
+
+    def _queue_reply(self, conn: _Connection, data: bytes) -> None:
+        with conn.guard:
+            if conn.closed:
                 return
+            conn.outbuf += data
+        # Best effort: send the reply straight from this worker
+        # instead of waking the reactor for it. The socket is
+        # non-blocking, so a full kernel buffer just leaves the
+        # remainder queued — the reactor drains it on EVENT_WRITE.
+        # Without this, every reply paid a full reactor round-trip
+        # (wakeup + select + send), which showed up as ~50-100us of
+        # extra latency on sequential reads.
+        self._flush(conn)
+        with conn.guard:
+            if not conn.closed and conn.outbuf:
+                self._poke()
+
+    def _flush(self, conn: _Connection) -> None:
+        """Send as much of the queued reply bytes as the socket takes
+        right now. Called from the worker that queued the reply and
+        from the reactor on EVENT_WRITE. The copy, send and delete
+        happen under the connection guard, so two flushers can never
+        send the same bytes twice; the socket is non-blocking, so the
+        send itself never blocks while the guard is held. A failed
+        send queues the connection for the reactor to close — the
+        selector is reactor-only, so a worker never closes a
+        connection itself.
+        """
+        error = False
+        with conn.guard:
+            if conn.closed or not conn.outbuf:
+                return
+            data = bytes(conn.outbuf)
+            try:
+                sent = conn.sock.send(data)
+            except (BlockingIOError, InterruptedError):
+                return
+            except OSError:
+                error = True
+            else:
+                del conn.outbuf[:sent]
+                conn.last_active = time.monotonic()
+        if error:
+            # A failed send means the peer is gone. Do not close
+            # here: the selector is reactor-only, and this runs on a
+            # worker thread — queue the close for the reactor.
+            self._request_close(conn)
+
+    def _writable(self, conn: _Connection) -> None:
+        self._flush(conn)
+        with conn.guard:
+            if not conn.closed and not conn.outbuf and conn.want_write:
+                conn.want_write = False
+                try:
+                    self._selector.modify(conn.sock,
+                                          selectors.EVENT_READ, conn)
+                except (KeyError, ValueError, OSError):
+                    pass
+
+    def _poke(self) -> None:
+        """Wake the reactor so it re-syncs write registrations. If the
+        pipe is full a wakeup is already pending, so a failed send is
+        fine."""
+        try:
+            self._wake_w.send(b"\x00")
+        except (BlockingIOError, InterruptedError, OSError):
+            pass
+
+    def _request_close(self, conn: _Connection) -> None:
+        """Ask the reactor to close a connection. Safe from any
+        thread: the close itself (selector unregister, socket close)
+        happens on the reactor thread when it wakes."""
+        self._close_queue.put(conn)
+        self._poke()
+
+    def _drain_wake(self) -> None:
+        try:
+            while self._wake_r.recv(4096):
+                pass
+        except (BlockingIOError, InterruptedError, OSError):
+            pass
+        while True:
+            try:
+                conn = self._close_queue.get_nowait()
+            except queue.Empty:
+                break
+            self._close(conn)
+        self._sync_registrations()
+
+    def _sync_registrations(self) -> None:
+        for sock, conn in list(self._conns.items()):
+            if conn.closed:
+                continue
+            with conn.guard:
+                want_write = bool(conn.outbuf)
+                if want_write == conn.want_write:
+                    continue
+                conn.want_write = want_write
+            events = selectors.EVENT_READ
+            if want_write:
+                events |= selectors.EVENT_WRITE
+            try:
+                self._selector.modify(sock, events, conn)
+            except (KeyError, ValueError, OSError):
+                pass
+
+    def _sweep_idle(self, now: float) -> None:
+        for conn in list(self._conns.values()):
+            if not conn.closed and now - conn.last_active > self.idle_timeout:
+                self._close(conn)
+
+    def _close(self, conn: _Connection) -> None:
+        with conn.guard:
+            if conn.closed:
+                return
+            conn.closed = True
+        try:
+            self._selector.unregister(conn.sock)
+        except (KeyError, ValueError, OSError):
+            pass
+        self._conns.pop(conn.sock, None)
+        try:
+            conn.sock.close()
+        except OSError:
+            pass
+
+    # -- lifecycle ----------------------------------------------------
+
+    def shutdown(self) -> None:
+        """Stop the reactor loop; blocks until serve_forever has
+        returned, like ``socketserver``'s shutdown."""
+        self._shutdown = True
+        self._poke()
+        self._shutdown_event.wait(timeout=5.0)
+
+    def server_close(self) -> None:
+        """Close the listener, every connection and the selector, and
+        release the worker pool. In-flight dispatches are daemon
+        threads and are not waited on — a node stopping mid-watch
+        behaves like the old server, whose handler threads were
+        daemon too."""
+        try:
+            self._selector.unregister(self._listener)
+        except (KeyError, ValueError, OSError):
+            pass
+        try:
+            self._listener.close()
+        except OSError:
+            pass
+        for conn in list(self._conns.values()):
+            self._close(conn)
+        try:
+            self._selector.unregister(self._wake_r)
+        except (KeyError, ValueError, OSError):
+            pass
+        for sock in (self._wake_r, self._wake_w):
+            try:
+                sock.close()
+            except OSError:
+                pass
+        try:
+            self._selector.close()
+        except OSError:
+            pass
+        self._pool.shutdown()
 
 
-class NodeServer(socketserver.ThreadingTCPServer):
-    """Threaded TCP server that dispatches each message to ``dispatch``."""
-
-    daemon_threads = True
-    allow_reuse_address = True
-
-    def __init__(self, host: str, port: int, dispatch):
-        self.dispatch = dispatch
-        super().__init__((host, port), _Handler)
-
-
-def serve_in_background(host: str, port: int, dispatch) -> NodeServer:
+def serve_in_background(host: str, port: int, dispatch,
+                        max_workers: int = _DEFAULT_POOL_WORKERS) -> NodeServer:
     """Start a NodeServer on a daemon thread. Caller must call
     ``shutdown()`` + ``server_close()`` to stop it."""
-    server = NodeServer(host, port, dispatch)
+    server = NodeServer(host, port, dispatch, max_workers=max_workers)
     thread = threading.Thread(
-        target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
+        target=server.serve_forever, kwargs={"poll_interval": 0.05},
+        name="raftkv-reactor", daemon=True,
     )
     thread.start()
     return server

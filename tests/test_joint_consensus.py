@@ -100,7 +100,23 @@ class TestJointQuorum(unittest.TestCase):
         cluster = Cluster(3)
         try:
             cluster.start_all()
-            leader = cluster.wait_for_leader()
+            leader = cluster.wait_for_stable_leader()
+            # The leader's election no-op must already be committed
+            # before the test appends its own entry: if it is still
+            # in flight, the test entry lands at index 2 and
+            # _advance_commit can legitimately commit index 1
+            # through the same holders (others[1] holds index 1),
+            # which is correct Raft behaviour but not what this test
+            # is checking. Wait until the log is fully committed, so
+            # the appended entry is the only uncommitted one.
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                with leader.lock:
+                    if leader.commit_index >= leader._last_log_index():
+                        break
+                time.sleep(0.02)
+            else:
+                self.fail("leader's log did not commit before the test")
             others = [n for n in ("node1", "node2", "node3")
                       if n != leader.id]
             with leader.lock:
