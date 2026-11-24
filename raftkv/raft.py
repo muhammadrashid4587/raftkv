@@ -1327,7 +1327,8 @@ class RaftNode:
             elif op == "noop":
                 pass
             else:
-                # The apply result matters for CAS, expire, and incr:
+                # The apply result matters for CAS, expire, incr, and
+                # setnx:
                 # their outcome is decided here, at this exact point
                 # in the log, so the result is recorded in the dedup
                 # table
@@ -1373,7 +1374,17 @@ class RaftNode:
                     self.watch.notify(entry["command"]["key"],
                                       result["value"], "set",
                                       index=self.last_applied)
-                if (op in ("cas", "expire", "incr") and result is not None
+                elif (op == "setnx" and result is not None
+                        and result.get("setnx") == 1):
+                    # A successful setnx fires like a set, with the
+                    # value it wrote: a setnx on an existing key
+                    # wrote nothing, so it fires nothing, like a
+                    # failed CAS.
+                    self.watch.notify(entry["command"]["key"],
+                                      entry["command"]["value"], "set",
+                                      index=self.last_applied)
+                if (op in ("cas", "expire", "incr", "setnx")
+                        and result is not None
                         and self.role == "leader"):
                     # Record the outcome only when a local waiter is
                     # waiting on it: the waiter is the only consumer,
@@ -1383,7 +1394,8 @@ class RaftNode:
                     # would sit in _apply_results forever. A write
                     # without a session id has no dedup key, so it
                     # always records: its waiter is identified by
-                    # index alone. CAS, expire, and incr are the ops
+                    # index alone. CAS, expire, incr, and setnx are
+                    # the ops
                     # whose apply returns a result — a set/del
                     # returns None and has nothing to record.
                     key = _dedup_key(entry["command"])
@@ -1419,10 +1431,12 @@ class RaftNode:
         """Record an applied client write in the dedup table. Lock held.
         The cached result is what a retry with the same session id gets
         back instead of a second log entry. For set/del the result is
-        always ok once committed; for CAS, expire, and incr it is the
+        always ok once committed; for CAS, expire, incr, and setnx
+        it is the
         apply-time outcome (success, mismatch, or missing key for a
         CAS; 1 or 0 for an expire; the new value, or not_an_integer
-        / overflow for an incr), so a retry returns the first
+        / overflow for an incr; 1 or 0 for a setnx), so a retry
+        returns the first
         attempt's exact result. The result also carries the log
         index and term of the entry that produced it: a retried write
         reports the same index as the first attempt, and a client
@@ -2111,10 +2125,11 @@ class RaftNode:
             return self._on_mset(msg)
         key = msg.get("key")
         if op not in ("set", "get", "del", "cas", "ttl", "expire",
-                      "incr") \
+                      "incr", "setnx") \
                 or key is None:
             return {"type": "client_response", "status": "error",
-                    "error": "op must be set/get/del/cas/ttl/expire/incr "
+                    "error": "op must be set/get/del/cas/ttl/expire/"
+                             "incr/setnx "
                              "with a key"}
         if self._is_removed():
             return {"type": "client_response", "status": "error",
@@ -2152,8 +2167,17 @@ class RaftNode:
                                     session_term=session_term,
                                     stale_ok=bool(msg.get("stale_ok")))
         command = {"op": op, "key": key}
-        if op == "set":
+        if op in ("set", "setnx"):
             command["value"] = msg.get("value")
+        if op == "setnx":
+            # Set-if-not-exists: the value is required, like a
+            # set's — a setnx with no value names nothing to
+            # write, so it is a client error and appends no log
+            # entry. Whether the key already exists is decided
+            # at apply time, like a CAS, not here.
+            if msg.get("value") is None:
+                return {"type": "client_response", "status": "error",
+                        "error": "setnx requires value"}
         if op in ("set", "expire"):
             # A TTL, in log entries: the key lives until the log
             # reaches this entry's index + ttl_entries, then it is

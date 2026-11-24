@@ -232,6 +232,28 @@ logic and the failure handling, not the key-value API on top.
   range itself: values are decimal strings, so a counter past
   9,223,372,036,854,775,807 is an error, not a wrap, and there is no
   `decr` spelling — a negative `by` is the decrement.
+- **Set-if-not-exists** — since v0.41.0 `setnx key value`
+  (`Session.setnx(k, v)`, `client.setnx(addr, k, v)`, `setnx key
+  value` on the CLI) sets the key only when it is absent and
+  answers 1 when it set it, 0 when the key already existed — and
+  the existing value is left untouched, Redis SETNX. The outcome
+  is decided at apply time, at the entry's exact position in the
+  log, like a CAS: two concurrent setnx on the same key race in
+  log order and exactly one wins, so it is a usable lock-acquire
+  primitive, and a retry with the same session id returns the
+  first attempt's result instead of setting twice. A successful
+  setnx fires a `set` watch event with the value it wrote; a
+  losing one fires nothing, like a failed CAS. It rides the same
+  write path as a single `set` — group-commit batching, dedup,
+  the response's log index advancing a session's watermark — and
+  `{"op": "setnx", "key": k, "value": v}` is a pipeline op too.
+  A setnx with no value is a client error and appends nothing.
+  The honest limit is the same one every single-key write has:
+  it is not a lock with an expiry — a key set by setnx lives
+  until it is deleted or overwritten, so a holder that crashes
+  without releasing leaves the key held; pair it with `expire`
+  for a lease, or use it only where a permanent claim is what
+  you want.
 - **Key enumeration** — since v0.31.0 one `keys` RPC lists the
   store's keys (`client.keys(prefix, limit, start_after)`,
   `Session.keys(prefix, limit, start_after)`, `keys --prefix p
@@ -546,7 +568,7 @@ make test
 # or: python3 -m unittest discover -s tests -v
 ```
 
-295 tests, plus a smoke test for the benchmark script, all passing:
+311 tests, plus a smoke test for the benchmark script, all passing:
 
 | Test | What it proves |
 |---|---|
@@ -653,6 +675,22 @@ make test
 | `test_session_incr_is_read_your_writes` | A session incr advances the write watermark and the next read sees the new value |
 | `test_pipeline_incr_ops` | Pipelined incr ops reply in order, a malformed `by` is an error in position |
 | `test_incr_cli` | The `incr` CLI subcommand prints the new value and exits 1 on a failed incr |
+| `test_setnx_sets_absent_key` | Setnx on a missing key sets it and answers 1 |
+| `test_setnx_leaves_existing_key_untouched` | Setnx on an existing key answers 0 and writes nothing |
+| `test_setnx_after_delete_sets_again` | A deleted key is absent again, so a later setnx wins |
+| `test_setnx_new_key_joins_sorted_index` | A key created by setnx joins the sorted scan index |
+| `test_setnx_succeeds_and_replicates` | Setnx writes and replicates to every node, and reads back the value |
+| `test_setnx_on_existing_key_is_noop_everywhere` | A losing setnx leaves the value unchanged on every node |
+| `test_setnx_requires_value` | A setnx with no value is a client error and appends nothing |
+| `test_setnx_from_follower_redirects` | A setnx sent to a follower is redirected to the leader and still applies |
+| `test_setnx_retry_appends_once_and_returns_same_result` | A retried setnx returns the first attempt's 1 and appends no second entry |
+| `test_setnx_noop_retry_returns_same_zero` | A retried losing setnx returns the same 0, one log entry |
+| `test_setnx_continues_after_leader_change` | Setnx keeps working through a leader change and the new leader sees the existing key |
+| `test_setnx_fires_watch_event_only_on_success` | A successful setnx fires a set watch event on leader and follower; a losing one fires nothing |
+| `test_setnx_survives_snapshot_and_restart` | The setnx claim survives log compaction and a leader restart |
+| `test_session_setnx_is_read_your_writes` | A session setnx advances the write watermark and the next read sees the value |
+| `test_pipeline_setnx_ops` | Pipelined setnx ops reply in order, a missing value is an error in position |
+| `test_setnx_cli` | The `setnx` CLI subcommand prints 1 on a set, 0 when the key exists |
 | `test_random_kill_restart_mid_write_loses_nothing` | Seeded chaos: 4 kill/restart cycles mid-write, every acked write survives on every node, all nodes converge to identical state, and the recorded read history is linearizable — now with CAS threads incrementing owned and shared counters through the same faults |
 | `test_stale_read_after_overwrite_is_flagged` | A read invoked after an overwrite completed but returning the old value fails the linearizability check |
 | `test_concurrent_read_may_see_old_or_new_value` | A read overlapping an overwrite may return either value |
@@ -1799,3 +1837,30 @@ entries left in `log.jsonl` are dropped by their index on reload.
   configurable in v0.26.0), so the next real thing is a new
   roadmap item grounded in this project's purpose, proposed
   by the next run.
+- ~~Set-if-not-exists (setnx)~~ — done in v0.41.0,
+  Nov 24, 2026: `setnx key value` sets the key only when it
+  is absent and answers 1 when it set it, 0 when the key
+  already existed (the existing value untouched) — Redis
+  SETNX, decided at apply time like a CAS, so two concurrent
+  setnx on the same key race in log order and exactly one
+  wins. A retry with the same session id returns the first
+  attempt's result, a successful setnx fires a `set` watch
+  event and rides the same write path as a `set`
+  (group-commit batching, dedup, session watermark), and
+  `{"op": "setnx"}` is a pipeline op too.
+  `Session.setnx`, `client.setnx`, and `setnx key value` on
+  the CLI expose it. `tests/test_setnx.py` proves it:
+  store-level set and no-op, setting again after a delete,
+  the new key joining the sorted index, replication to every
+  node, a losing setnx leaving the value unchanged
+  everywhere, a missing value rejected with no log entry,
+  redirect from a follower, dedup of a winning and a losing
+  retry, continuing after a leader change, the watch event
+  on leader and follower with nothing fired on a loss,
+  surviving a snapshot + restart, session
+  read-your-writes, pipelined setnx ops with a missing value
+  in position, and the CLI end to end. The roadmap is
+  exhausted again, so the next real thing is a new roadmap
+  item grounded in this project's purpose, proposed by the
+  next run — candidates: getset-style string ops, or a
+  wall-clock TTL variant.

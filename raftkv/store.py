@@ -95,7 +95,8 @@ class KVStore:
         key that is about to expire.
 
         Returns a result dict for commands whose outcome depends on the
-        state at apply time — currently "cas", "expire", and "incr" —
+        state at apply time — currently "cas", "expire", "incr", and
+        "setnx" —
         and None for set/del, whose outcome is always ok. The result is
         what the leader hands back to the waiting client and what the
         dedup table caches for retries, so it must be a pure function
@@ -258,6 +259,31 @@ class KVStore:
             self._data[key] = str(new)
             return {"type": "client_response", "status": "ok",
                     "value": str(new)}
+        elif op == "setnx":
+            # Set-if-not-exists, Redis SETNX: set the key only
+            # when it is absent, and answer 1 when it was set,
+            # 0 when the key already existed (and the value is
+            # left untouched). The outcome is decided here, at
+            # this exact point in the log, so two concurrent
+            # setnx on the same key race in log order — exactly
+            # one wins — and a retry with the same session id
+            # returns the first attempt's outcome from the
+            # dedup table instead of setting twice. A key that
+            # already exists keeps its value and its deadline
+            # (the failed attempt writes nothing); a key that
+            # is created has no deadline, like a plain set
+            # without a TTL, and any stale deadline entry is
+            # cleared. A new key joins the sorted index, like a
+            # set of a new key.
+            key = command["key"]
+            if key in self._data:
+                return {"type": "client_response", "status": "ok",
+                        "setnx": 0}
+            bisect.insort(self._keys, key)
+            self._data[key] = command["value"]
+            self._expiry.pop(key, None)
+            return {"type": "client_response", "status": "ok",
+                    "setnx": 1}
         else:
             raise ValueError(f"unknown command op: {op!r}")
 

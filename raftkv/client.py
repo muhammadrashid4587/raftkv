@@ -196,6 +196,7 @@ class Session:
             {"op": "del", "key": k}
             {"op": "cas", "key": k, "expected": e, "value": v}
             {"op": "incr", "key": k, "by": n}
+            {"op": "setnx", "key": k, "value": v}
 
         The whole list goes out in batches of ``depth`` on a single
         persistent socket without waiting between requests, and the
@@ -305,6 +306,20 @@ class Session:
         incr keeps the key's TTL deadline, like a CAS."""
         return self._write({"type": "client", "op": "incr", "key": key,
                             "by": by})
+
+    def setnx(self, key: str, value: str) -> dict:
+        """Set the key only if it does not already exist, Redis
+        SETNX: returns ``setnx`` 1 when the key was created and 0
+        when it already existed — and the existing value is left
+        untouched. The outcome is decided at apply time, at the
+        entry's position in the log, so two concurrent setnx on
+        the same key race in log order and exactly one wins; a
+        retry with the same session id returns the first
+        attempt's result instead of setting twice. A successful
+        setnx advances the write watermark from the reply's
+        index, like any other write."""
+        return self._write({"type": "client", "op": "setnx", "key": key,
+                            "value": value})
 
     def get(self, key: str) -> dict:
         # The read carries the higher of the two watermarks — the
@@ -582,22 +597,23 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
     op's reply position and nothing goes on the wire for it.
     ``set`` needs a string key and value, ``del`` a string key,
     ``cas`` a string key, expected, and value, ``incr`` a string
-    key and an integer ``by`` (default 1)."""
+    key and an integer ``by`` (default 1), ``setnx`` a string key
+    and value."""
     if not isinstance(op, dict):
         return None, {"type": "client_response", "status": "error",
                       "error": "pipeline op must be an object with "
                                "op, key, and value fields"}
     name = op.get("op")
-    if name not in ("set", "del", "cas", "incr"):
+    if name not in ("set", "del", "cas", "incr", "setnx"):
         return None, {"type": "client_response", "status": "error",
                       "error": "pipeline op must be set, del, cas, "
-                               "or incr"}
+                               "incr, or setnx"}
     key = op.get("key")
     if not isinstance(key, str):
         return None, {"type": "client_response", "status": "error",
                       "error": f"pipeline {name} needs a string key"}
     msg: dict = {"type": "client", "op": name, "key": key}
-    if name in ("set", "cas"):
+    if name in ("set", "cas", "setnx"):
         value = op.get("value")
         if not isinstance(value, str):
             return None, {"type": "client_response", "status": "error",
@@ -640,7 +656,8 @@ def pipeline(node_addr: tuple[str, int], ops: list,
              timeout: float = 12.0, depth: int = 50) -> list[dict]:
     """Send many writes pipelined over one connection.
 
-    One ``set`` / ``del`` / ``cas`` / ``incr`` op per dict (see
+    One ``set`` / ``del`` / ``cas`` / ``incr`` / ``setnx`` op per
+    dict (see
     ``Session.pipeline`` for the shapes): the ops go out in
     batches of ``depth`` on a single persistent socket and the
     replies come back aligned by position. Each op carries a
@@ -811,6 +828,22 @@ def incr(node_addr: tuple[str, int], key: str, by: int = 1,
     the first incr creates it at ``by``."""
     return request(node_addr, {"type": "client", "op": "incr",
                                "key": key, "by": by},
+                   timeout=timeout)
+
+
+def setnx(node_addr: tuple[str, int], key: str, value: str,
+          timeout: float = 12.0) -> dict:
+    """Set the key only if it does not already exist, following
+    leader redirects like ``request`` — Redis SETNX.
+
+    One request appends the setnx entry, so the outcome is decided
+    at the entry's position in the log: two concurrent setnx on
+    the same key race in log order and exactly one wins. The reply
+    is the plain setnx response (``status`` ``ok`` with ``setnx``
+    1 when the key was created and 0 when it already existed —
+    and the existing value is left untouched)."""
+    return request(node_addr, {"type": "client", "op": "setnx",
+                               "key": key, "value": value},
                    timeout=timeout)
 
 
@@ -1097,6 +1130,20 @@ def main(argv: list[str] | None = None) -> int:
                              "twice")
     p_incr.add_argument("--request-id", default=None,
                         help="id of this write within the client session")
+    p_setnx = sub.add_parser(
+        "setnx",
+        help="set the key only if it does not already exist and "
+             "print 1 when it was set, 0 when the key already "
+             "existed (its value is left untouched)")
+    p_setnx.add_argument("key")
+    p_setnx.add_argument("value")
+    p_setnx.add_argument("--client-id", default=None,
+                         help="session id for at-most-once writes: a retry "
+                              "with the same client id + request id returns "
+                              "the first attempt's result instead of writing "
+                              "twice")
+    p_setnx.add_argument("--request-id", default=None,
+                         help="id of this write within the client session")
     p_add = sub.add_parser("add-server",
                            help="add a server to the cluster (Raft §6)")
     p_add.add_argument("server_id")
@@ -1187,7 +1234,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(resp))
         return 0
     msg: dict = {"type": "client", "op": op}
-    if op in ("set", "get", "del", "cas", "ttl", "expire", "incr"):
+    if op in ("set", "get", "del", "cas", "ttl", "expire", "incr",
+              "setnx"):
         msg["key"] = args.key
     elif op == "mset":
         if len(args.pairs) % 2:
@@ -1222,7 +1270,9 @@ def main(argv: list[str] | None = None) -> int:
         msg["ttl_entries"] = args.entries
     if op == "incr":
         msg["by"] = args.by
-    if op in ("set", "del", "cas", "mset", "expire", "incr") \
+    if op == "setnx":
+        msg["value"] = args.value
+    if op in ("set", "del", "cas", "mset", "expire", "incr", "setnx") \
             and args.request_id:
         # A request id without an explicit client id still dedups
         # within the default "cli" session; the same id retried from
@@ -1258,6 +1308,8 @@ def main(argv: list[str] | None = None) -> int:
             print(resp.get("expire"))
         elif op == "incr":
             print(resp.get("value"))
+        elif op == "setnx":
+            print(resp.get("setnx"))
         elif op == "mget":
             print(json.dumps(resp.get("values")))
         elif op == "keys":
