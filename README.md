@@ -468,6 +468,29 @@ logic and the failure handling, not the key-value API on top.
   conditional write has: NX is a claim, not a lease — a key
   claimed by NX lives until it is deleted or overwritten, so
   pair it with a TTL for a lock with an expiry.
+- **SET with GET** — since v0.51.0 `set key value [--get]`
+  (`Session.set(k, v, get=True)`, `set key value --get` on the
+  CLI) carries Redis's SET GET option: one round trip both
+  swaps the value and reports what it replaced — the reply
+  carries `old_value`, the value the key held at the entry's
+  exact position in the log, or None when the key was absent.
+  A losing conditional set answers `old_value` None, like
+  Redis answering nil when the condition fails, and writes
+  nothing at all — value and deadline untouched, no watch
+  event — while a winning one fires a `set` event with the new
+  value, like a plain set. GET changes nothing about the
+  write itself: a winning GET set clears the deadline like a
+  plain set, or keeps it with KEEPTTL, and it composes with
+  NX / XX and with a fresh TTL exactly like the other flags.
+  The old value rides the same write path as a single `set` —
+  group-commit batching, dedup (a retry with the same session
+  id returns the first attempt's old value instead of setting
+  twice), the response's log index advancing a session's
+  watermark — and `{"op": "set", "key": k, "value": v, "get":
+  true}` is a pipeline op too. The honest limit is the same
+  one getset already has: the old value is whatever the key
+  held when the entry applied, so a concurrent write that
+  lands first in the log is the old value you get back.
 - **Bit operations** — since v0.46.0 `setbit key offset bit`
   (`Session.setbit(k, offset, bit)`, `client.setbit(addr, k,
   offset, bit)`, `setbit key offset bit` on the CLI) sets one
@@ -1186,6 +1209,23 @@ make test
 | `test_session_set_flags_is_read_your_writes` | Session.set with NX / XX answers 1 / 0, advances the watermark even on a losing set, and reads see the write |
 | `test_pipeline_set_flags` | Pipelined set ops carry NX / XX / KEEPTTL; malformed flag combinations are errors in position |
 | `test_set_flags_cli` | The `set` CLI prints 1 / 0 for --nx / --xx, rejects --nx with --xx as a usage error, and keeps the deadline with --keepttl |
+| `test_store_get_on_missing_key_answers_none` | A GET set on a missing key answers `set` 1 and `old_value` None |
+| `test_store_get_returns_old_value` | A GET set on an existing key answers the old value and replaces it |
+| `test_store_plain_set_carries_no_old_value` | A plain set without GET carries no `old_value` in its reply |
+| `test_store_losing_nx_with_get_answers_none` | A losing NX with GET answers `old_value` None, and the value and deadline are untouched |
+| `test_store_losing_xx_with_get_answers_none` | A losing XX with GET answers `old_value` None, and the key stays absent |
+| `test_store_get_clears_log_deadline_like_plain_set` | A winning GET set clears the log-entry deadline like a plain set |
+| `test_store_get_with_keepttl_keeps_log_deadline` | A GET set with KEEPTTL keeps the log-entry deadline and reports the old value |
+| `test_store_get_clears_wall_deadline_like_plain_set` | A winning GET set clears the wall-clock deadline like a plain set |
+| `test_store_get_with_keepttl_keeps_wall_deadline` | A GET set with KEEPTTL keeps the wall-clock deadline and reports the old value |
+| `test_store_get_with_fresh_ttl_sets_deadline` | A GET set with a fresh TTL reports the old value and records the new deadline |
+| `test_set_get_replicates` | A GET set replicates to every node and answers the old value |
+| `test_set_get_rejected_flag_with_no_log_entry` | A non-boolean GET is a client error and appends no log entry |
+| `test_set_get_retry_returns_first_old_value` | A retried GET set returns the first attempt's old value and appends no second entry, winning or losing |
+| `test_set_get_fires_watch_event_only_on_win` | A watch fires on a winning GET set on leader and follower, and nothing on a losing NX with GET |
+| `test_session_set_get` | Session.set with `get=True` answers the old value, advances the watermark even on a losing set, and reads see the write |
+| `test_pipeline_set_get` | Pipelined set ops carry GET and answer the old value in position; a malformed GET is an error in position |
+| `test_set_get_cli` | The `set` CLI prints (nil) for --get on a missing key and the old value otherwise, and (nil) for a losing NX with --get |
 
 Tests use real nodes (real TCP, real threads, real disk) on localhost —
 no mocks of the consensus path.
@@ -2556,7 +2596,34 @@ entries left in `log.jsonl` are dropped by their index on reload.
   read-your-writes with the watermark advancing on a losing set
   too, pipelined set ops with flags and malformed ops in
   position, and the CLI end to end.
+- ~~SET with GET~~ — done in v0.51.0,
+  Nov 24, 2026: `set key value [--get]` carries Redis's SET GET
+  option — one round trip both swaps the value and reports what
+  it replaced: the reply carries `old_value`, the value the key
+  held at the entry's exact position in the log, or None when
+  the key was absent, and a losing conditional set answers
+  `old_value` None, like Redis answering nil when the
+  condition fails. GET changes nothing about the write: a
+  winning GET set clears the deadline like a plain set, or
+  keeps it with KEEPTTL, and composes with NX / XX and with a
+  fresh TTL. It rides the same write path as a single `set` —
+  group-commit batching, dedup of a retry returning the first
+  attempt's old value, the response's log index advancing a
+  session's watermark — and `{"op": "set", "key": k, "value":
+  v, "get": true}` is a pipeline op too. `Session.set` and
+  `set` on the CLI expose it.
+  `tests/test_set_get.py` proves it: store-level old value on
+  an existing key and None on a missing one, a losing NX and a
+  losing XX answering `old_value` None with value and deadline
+  untouched, GET clearing a log-entry and a wall-clock deadline
+  like a plain set and KEEPTTL with GET keeping them, a winning
+  GET set firing the watch event and a losing one firing
+  nothing, replication to every node, dedup of a winning and a
+  losing retry returning the first attempt's old value,
+  pipelined set ops with GET and a malformed GET in position,
+  and the CLI end to end.
   The roadmap is exhausted again, so the next real thing is
   a new roadmap item grounded in this project's purpose,
-  proposed by the next run — candidate: SET with GET (return the
-  old value atomically, Redis's GET option).
+  proposed by the next run — candidate: SET with EX / PX (an
+  inline wall-clock TTL on SET, Redis's EX seconds / PX
+  milliseconds, instead of the separate setex op).

@@ -2635,7 +2635,8 @@ class RaftNode:
             # Redis SET options, decided at apply time like a
             # CAS, not here: NX sets only when the key does not
             # exist, XX only when it does, KEEPTTL preserves the
-            # deadline a plain set would clear. Validated here,
+            # deadline a plain set would clear, GET answers with
+            # the old value alongside ``set`` 1. Validated here,
             # on the leader, before the command is ever logged —
             # NX and XX are mutually exclusive (Redis rejects the
             # combination), KEEPTTL cannot ride with a fresh TTL
@@ -2643,7 +2644,7 @@ class RaftNode:
             # is a bare boolean, so a malformed flag is a client
             # error, not a log entry. Whether the key exists, and
             # what the deadline becomes, is the entry's result.
-            for field in ("nx", "xx", "keepttl"):
+            for field in ("nx", "xx", "keepttl", "get"):
                 if (msg.get(field) is not None
                         and msg[field] is not True):
                     return {"type": "client_response",
@@ -2659,7 +2660,7 @@ class RaftNode:
                 return {"type": "client_response", "status": "error",
                         "error": "set KEEPTTL cannot be combined "
                                  "with ttl_entries"}
-            for field in ("nx", "xx", "keepttl"):
+            for field in ("nx", "xx", "keepttl", "get"):
                 if msg.get(field):
                     command[field] = True
         if op == "getex":

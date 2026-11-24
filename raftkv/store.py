@@ -216,7 +216,17 @@ class KVStore:
         had (log-entry or wall-clock) instead of clearing it
         like a plain set; a set carrying ``ttl_entries`` records
         a fresh deadline instead, and drops the wall one, so a
-        key still holds at most one kind of TTL. An ``mset`` carrying
+        key still holds at most one kind of TTL. A ``set``
+        carrying GET answers with the old value the key held
+        at this exact point in the log — None when the key was
+        absent — alongside ``set`` 1, so one round trip both
+        swaps the value and reports what it replaced, like
+        Redis SET ... GET; a losing conditional set answers
+        ``old_value`` None, because the condition failed and
+        there is no old value to report. GET changes nothing
+        about the write itself: a winning GET set clears the
+        deadline like a plain set (or keeps it with KEEPTTL),
+        and a losing one writes nothing at all. An ``mset`` carrying
         ``ttl_entries`` sets the same deadline (its entry's
         index + the TTL) on every pair it touches, so the whole
         batch expires together. A successful CAS keeps the key's
@@ -254,18 +264,35 @@ class KVStore:
             # set; without it a fresh set is a new life for the
             # key and both deadlines are dropped, and a set
             # carrying ``ttl_entries`` records a fresh deadline
-            # instead. The flags were validated on the leader
+            # instead. GET answers with the old value alongside
+            # ``set`` 1 — None when the key was absent — and a
+            # losing conditional set answers ``old_value`` None.
+            # The flags were validated on the leader
             # before the entry was logged — NX and XX never
-            # together, KEEPTTL never with a TTL — so by apply
-            # time they are well-formed.
+            # together, KEEPTTL never with a TTL, GET a bare
+            # boolean — so by apply time they are well-formed.
             key = command["key"]
+            get = bool(command.get("get"))
             if command.get("nx") and key in self._data:
-                return {"type": "client_response", "status": "ok",
-                        "set": 0}
+                # A losing conditional set answers nil for the
+                # old value, like Redis: the condition failed,
+                # so there is no old value to report.
+                result = {"type": "client_response", "status": "ok",
+                          "set": 0}
+                if get:
+                    result["old_value"] = None
+                return result
             if command.get("xx") and key not in self._data:
-                return {"type": "client_response", "status": "ok",
-                        "set": 0}
+                result = {"type": "client_response", "status": "ok",
+                          "set": 0}
+                if get:
+                    result["old_value"] = None
+                return result
             keepttl = bool(command.get("keepttl"))
+            # The old value is whatever the key held at this
+            # exact point in the log — None when it was absent —
+            # read before the write overwrites it.
+            old = self._data.get(key)
             if key not in self._data:
                 bisect.insort(self._keys, key)
             self._data[key] = command["value"]
@@ -291,8 +318,11 @@ class KVStore:
                 # a key holds at most one kind of TTL, and a
                 # plain set is a new life for the key either way.
                 self._wall_expiry.pop(key, None)
-            return {"type": "client_response", "status": "ok",
-                    "set": 1}
+            result = {"type": "client_response", "status": "ok",
+                      "set": 1}
+            if get:
+                result["old_value"] = old
+            return result
         elif op == "setex":
             # Set a key with a wall-clock TTL, Redis SETEX: the
             # value is written like a ``set``, and the key dies

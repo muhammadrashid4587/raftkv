@@ -137,7 +137,7 @@ class Session:
     def set(self, key: str, value: str,
             ttl_entries: int | None = None,
             nx: bool = False, xx: bool = False,
-            keepttl: bool = False) -> dict:
+            keepttl: bool = False, get: bool = False) -> dict:
         """Write one key. With ``ttl_entries`` (a positive number
         of log entries) the key expires when the log reaches this
         entry's index + ``ttl_entries`` — a distance in the log,
@@ -149,7 +149,12 @@ class Session:
         ``set`` 1 when the key was written, 0 when the condition
         failed and nothing changed. With ``keepttl`` the write
         keeps whatever deadline the key had instead of clearing
-        it — Redis SET KEEPTTL. The outcome is decided at apply
+        it — Redis SET KEEPTTL. With ``get`` the reply also
+        carries ``old_value`` — the value the key held before
+        this write, None when it was absent — so one round trip
+        swaps the value and reports what it replaced, Redis
+        SET ... GET; a losing conditional set answers
+        ``old_value`` None. The outcome is decided at apply
         time, at the entry's exact position in the log, like a
         CAS: a retry with the same session id returns the first
         attempt's result instead of writing twice. NX and XX
@@ -165,6 +170,8 @@ class Session:
             msg["xx"] = True
         if keepttl:
             msg["keepttl"] = True
+        if get:
+            msg["get"] = True
         return self._write(msg)
 
     def setex(self, key: str, value: str, seconds: int) -> dict:
@@ -958,7 +965,7 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
     ``set`` needs a string key and value, and may carry
     ``ttl_entries`` (an integer number of log entries,
     1..1000000) and the bare boolean flags ``nx`` / ``xx`` /
-    ``keepttl`` — NX and XX never together, KEEPTTL never with
+    ``keepttl`` / ``get`` — NX and XX never together, KEEPTTL never with
     a TTL — ``del`` a string key,
     ``cas`` a string key, expected, and value, ``incr`` a string
     key and an integer ``by`` (default 1), ``setnx`` a string key
@@ -1015,12 +1022,12 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
                                    "an integer between 1 and 1000000"}
         msg["ttl_entries"] = ttl
     if name == "set":
-        # NX / XX / KEEPTTL ride along with a pipelined set,
+        # NX / XX / KEEPTTL / GET ride along with a pipelined set,
         # validated here so a malformed one never goes on the
         # wire: bare boolean flags, NX and XX never together,
         # KEEPTTL never with a TTL — the same shapes the server
         # enforces.
-        for field in ("nx", "xx", "keepttl"):
+        for field in ("nx", "xx", "keepttl", "get"):
             if (op.get(field) is not None
                     and op[field] is not True):
                 return None, {"type": "client_response",
@@ -1036,7 +1043,7 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
             return None, {"type": "client_response", "status": "error",
                           "error": "pipeline set KEEPTTL cannot be "
                                    "combined with ttl_entries"}
-        for field in ("nx", "xx", "keepttl"):
+        for field in ("nx", "xx", "keepttl", "get"):
             if op.get(field):
                 msg[field] = True
     if name == "cas":
@@ -1814,6 +1821,11 @@ def main(argv: list[str] | None = None) -> int:
     p_set.add_argument("--keepttl", action="store_true",
                        help="keep the key's existing TTL instead of "
                             "clearing it (Redis KEEPTTL)")
+    p_set.add_argument("--get", action="store_true",
+                       help="return the old value the key held before "
+                            "this write (Redis SET GET): prints the old "
+                            "value, or (nil) when the key was absent or "
+                            "a conditional set lost")
     p_set.add_argument("--client-id", default=None,
                        help="session id for at-most-once writes: a retry "
                             "with the same client id + request id returns "
@@ -2314,6 +2326,8 @@ def main(argv: list[str] | None = None) -> int:
             msg["xx"] = True
         if args.keepttl:
             msg["keepttl"] = True
+        if args.get:
+            msg["get"] = True
     if op == "mset":
         if args.ttl_entries is not None:
             msg["ttl_entries"] = args.ttl_entries
@@ -2434,6 +2448,13 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(resp.get("values")))
         elif op == "keys":
             print(json.dumps(resp.get("keys")))
+        elif op == "set" and args.get:
+            # A GET set prints the old value, like getset does —
+            # (nil) when the key was absent or a conditional set
+            # lost — instead of OK or the 1/0 a plain or
+            # conditional set prints.
+            old = resp.get("old_value")
+            print(old if old is not None else "(nil)")
         elif op == "set" and (args.nx or args.xx):
             # A conditional set prints whether it wrote, like
             # setnx does — a plain set prints OK below.
