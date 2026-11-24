@@ -96,7 +96,7 @@ class KVStore:
 
         Returns a result dict for commands whose outcome depends on the
         state at apply time — currently "cas", "expire", "incr",
-        "setnx", and "getset" —
+        "setnx", "getset", "append", and "getdel" —
         and None for set/del, whose outcome is always ok. The result is
         what the leader hands back to the waiting client and what the
         dedup table caches for retries, so it must be a pure function
@@ -309,6 +309,68 @@ class KVStore:
             self._data[key] = command["value"]
             return {"type": "client_response", "status": "ok",
                     "old_value": old}
+        elif op == "append":
+            # Append to a string value, Redis APPEND: the key holds
+            # its old value plus ``value`` — a missing key is
+            # created holding just ``value`` — and the reply
+            # carries the new value and its length, the length
+            # Redis answers with. The outcome is decided here, at
+            # this exact point in the log, so a retry with the
+            # same session id returns the first attempt's length
+            # from the dedup table instead of appending twice.
+            # A value that is not a string fails with WRONGTYPE,
+            # like Redis: every value this store holds is a
+            # string, so only a hand-built state can do that, but
+            # the check keeps the op honest about what it
+            # appended to. A failed append writes nothing at all,
+            # like a failed incr. A successful append keeps the
+            # key's deadline, like a CAS or an incr: it is an
+            # update of the value, not a fresh set, so it must
+            # not resurrect a key that is about to expire. A new
+            # key joins the sorted index, like a set of a new key.
+            key = command["key"]
+            current = self._data.get(key)
+            if current is not None and not isinstance(current, str):
+                return {"type": "client_response",
+                        "status": "append_failed",
+                        "reason": "wrongtype",
+                        "current": current,
+                        "error": "append failed: value of "
+                                 f"{key!r} is not a string"}
+            new = (current or "") + command["value"]
+            if key not in self._data:
+                bisect.insort(self._keys, key)
+            self._data[key] = new
+            return {"type": "client_response", "status": "ok",
+                    "value": new, "length": len(new)}
+        elif op == "getdel":
+            # Atomically get a key's value and delete it, Redis
+            # GETDEL: the reply carries the value the key held —
+            # None when it did not exist — and ``getdel`` 1 when
+            # the key was there and is now gone, 0 when there was
+            # nothing to delete. The outcome is decided here, at
+            # this exact point in the log, so a retry with the
+            # same session id returns the first attempt's value
+            # from the dedup table instead of deleting a key a
+            # later write recreated. A deleted key leaves the
+            # sorted index and takes its deadline with it — the
+            # key is gone, so there is nothing left to expire.
+            # A getdel on a missing key is a no-op, not an error:
+            # Redis answers nil there, and the entry still
+            # committed (the outcome is the entry's result, not
+            # a client error).
+            key = command["key"]
+            old = self._data.get(key)
+            if old is None:
+                return {"type": "client_response", "status": "ok",
+                        "value": None, "getdel": 0}
+            del self._data[key]
+            idx = bisect.bisect_left(self._keys, key)
+            if idx < len(self._keys) and self._keys[idx] == key:
+                del self._keys[idx]
+            self._expiry.pop(key, None)
+            return {"type": "client_response", "status": "ok",
+                    "value": old, "getdel": 1}
         else:
             raise ValueError(f"unknown command op: {op!r}")
 
@@ -362,6 +424,22 @@ class KVStore:
 
     def get(self, key: str) -> str | None:
         return self._data.get(key)
+
+    def strlen(self, key: str) -> int:
+        """Length of the string value at ``key`` — 0 when the key
+        does not exist, Redis STRLEN. Raises TypeError when the
+        value is not a string: every value this store holds is a
+        string, so only a hand-built state can do that, but the
+        check keeps the read honest about what it measured
+        instead of answering a length for something that has
+        none. Pure read: no log entry, no state change."""
+        value = self._data.get(key)
+        if value is None:
+            return 0
+        if not isinstance(value, str):
+            raise TypeError(
+                f"strlen failed: value of {key!r} is not a string")
+        return len(value)
 
     def keys(self, prefix: str = "", start_after: str | None = None,
              limit: int = 1000) -> tuple[list[str], bool]:

@@ -274,6 +274,40 @@ logic and the failure handling, not the key-value API on top.
   returns is the value at its log position, so a concurrent write
   that commits first is the old value it sees — there is no way to
   ask for the value "as of now" without going through the log.
+- **Append** — since v0.43.0 `append key value` (`Session.append(k, v)`,
+  `client.append(addr, k, v)`, `append key value` on the CLI) appends to
+  the string at the key and answers with the new length — Redis APPEND.
+  A missing key is created holding just the value, and the new length is
+  decided at apply time, at the entry's exact position in the log, like
+  a CAS: a retry with the same session id returns the first attempt's
+  length instead of appending twice. A successful append fires a `set`
+  watch event with the new value and keeps the key's TTL deadline, like
+  a CAS. A non-string value fails with `append_failed` and reason
+  `wrongtype` instead of appending — every value this store holds is a
+  string, so that branch is defensive, reached only by a hand-built
+  state. It rides the same write path as a single `set` — group-commit
+  batching, dedup, the response's log index advancing a session's
+  watermark — and `{"op": "append", "key": k, "value": v}` is a pipeline
+  op too. An append with no value is a client error and appends nothing.
+- **String length** — since v0.43.0 `strlen key` (`Session.strlen(k)`,
+  `client.strlen(addr, k)`, `strlen key` on the CLI) prints the length of
+  the string at the key, 0 when the key does not exist — Redis STRLEN.
+  It rides the same ReadIndex path as a `get`, so it carries the same
+  session watermark and is exactly as linearizable. A non-string value
+  is a client error, not a length — defensive, like append's wrongtype,
+  since every value this store holds is a string.
+- **Get-and-delete** — since v0.43.0 `getdel key` (`Session.getdel(k)`,
+  `client.getdel(addr, k)`, `getdel key` on the CLI) atomically answers
+  with the value the key held and deletes it — Redis GETDEL — answering
+  `value` None and `getdel` 0 when the key did not exist, which is a
+  no-op, not an error. The value is decided at apply time, at the
+  entry's exact position in the log, like a CAS: a retry with the same
+  session id returns the first attempt's value instead of deleting a key
+  a later write recreated. A getdel that found its key fires a `del`
+  watch event, and the key takes its TTL deadline with it when it goes.
+  It rides the same write path as a single `set` — group-commit
+  batching, dedup, the response's log index advancing a session's
+  watermark — and `{"op": "getdel", "key": k}` is a pipeline op too.
 - **Key enumeration** — since v0.31.0 one `keys` RPC lists the
   store's keys (`client.keys(prefix, limit, start_after)`,
   `Session.keys(prefix, limit, start_after)`, `keys --prefix p
@@ -1930,3 +1964,41 @@ entries left in `log.jsonl` are dropped by their index on reload.
   a new roadmap item grounded in this project's purpose,
   proposed by the next run — candidates: a wall-clock TTL
   variant, or more Redis string ops (append, strlen, getdel).
+- ~~Append / strlen / getdel~~ — done in v0.43.0,
+  Nov 24, 2026: `append key value` appends to the string at
+  the key and answers with the new length — Redis APPEND,
+  decided at apply time like a CAS, so a retry with the same
+  session id returns the first attempt's length instead of
+  appending twice; a missing key is created, a successful
+  append fires a `set` watch event with the new value and
+  keeps the key's TTL deadline, and a non-string value fails
+  with `append_failed` / `wrongtype`. `strlen key` answers
+  the length of the string value, 0 for a missing key —
+  Redis STRLEN — through the same ReadIndex path as a `get`.
+  `getdel key` atomically answers with the value and deletes
+  the key — Redis GETDEL — answering None and `getdel` 0 on
+  a missing key, firing a `del` watch event when it found
+  one, and taking the key's TTL deadline with it; a retry
+  returns the first attempt's value instead of deleting a
+  key a later write recreated. `{"op": "append"}` and
+  `{"op": "getdel"}` are pipeline ops too.
+  `Session.append` / `Session.strlen` / `Session.getdel`,
+  `client.append` / `client.strlen` / `client.getdel`, and
+  `append` / `strlen` / `getdel` on the CLI expose them.
+  `tests/test_string_ops.py` proves them: store-level
+  append create and concatenate, the TTL deadline kept
+  across an append, the wrongtype failure leaving the value
+  untouched, getdel returning the old value and dropping the
+  key from the sorted index and its deadline, strlen on a
+  missing, empty, and wrongtype value, replication to every
+  node, a missing value rejected with no log entry, redirect
+  from a follower, dedup of an append and a getdel retry,
+  continuing after a leader change, the watch events on
+  leader and follower with nothing fired on a miss or a
+  failed append, surviving a snapshot + restart, session
+  read-your-writes, pipelined append and getdel ops with a
+  missing value in position, and the CLI end to end.
+  The roadmap is exhausted again, so the next real thing is
+  a new roadmap item grounded in this project's purpose,
+  proposed by the next run — candidates: a wall-clock TTL
+  variant, or more Redis string ops (getrange, setrange).

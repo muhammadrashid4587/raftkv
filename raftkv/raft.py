@@ -1328,7 +1328,7 @@ class RaftNode:
                 pass
             else:
                 # The apply result matters for CAS, expire, incr,
-                # setnx, and getset:
+                # setnx, getset, append, and getdel:
                 # their outcome is decided here, at this exact point
                 # in the log, so the result is recorded in the dedup
                 # table
@@ -1391,7 +1391,24 @@ class RaftNode:
                     self.watch.notify(entry["command"]["key"],
                                       entry["command"]["value"], "set",
                                       index=self.last_applied)
-                if (op in ("cas", "expire", "incr", "setnx", "getset")
+                elif (op == "append" and result is not None
+                        and result.get("status") == "ok"):
+                    # A successful append fires like a set, with
+                    # the new (appended) value: a failed append
+                    # wrote nothing, so it fires nothing, like a
+                    # failed incr.
+                    self.watch.notify(entry["command"]["key"],
+                                      result["value"], "set",
+                                      index=self.last_applied)
+                elif (op == "getdel" and result is not None
+                        and result.get("getdel") == 1):
+                    # A getdel that found its key fires like a
+                    # del: a getdel on a missing key deleted
+                    # nothing, so it fires nothing.
+                    self.watch.notify(entry["command"]["key"], None, "del",
+                                      index=self.last_applied)
+                if (op in ("cas", "expire", "incr", "setnx", "getset",
+                           "append", "getdel")
                         and result is not None
                         and self.role == "leader"):
                     # Record the outcome only when a local waiter is
@@ -1402,8 +1419,8 @@ class RaftNode:
                     # would sit in _apply_results forever. A write
                     # without a session id has no dedup key, so it
                     # always records: its waiter is identified by
-                    # index alone. CAS, expire, incr, setnx, and
-                    # getset are
+                    # index alone. CAS, expire, incr, setnx, getset,
+                    # append, and getdel are
                     # the ops
                     # whose apply returns a result — a set/del
                     # returns None and has nothing to record.
@@ -1440,13 +1457,15 @@ class RaftNode:
         """Record an applied client write in the dedup table. Lock held.
         The cached result is what a retry with the same session id gets
         back instead of a second log entry. For set/del the result is
-        always ok once committed; for CAS, expire, incr, setnx, and
-        getset
+        always ok once committed; for CAS, expire, incr, setnx,
+        getset, append, and getdel
         it is the
         apply-time outcome (success, mismatch, or missing key for a
         CAS; 1 or 0 for an expire; the new value, or not_an_integer
         / overflow for an incr; 1 or 0 for a setnx; the old value
-        for a getset), so a retry returns the first
+        for a getset; the new value and length, or wrongtype for
+        an append; the old value and 1 or 0 for a getdel), so a
+        retry returns the first
         attempt's exact result. The result also carries the log
         index and term of the entry that produced it: a retried write
         reports the same index as the first attempt, and a client
@@ -2135,15 +2154,30 @@ class RaftNode:
             return self._on_mset(msg)
         key = msg.get("key")
         if op not in ("set", "get", "del", "cas", "ttl", "expire",
-                      "incr", "setnx", "getset") \
+                      "incr", "setnx", "getset", "append", "strlen",
+                      "getdel") \
                 or key is None:
             return {"type": "client_response", "status": "error",
                     "error": "op must be set/get/del/cas/ttl/expire/"
-                             "incr/setnx/getset "
+                             "incr/setnx/getset/append/strlen/getdel "
                              "with a key"}
         if self._is_removed():
             return {"type": "client_response", "status": "error",
                     "error": "this node was removed from the cluster"}
+        if op == "strlen":
+            # A length query: the length of the string value at
+            # this key, 0 for a missing key. It rides the same
+            # ReadIndex/lease path as a ``get`` — one leadership
+            # confirmation, one apply wait — so the length
+            # reflects the committed state as of the read index
+            # it names, exactly as linearizable, and a session
+            # read carries the same watermark a get would.
+            min_index, session_term, error = self._parse_read_params(msg)
+            if error is not None:
+                return error
+            return self._serve_read(strlen_key=key, min_index=min_index,
+                                    session_term=session_term,
+                                    stale_ok=bool(msg.get("stale_ok")))
         if op == "ttl":
             # A TTL query: how many more log entries this key has
             # left, in Redis's -2/-1 convention, plus the deadline
@@ -2177,7 +2211,7 @@ class RaftNode:
                                     session_term=session_term,
                                     stale_ok=bool(msg.get("stale_ok")))
         command = {"op": op, "key": key}
-        if op in ("set", "setnx", "getset"):
+        if op in ("set", "setnx", "getset", "append"):
             command["value"] = msg.get("value")
         if op == "setnx":
             # Set-if-not-exists: the value is required, like a
@@ -2197,6 +2231,16 @@ class RaftNode:
             if msg.get("value") is None:
                 return {"type": "client_response", "status": "error",
                         "error": "getset requires value"}
+        if op == "append":
+            # Append to a string value: the value is required,
+            # like a set's — an append with no value names
+            # nothing to append, so it is a client error and
+            # appends no log entry. Whether the key holds a
+            # string (and what the new length is) is decided at
+            # apply time, like a CAS, not here.
+            if msg.get("value") is None:
+                return {"type": "client_response", "status": "error",
+                        "error": "append requires value"}
         if op in ("set", "expire"):
             # A TTL, in log entries: the key lives until the log
             # reaches this entry's index + ttl_entries, then it is
@@ -2816,6 +2860,7 @@ class RaftNode:
                     keys: list[str] | None = None,
                     stale_ok: bool = False,
                     ttl_key: str | None = None,
+                    strlen_key: str | None = None,
                     scan_prefix: str | None = None,
                     scan_limit: int = MAX_KEYS_SCAN,
                     scan_start_after: str | None = None) -> dict:
@@ -2829,6 +2874,10 @@ class RaftNode:
         left, in Redis's -2/-1 convention, plus the deadline
         itself — read off the applied state machine like any other
         read, so it is exactly as linearizable as a ``get``.
+        ``strlen_key`` serves a length query instead — the length
+        of the string value at that key, 0 for a missing key,
+        Redis STRLEN — read off the applied state machine the
+        same way, so it is exactly as linearizable as a ``get``.
         ``scan_prefix`` serves a key enumeration instead — every key
         in the applied state machine starting with the prefix,
         sorted, at most ``scan_limit`` of them, with ``truncated``
@@ -2928,6 +2977,20 @@ class RaftNode:
                 remaining, deadline = self.sm.ttl(ttl_key,
                                                   self.last_applied)
                 return {"ttl": remaining, "deadline": deadline}
+            if strlen_key is not None:
+                # A length query: the length of the string value
+                # at this key, 0 for a missing key — Redis STRLEN.
+                # A non-string value is a client error, not a
+                # length: the payload carries its own "status":
+                # "error", which overrides the "ok" in the
+                # response literal _serve_read builds around it
+                # (a later key wins in a dict literal), so the
+                # reply is an error response that still names the
+                # read index it was measured at.
+                try:
+                    return {"length": self.sm.strlen(strlen_key)}
+                except TypeError as e:
+                    return {"status": "error", "error": str(e)}
             if keys is not None:
                 return {"values": [self.sm.get(k) for k in keys]}
             return {"value": self.sm.get(key)}

@@ -125,7 +125,8 @@ class Session:
         # index and leave the watermark where it was: the write may
         # still have committed, and the next read must not claim a
         # watermark the client never saw acknowledged.
-        if (resp.get("status") in ("ok", "cas_failed", "incr_failed")
+        if (resp.get("status")
+                in ("ok", "cas_failed", "incr_failed", "append_failed")
                 and resp.get("index") is not None):
             self.last_write_index = int(resp["index"])
             self.last_write_term = int(resp.get("term") or 0)
@@ -198,6 +199,8 @@ class Session:
             {"op": "incr", "key": k, "by": n}
             {"op": "setnx", "key": k, "value": v}
             {"op": "getset", "key": k, "value": v}
+            {"op": "append", "key": k, "value": v}
+            {"op": "getdel", "key": k}
 
         The whole list goes out in batches of ``depth`` on a single
         persistent socket without waiting between requests, and the
@@ -273,7 +276,8 @@ class Session:
             for j, resp in enumerate(sent):
                 replies[positions[j]] = resp
                 if (resp.get("status")
-                        in ("ok", "cas_failed", "incr_failed")
+                        in ("ok", "cas_failed", "incr_failed",
+                            "append_failed")
                         and resp.get("index") is not None):
                     index = int(resp["index"])
                     if index > self.last_write_index:
@@ -338,6 +342,65 @@ class Session:
         any other write."""
         return self._write({"type": "client", "op": "getset", "key": key,
                             "value": value})
+
+    def append(self, key: str, value: str) -> dict:
+        """Append ``value`` to the key's string value, Redis APPEND:
+        a missing key is created holding just ``value``, and the
+        reply carries the new value and its length (``length``).
+        The outcome is decided at apply time, at the entry's
+        position in the log, so a retry with the same session id
+        returns the first attempt's length instead of appending
+        twice, and a successful append keeps the key's TTL
+        deadline, like a CAS. A non-string value fails with
+        ``append_failed`` and reason ``wrongtype`` instead of
+        appending. A successful append advances the write
+        watermark from the reply's index, like any other write —
+        and so does a failed one, since it still committed its
+        entry."""
+        return self._write({"type": "client", "op": "append", "key": key,
+                            "value": value})
+
+    def strlen(self, key: str) -> dict:
+        """Ask how long the string value at ``key`` is: the reply
+        carries ``length`` — 0 when the key does not exist, Redis
+        STRLEN. It rides the same ReadIndex path as ``get``, so it
+        carries the same session watermark and advances the read
+        watermark from the reply's ``read_index`` exactly the same
+        way: a length query after your own write sees the length
+        that write produced, and a later read never goes backwards
+        past it."""
+        if self.last_read_index > self.last_write_index:
+            min_index = self.last_read_index
+            term = self.last_read_term
+        else:
+            min_index = self.last_write_index
+            term = self.last_write_term
+        msg: dict = {"type": "client", "op": "strlen", "key": key,
+                     "client_id": self.client_id,
+                     "min_commit_index": min_index,
+                     "session_term": term}
+        resp = request(self.node_addr, msg, pool=self._pooled)
+        if (resp.get("status") == "ok"
+                and resp.get("read_index") is not None):
+            read_index = int(resp["read_index"])
+            if read_index > self.last_read_index:
+                self.last_read_index = read_index
+                self.last_read_term = int(resp.get("read_term") or 0)
+        return resp
+
+    def getdel(self, key: str) -> dict:
+        """Atomically get a key's value and delete it, Redis GETDEL:
+        returns ``value`` — the value the key held, or None when
+        it did not exist — and ``getdel`` 1 when the key was there
+        and is now gone, 0 when there was nothing to delete. The
+        outcome is decided at apply time, at the entry's position
+        in the log, so a retry with the same session id returns
+        the first attempt's value instead of deleting a key a
+        later write recreated, and the key takes its TTL deadline
+        with it when it goes. A successful getdel advances the
+        write watermark from the reply's index, like any other
+        write."""
+        return self._write({"type": "client", "op": "getdel", "key": key})
 
     def get(self, key: str) -> dict:
         # The read carries the higher of the two watermarks — the
@@ -616,22 +679,25 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
     ``set`` needs a string key and value, ``del`` a string key,
     ``cas`` a string key, expected, and value, ``incr`` a string
     key and an integer ``by`` (default 1), ``setnx`` a string key
-    and value, ``getset`` a string key and value."""
+    and value, ``getset`` a string key and value, ``append`` a
+    string key and value, ``getdel`` a string key."""
     if not isinstance(op, dict):
         return None, {"type": "client_response", "status": "error",
                       "error": "pipeline op must be an object with "
                                "op, key, and value fields"}
     name = op.get("op")
-    if name not in ("set", "del", "cas", "incr", "setnx", "getset"):
+    if name not in ("set", "del", "cas", "incr", "setnx", "getset",
+                    "append", "getdel"):
         return None, {"type": "client_response", "status": "error",
                       "error": "pipeline op must be set, del, cas, "
-                               "incr, setnx, or getset"}
+                               "incr, setnx, getset, append, or "
+                               "getdel"}
     key = op.get("key")
     if not isinstance(key, str):
         return None, {"type": "client_response", "status": "error",
                       "error": f"pipeline {name} needs a string key"}
     msg: dict = {"type": "client", "op": name, "key": key}
-    if name in ("set", "cas", "setnx", "getset"):
+    if name in ("set", "cas", "setnx", "getset", "append"):
         value = op.get("value")
         if not isinstance(value, str):
             return None, {"type": "client_response", "status": "error",
@@ -675,7 +741,7 @@ def pipeline(node_addr: tuple[str, int], ops: list,
     """Send many writes pipelined over one connection.
 
     One ``set`` / ``del`` / ``cas`` / ``incr`` / ``setnx`` /
-    ``getset`` op per
+    ``getset`` / ``append`` / ``getdel`` op per
     dict (see
     ``Session.pipeline`` for the shapes): the ops go out in
     batches of ``depth`` on a single persistent socket and the
@@ -881,6 +947,55 @@ def getset(node_addr: tuple[str, int], key: str, value: str,
     return request(node_addr, {"type": "client", "op": "getset",
                                "key": key, "value": value},
                    timeout=timeout)
+
+
+def append(node_addr: tuple[str, int], key: str, value: str,
+           timeout: float = 12.0) -> dict:
+    """Append ``value`` to the key's string value, following leader
+    redirects like ``request`` — Redis APPEND.
+
+    One request appends the append entry, so the new value and
+    length are decided at the entry's position in the log: the
+    reply is the plain append response (``status`` ``ok`` with
+    the new ``value`` and its ``length`` — or ``append_failed``
+    with reason ``wrongtype`` when the current value is not a
+    string). A missing key is created holding just ``value``, and
+    a successful append keeps the key's TTL deadline, like a
+    CAS."""
+    return request(node_addr, {"type": "client", "op": "append",
+                               "key": key, "value": value},
+                   timeout=timeout)
+
+
+def strlen(node_addr: tuple[str, int], key: str,
+           timeout: float = 12.0) -> dict:
+    """Ask how long the string value at ``key`` is, following leader
+    redirects like ``request`` — Redis STRLEN.
+
+    One request serves the length through the leader's ReadIndex
+    path, so it reflects the committed state as of one read
+    index, exactly as linearizable as a ``get``. The reply is the
+    plain strlen response (``status`` ``ok`` with ``length`` — 0
+    when the key does not exist — plus the ``read_index`` /
+    ``read_term`` the length was measured at)."""
+    return request(node_addr, {"type": "client", "op": "strlen",
+                               "key": key}, timeout=timeout)
+
+
+def getdel(node_addr: tuple[str, int], key: str,
+           timeout: float = 12.0) -> dict:
+    """Atomically get a key's value and delete it, following leader
+    redirects like ``request`` — Redis GETDEL.
+
+    One request appends the getdel entry, so the value it returns
+    is decided at the entry's position in the log: the reply is
+    the plain getdel response (``status`` ``ok`` with ``value``
+    — the value the key held, or None when it did not exist —
+    and ``getdel`` 1 when the key was there and is now gone, 0
+    when there was nothing to delete). The key takes its TTL
+    deadline with it when it goes."""
+    return request(node_addr, {"type": "client", "op": "getdel",
+                               "key": key}, timeout=timeout)
 
 
 def mset(node_addr: tuple[str, int], pairs: list,
@@ -1194,6 +1309,37 @@ def main(argv: list[str] | None = None) -> int:
                                "twice")
     p_getset.add_argument("--request-id", default=None,
                           help="id of this write within the client session")
+    p_append = sub.add_parser(
+        "append",
+        help="append value to the string at key and print the new "
+             "length; a missing key is created holding just value, "
+             "and a non-string value fails")
+    p_append.add_argument("key")
+    p_append.add_argument("value")
+    p_append.add_argument("--client-id", default=None,
+                          help="session id for at-most-once writes: a retry "
+                               "with the same client id + request id returns "
+                               "the first attempt's result instead of writing "
+                               "twice")
+    p_append.add_argument("--request-id", default=None,
+                          help="id of this write within the client session")
+    p_strlen = sub.add_parser(
+        "strlen",
+        help="print the length of the string at key (0 when the key "
+             "does not exist); a non-string value fails")
+    p_strlen.add_argument("key")
+    p_getdel = sub.add_parser(
+        "getdel",
+        help="atomically print the value at key and delete it "
+             "(or (nil) when the key did not exist)")
+    p_getdel.add_argument("key")
+    p_getdel.add_argument("--client-id", default=None,
+                          help="session id for at-most-once writes: a retry "
+                               "with the same client id + request id returns "
+                               "the first attempt's result instead of writing "
+                               "twice")
+    p_getdel.add_argument("--request-id", default=None,
+                          help="id of this write within the client session")
     p_add = sub.add_parser("add-server",
                            help="add a server to the cluster (Raft §6)")
     p_add.add_argument("server_id")
@@ -1285,7 +1431,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     msg: dict = {"type": "client", "op": op}
     if op in ("set", "get", "del", "cas", "ttl", "expire", "incr",
-              "setnx", "getset"):
+              "setnx", "getset", "append", "strlen", "getdel"):
         msg["key"] = args.key
     elif op == "mset":
         if len(args.pairs) % 2:
@@ -1324,8 +1470,10 @@ def main(argv: list[str] | None = None) -> int:
         msg["value"] = args.value
     if op == "getset":
         msg["value"] = args.value
+    if op == "append":
+        msg["value"] = args.value
     if op in ("set", "del", "cas", "mset", "expire", "incr", "setnx",
-              "getset") \
+              "getset", "append", "getdel") \
             and args.request_id:
         # A request id without an explicit client id still dedups
         # within the default "cli" session; the same id retried from
@@ -1365,6 +1513,13 @@ def main(argv: list[str] | None = None) -> int:
             print(resp.get("setnx"))
         elif op == "getset":
             old = resp.get("old_value")
+            print(old if old is not None else "(nil)")
+        elif op == "append":
+            print(resp.get("length"))
+        elif op == "strlen":
+            print(resp.get("length"))
+        elif op == "getdel":
+            old = resp.get("value")
             print(old if old is not None else "(nil)")
         elif op == "mget":
             print(json.dumps(resp.get("values")))
