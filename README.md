@@ -346,6 +346,38 @@ logic and the failure handling, not the key-value API on top.
   the end grows the value by the whole gap in one entry, so a
   large offset is a large value on every replica, not just on the
   leader — the cap is what keeps that bounded.
+- **Get-and-expire** — since v0.45.0 `getex key [EX n | PX n |
+  EXAT t | PXAT t | PERSIST]` (`Session.getex(k, ex=n, ...)`,
+  `client.getex(addr, k, ...)`, `getex key --ex n` on the CLI)
+  answers with the value the key held and optionally sets,
+  refreshes, or clears its expiry in the same atomic operation —
+  Redis GETEX. A missing key answers None with `getex` 0, a
+  no-op, not an error. EX / PX name a relative deadline (this
+  entry's index + N, in the store's log-entry units, like
+  `ttl_entries` — this store has no wall clock, so the Redis
+  seconds / milliseconds are read as log entries); EXAT / PXAT
+  name the absolute log index of the deadline; PERSIST clears
+  it; no option leaves the value and the deadline both alone.
+  The outcome is decided at apply time, at the entry's exact
+  position in the log, like a CAS: a retry with the same session
+  id returns the first attempt's value and deadline instead of
+  re-expiring, and the deadline rides snapshots like any other.
+  A GETEX never changes the value, so a pure expiry change fires
+  no watch event — only the purge fires a `del` event, when the
+  deadline entry lands, like an expire. The one exception is an
+  absolute deadline already past at apply time: Redis deletes the
+  key there, so this does too — the reply is None with `getex` 0
+  and the apply path fires the `del` event for it. At most one
+  option: two options, an unknown option, or a bad value is a
+  client error and appends nothing. It rides the same write path
+  as a single `set` — group-commit batching, dedup, the
+  response's log index advancing a session's watermark — and
+  `{"op": "getex", "key": k, "ex": n}` is a pipeline op too.
+  The honest limit is the unit itself: the options spell Redis
+  times, but the deadlines they set are distances and positions
+  in the log, not seconds — a key expired with EX 10 lives for
+  10 further log entries, however long those take in wall-clock
+  time.
 - **Key enumeration** — since v0.31.0 one `keys` RPC lists the
   store's keys (`client.keys(prefix, limit, start_after)`,
   `Session.keys(prefix, limit, start_after)`, `keys --prefix p
@@ -660,7 +692,7 @@ make test
 # or: python3 -m unittest discover -s tests -v
 ```
 
-381 tests, plus a smoke test for the benchmark script, all passing:
+406 tests, plus a smoke test for the benchmark script, all passing:
 
 | Test | What it proves |
 |---|---|
@@ -2081,3 +2113,45 @@ entries left in `log.jsonl` are dropped by their index on reload.
   proposed by the next run — candidates: a wall-clock TTL
   variant, or GETEX (get-and-expire), or Redis bit ops
   (SETBIT / GETBIT).
+- ~~GETEX~~ — done in v0.45.0,
+  Nov 24, 2026: `getex key [EX n | PX n | EXAT t | PXAT t |
+  PERSIST]` answers with the value the key held and optionally
+  sets, refreshes, or clears its expiry in the same atomic
+  operation — Redis GETEX — decided at apply time like a CAS,
+  so a retry with the same session id returns the first
+  attempt's value and deadline instead of re-expiring. EX / PX
+  name a relative deadline (this entry's index + N, in the
+  store's log-entry units — the Redis seconds / milliseconds
+  are read as log entries, since this store has no wall clock);
+  EXAT / PXAT name the absolute log index of the deadline;
+  PERSIST clears it; no option leaves the value and the
+  deadline both alone. A missing key answers None with `getex`
+  0, a no-op; an absolute deadline already past deletes the key
+  in its own entry, like Redis. A pure expiry change fires no
+  watch event — only the purge fires a `del` event, when the
+  deadline entry lands — except the past-deadline delete, which
+  fires `del` in its own entry. At most one option: two options,
+  an unknown option, or a bad value is a client error and
+  appends nothing. `{"op": "getex"}` is a pipeline op too.
+  `Session.getex` / `client.getex`, and `getex` on the CLI
+  expose it.
+  `tests/test_getex.py` proves it: store-level EX, PX, EXAT,
+  PXAT, PERSIST, no-option, missing key, replacing a deadline,
+  the past absolute deadline deleting the key and dropping it
+  from the sorted index, and a relative deadline with no index
+  raising; replication to every node, all five option forms
+  through the TTL query, a missing key still committing one
+  entry, PERSIST clearing a deadline, the past EXAT deleting
+  the key on every node, no watch event on a pure expiry change
+  and a del event at the purge and at a past-deadline delete,
+  invalid option combinations rejected with no log entry,
+  dedup of a retry returning the first attempt's value and
+  deadline, redirect from a follower, surviving a snapshot +
+  restart, continuing after a leader change, session
+  read-your-writes, pipelined getex ops with a malformed op in
+  position, and the CLI end to end.
+  The roadmap is exhausted again, so the next real thing is
+  a new roadmap item grounded in this project's purpose,
+  proposed by the next run — candidates: a wall-clock TTL
+  variant, or Redis bit ops (SETBIT / GETBIT), or HyperLogLog
+  (PFADD / PFCOUNT).

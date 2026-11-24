@@ -202,6 +202,9 @@ class Session:
             {"op": "getset", "key": k, "value": v}
             {"op": "append", "key": k, "value": v}
             {"op": "getdel", "key": k}
+            {"op": "getex", "key": k}
+            {"op": "getex", "key": k, "ex": n}
+            {"op": "getex", "key": k, "persist": True}
             {"op": "setrange", "key": k, "offset": n, "value": v}
 
         The whole list goes out in batches of ``depth`` on a single
@@ -403,6 +406,42 @@ class Session:
         write watermark from the reply's index, like any other
         write."""
         return self._write({"type": "client", "op": "getdel", "key": key})
+
+    def getex(self, key: str, ex: int | None = None,
+              px: int | None = None, exat: int | None = None,
+              pxat: int | None = None, persist: bool = False) -> dict:
+        """Get the value at ``key`` and optionally set, refresh, or
+        clear its expiry in the same atomic operation, Redis GETEX:
+        returns ``value`` — the value the key held, or None when
+        it did not exist — and ``getex`` 1 when the key was there,
+        0 when there was nothing to get, plus ``deadline`` — the
+        key's deadline after the op, or None without one. At most
+        one option: ``ex`` / ``px`` expire the key after that many
+        further log entries (the store's log-entry units, like
+        ``ttl_entries`` — the Redis seconds / milliseconds are
+        read as log entries, since this store has no wall clock);
+        ``exat`` / ``pxat`` expire it when the log reaches that
+        absolute index; ``persist`` clears the deadline. With no
+        option the value and the deadline are both left alone. The
+        outcome is decided at apply time, at the entry's position
+        in the log, so a retry with the same session id returns
+        the first attempt's value and deadline instead of
+        re-expiring, and the value is never changed — a pure
+        expiry change fires no watch event. A successful getex
+        advances the write watermark from the reply's index, like
+        any other write."""
+        msg: dict = {"type": "client", "op": "getex", "key": key}
+        if ex is not None:
+            msg["ex"] = ex
+        if px is not None:
+            msg["px"] = px
+        if exat is not None:
+            msg["exat"] = exat
+        if pxat is not None:
+            msg["pxat"] = pxat
+        if persist:
+            msg["persist"] = True
+        return self._write(msg)
 
     def getrange(self, key: str, start: int, end: int) -> dict:
         """Ask for the substring of the string value at ``key``
@@ -734,7 +773,10 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
     ``cas`` a string key, expected, and value, ``incr`` a string
     key and an integer ``by`` (default 1), ``setnx`` a string key
     and value, ``getset`` a string key and value, ``append`` a
-    string key and value, ``getdel`` a string key, ``setrange`` a
+    string key and value, ``getdel`` a string key, ``getex`` a
+    string key and at most one expiry option (``ex`` / ``px`` a
+    relative count of log entries, ``exat`` / ``pxat`` an absolute
+    log index, ``persist`` a bare flag), ``setrange`` a
     string key, an integer ``offset`` and a string value."""
     if not isinstance(op, dict):
         return None, {"type": "client_response", "status": "error",
@@ -742,11 +784,11 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
                                "op, key, and value fields"}
     name = op.get("op")
     if name not in ("set", "del", "cas", "incr", "setnx", "getset",
-                    "append", "getdel", "setrange"):
+                    "append", "getdel", "getex", "setrange"):
         return None, {"type": "client_response", "status": "error",
                       "error": "pipeline op must be set, del, cas, "
                                "incr, setnx, getset, append, "
-                               "getdel, or setrange"}
+                               "getdel, getex, or setrange"}
     key = op.get("key")
     if not isinstance(key, str):
         return None, {"type": "client_response", "status": "error",
@@ -801,6 +843,56 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
                           "error": "pipeline setrange offset must be "
                                    "a non-negative integer"}
         msg["offset"] = offset
+    if name == "getex":
+        # At most one expiry option rides along with a pipelined
+        # getex, validated here so a malformed one never goes on
+        # the wire: EX / PX a relative count of log entries,
+        # 1..1,000,000, like ttl_entries; EXAT / PXAT an absolute
+        # log index, a positive integer; PERSIST a bare flag —
+        # the same shapes the server enforces. Anything else on
+        # the op is an unknown option, not a silently ignored
+        # field.
+        options = [f for f in ("ex", "px", "exat", "pxat", "persist")
+                   if op.get(f) is not None]
+        extra = [f for f in op
+                 if f not in ("op", "key", "ex", "px", "exat",
+                              "pxat", "persist")
+                 and op.get(f) is not None]
+        if extra:
+            return None, {"type": "client_response", "status": "error",
+                          "error": f"unknown getex option: {extra[0]}"}
+        if len(options) > 1:
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline getex takes at most one "
+                                   "of EX, PX, EXAT, PXAT, PERSIST"}
+        if "ex" in options or "px" in options:
+            field = "ex" if "ex" in options else "px"
+            n = op[field]
+            if (not isinstance(n, int) or isinstance(n, bool)
+                    or n < 1 or n > 1_000_000):
+                return None, {"type": "client_response",
+                              "status": "error",
+                              "error": f"pipeline getex {field.upper()} "
+                                       "must be an integer between 1 "
+                                       "and 1000000"}
+            msg[field] = n
+        elif "exat" in options or "pxat" in options:
+            field = "exat" if "exat" in options else "pxat"
+            t = op[field]
+            if (not isinstance(t, int) or isinstance(t, bool)
+                    or t < 1):
+                return None, {"type": "client_response",
+                              "status": "error",
+                              "error": f"pipeline getex {field.upper()} "
+                                       "must be a positive integer"}
+            msg[field] = t
+        elif "persist" in options:
+            if op["persist"] is not True:
+                return None, {"type": "client_response",
+                              "status": "error",
+                              "error": "pipeline getex PERSIST takes "
+                                       "no argument"}
+            msg["persist"] = True
     return msg, None
 
 
@@ -809,7 +901,7 @@ def pipeline(node_addr: tuple[str, int], ops: list,
     """Send many writes pipelined over one connection.
 
     One ``set`` / ``del`` / ``cas`` / ``incr`` / ``setnx`` /
-    ``getset`` / ``append`` / ``getdel`` / ``setrange`` op per
+    ``getset`` / ``append`` / ``getdel`` / ``getex`` / ``setrange`` op per
     dict (see
     ``Session.pipeline`` for the shapes): the ops go out in
     batches of ``depth`` on a single persistent socket and the
@@ -1064,6 +1156,43 @@ def getdel(node_addr: tuple[str, int], key: str,
     deadline with it when it goes."""
     return request(node_addr, {"type": "client", "op": "getdel",
                                "key": key}, timeout=timeout)
+
+
+def getex(node_addr: tuple[str, int], key: str,
+          ex: int | None = None, px: int | None = None,
+          exat: int | None = None, pxat: int | None = None,
+          persist: bool = False, timeout: float = 12.0) -> dict:
+    """Get the value at ``key`` and optionally set, refresh, or
+    clear its expiry in the same atomic operation, following
+    leader redirects like ``request`` — Redis GETEX.
+
+    One request appends the getex entry, so the value it returns
+    and the deadline it sets are decided at the entry's position
+    in the log: the reply is the plain getex response (``status``
+    ``ok`` with ``value`` — the value the key held, or None when
+    it did not exist — and ``getex`` 1 when the key was there, 0
+    when there was nothing to get, plus ``deadline``, the key's
+    deadline after the op, or None without one). At most one
+    option: ``ex`` / ``px`` expire the key after that many
+    further log entries (the store's log-entry units — the Redis
+    seconds / milliseconds are read as log entries, since this
+    store has no wall clock); ``exat`` / ``pxat`` expire it when
+    the log reaches that absolute index; ``persist`` clears the
+    deadline. With no option the value and the deadline are both
+    left alone, and the value is never changed — a pure expiry
+    change fires no watch event."""
+    msg: dict = {"type": "client", "op": "getex", "key": key}
+    if ex is not None:
+        msg["ex"] = ex
+    if px is not None:
+        msg["px"] = px
+    if exat is not None:
+        msg["exat"] = exat
+    if pxat is not None:
+        msg["pxat"] = pxat
+    if persist:
+        msg["persist"] = True
+    return request(node_addr, msg, timeout=timeout)
 
 
 def getrange(node_addr: tuple[str, int], key: str, start: int,
@@ -1447,6 +1576,35 @@ def main(argv: list[str] | None = None) -> int:
                                "twice")
     p_getdel.add_argument("--request-id", default=None,
                           help="id of this write within the client session")
+    p_getex = sub.add_parser(
+        "getex",
+        help="print the value at key and optionally set, refresh, "
+             "or clear its expiry in one atomic operation (or "
+             "(nil) when the key did not exist); at most one "
+             "expiry option")
+    p_getex.add_argument("key")
+    g_getex = p_getex.add_mutually_exclusive_group()
+    g_getex.add_argument("--ex", type=int, default=None,
+                         help="expire the key after this many further "
+                              "log entries")
+    g_getex.add_argument("--px", type=int, default=None,
+                         help="expire the key after this many further "
+                              "log entries")
+    g_getex.add_argument("--exat", type=int, default=None,
+                         help="expire the key when the log reaches "
+                              "this index")
+    g_getex.add_argument("--pxat", type=int, default=None,
+                         help="expire the key when the log reaches "
+                              "this index")
+    g_getex.add_argument("--persist", action="store_true",
+                         help="clear the key's expiry")
+    p_getex.add_argument("--client-id", default=None,
+                         help="session id for at-most-once writes: a retry "
+                              "with the same client id + request id returns "
+                              "the first attempt's result instead of writing "
+                              "twice")
+    p_getex.add_argument("--request-id", default=None,
+                         help="id of this write within the client session")
     p_getrange = sub.add_parser(
         "getrange",
         help="print the substring of the string at key from start "
@@ -1571,7 +1729,7 @@ def main(argv: list[str] | None = None) -> int:
     msg: dict = {"type": "client", "op": op}
     if op in ("set", "get", "del", "cas", "ttl", "expire", "incr",
               "setnx", "getset", "append", "strlen", "getdel",
-              "getrange", "setrange"):
+              "getex", "getrange", "setrange"):
         msg["key"] = args.key
     elif op == "mset":
         if len(args.pairs) % 2:
@@ -1615,11 +1773,22 @@ def main(argv: list[str] | None = None) -> int:
     if op == "getrange":
         msg["start"] = args.start
         msg["end"] = args.end
+    if op == "getex":
+        if args.ex is not None:
+            msg["ex"] = args.ex
+        if args.px is not None:
+            msg["px"] = args.px
+        if args.exat is not None:
+            msg["exat"] = args.exat
+        if args.pxat is not None:
+            msg["pxat"] = args.pxat
+        if args.persist:
+            msg["persist"] = True
     if op == "setrange":
         msg["offset"] = args.offset
         msg["value"] = args.value
     if op in ("set", "del", "cas", "mset", "expire", "incr", "setnx",
-              "getset", "append", "getdel", "setrange") \
+              "getset", "append", "getdel", "getex", "setrange") \
             and args.request_id:
         # A request id without an explicit client id still dedups
         # within the default "cli" session; the same id retried from
@@ -1667,6 +1836,9 @@ def main(argv: list[str] | None = None) -> int:
         elif op == "getdel":
             old = resp.get("value")
             print(old if old is not None else "(nil)")
+        elif op == "getex":
+            value = resp.get("value")
+            print(value if value is not None else "(nil)")
         elif op == "getrange":
             print(resp.get("value") or "")
         elif op == "setrange":

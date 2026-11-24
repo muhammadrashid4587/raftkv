@@ -1336,7 +1336,8 @@ class RaftNode:
                 pass
             else:
                 # The apply result matters for CAS, expire, incr,
-                # setnx, getset, append, getdel, and setrange:
+                # setnx, getset, append, getdel, setrange, and
+                # getex:
                 # their outcome is decided here, at this exact point
                 # in the log, so the result is recorded in the dedup
                 # table
@@ -1424,8 +1425,18 @@ class RaftNode:
                     self.watch.notify(entry["command"]["key"],
                                       result["value"], "set",
                                       index=self.last_applied)
+                elif (op == "getex" and result is not None
+                        and result.get("deleted")):
+                    # A getex whose absolute deadline was already
+                    # past deleted the key outright: it fires like
+                    # a del. Any other getex changed only the
+                    # deadline, not the value, so it fires
+                    # nothing — a pure expiry change is a
+                    # read-with-side-effect, not a set.
+                    self.watch.notify(entry["command"]["key"], None, "del",
+                                      index=self.last_applied)
                 if (op in ("cas", "expire", "incr", "setnx", "getset",
-                           "append", "getdel", "setrange")
+                           "append", "getdel", "setrange", "getex")
                         and result is not None
                         and self.role == "leader"):
                     # Record the outcome only when a local waiter is
@@ -1437,7 +1448,7 @@ class RaftNode:
                     # without a session id has no dedup key, so it
                     # always records: its waiter is identified by
                     # index alone. CAS, expire, incr, setnx, getset,
-                    # append, getdel, and setrange are
+                    # append, getdel, setrange, and getex are
                     # the ops
                     # whose apply returns a result — a set/del
                     # returns None and has nothing to record.
@@ -1475,14 +1486,15 @@ class RaftNode:
         The cached result is what a retry with the same session id gets
         back instead of a second log entry. For set/del the result is
         always ok once committed; for CAS, expire, incr, setnx,
-        getset, append, getdel, and setrange
+        getset, append, getdel, setrange, and getex
         it is the
         apply-time outcome (success, mismatch, or missing key for a
         CAS; 1 or 0 for an expire; the new value, or not_an_integer
         / overflow for an incr; 1 or 0 for a setnx; the old value
         for a getset; the new value and length, or wrongtype for
         an append; the old value and 1 or 0 for a getdel; the new
-        value and length, or wrongtype for a setrange), so a
+        value and length, or wrongtype for a setrange; the value
+        and 1 or 0, plus the deadline, for a getex), so a
         retry returns the first
         attempt's exact result. The result also carries the log
         index and term of the entry that produced it: a retried write
@@ -2173,12 +2185,12 @@ class RaftNode:
         key = msg.get("key")
         if op not in ("set", "get", "del", "cas", "ttl", "expire",
                       "incr", "setnx", "getset", "append", "strlen",
-                      "getdel", "getrange", "setrange") \
+                      "getdel", "getrange", "setrange", "getex") \
                 or key is None:
             return {"type": "client_response", "status": "error",
                     "error": "op must be set/get/del/cas/ttl/expire/"
                              "incr/setnx/getset/append/strlen/getdel/"
-                             "getrange/setrange "
+                             "getrange/setrange/getex "
                              "with a key"}
         if self._is_removed():
             return {"type": "client_response", "status": "error",
@@ -2337,6 +2349,70 @@ class RaftNode:
             elif op == "expire":
                 return {"type": "client_response", "status": "error",
                         "error": "expire requires ttl_entries"}
+        if op == "getex":
+            # Get the value and optionally set, refresh, or clear
+            # its expiry in the same atomic operation, Redis
+            # GETEX. At most one expiry option: EX / PX set a
+            # relative deadline — this entry's index + N, in the
+            # store's log-entry units, like ttl_entries (this
+            # store has no wall clock, so the Redis seconds /
+            # milliseconds are read as log entries); EXAT / PXAT
+            # name the absolute log index of the deadline, not a
+            # Unix time; PERSIST clears the deadline. No option
+            # at all is a plain read-with-no-side-effect: the
+            # value and the deadline are both left alone.
+            # Validated here, on the leader, before the command
+            # is ever logged — a bad option is a client error,
+            # not a log entry. What the option does is decided
+            # at apply time, like a CAS, not here: whether the
+            # key exists, and what its deadline becomes, is the
+            # entry's result. The message envelope for a write is
+            # type / op / key plus the session id — anything else
+            # on a getex must be one of the five expiry options,
+            # so an unknown field (a typo like "expx") is a
+            # client error, not a silently ignored option.
+            options = [f for f in ("ex", "px", "exat", "pxat",
+                                   "persist")
+                       if msg.get(f) is not None]
+            extra = [f for f in msg
+                     if f not in ("type", "op", "key", "client_id",
+                                  "request_id", "ex", "px", "exat",
+                                  "pxat", "persist")
+                     and msg.get(f) is not None]
+            if extra:
+                return {"type": "client_response", "status": "error",
+                        "error": f"unknown getex option: {extra[0]}"}
+            if len(options) > 1:
+                return {"type": "client_response", "status": "error",
+                        "error": "getex takes at most one of EX, PX, "
+                                 "EXAT, PXAT, PERSIST"}
+            if "ex" in options or "px" in options:
+                field = "ex" if "ex" in options else "px"
+                n = msg[field]
+                if (not isinstance(n, int) or isinstance(n, bool)
+                        or n < 1 or n > TTL_MAX_ENTRIES):
+                    return {"type": "client_response",
+                            "status": "error",
+                            "error": f"getex {field.upper()} must be "
+                                     "an integer between 1 and "
+                                     f"{TTL_MAX_ENTRIES}"}
+                command[field] = n
+            elif "exat" in options or "pxat" in options:
+                field = "exat" if "exat" in options else "pxat"
+                t = msg[field]
+                if (not isinstance(t, int) or isinstance(t, bool)
+                        or t < 1):
+                    return {"type": "client_response",
+                            "status": "error",
+                            "error": f"getex {field.upper()} must be "
+                                     "a positive integer"}
+                command[field] = t
+            elif "persist" in options:
+                if msg["persist"] is not True:
+                    return {"type": "client_response",
+                            "status": "error",
+                            "error": "getex PERSIST takes no argument"}
+                command["persist"] = True
         if op == "cas":
             # A conditional write: set key to value only if its current
             # value equals expected. The comparison happens at apply
@@ -2859,8 +2935,8 @@ class RaftNode:
         # dedup table already holds it via _apply_committed) or the
         # batch failed (so nothing was appended), and a retry arriving
         # after this point takes the _dedup path or appends fresh.
-        # A waiter whose entry has an apply-time result (a CAS, or an
-        # expire) gets that result, not the shared ok: the outcome was
+        # A waiter whose entry has an apply-time result (a CAS, an
+        # expire, or a getex) gets that result, not the shared ok: the outcome was
         # decided when the entry applied, and the waiter must learn it,
         # not just that the entry committed. Apply results for this
         # batch are pruned here, once every waiter has its own — and

@@ -96,7 +96,8 @@ class KVStore:
 
         Returns a result dict for commands whose outcome depends on the
         state at apply time — currently "cas", "expire", "incr",
-        "setnx", "getset", "append", "getdel", and "setrange" —
+        "setnx", "getset", "append", "getdel", "setrange", and
+        "getex" —
         and None for set/del, whose outcome is always ok. The result is
         what the leader hands back to the waiting client and what the
         dedup table caches for retries, so it must be a pure function
@@ -371,6 +372,79 @@ class KVStore:
             self._expiry.pop(key, None)
             return {"type": "client_response", "status": "ok",
                     "value": old, "getdel": 1}
+        elif op == "getex":
+            # Get a key's value and optionally set, refresh, or
+            # clear its expiry in the same atomic operation, Redis
+            # GETEX: the value is whatever the key held at this
+            # exact point in the log — None when it did not
+            # exist — and the deadline comes from the option the
+            # command carries. EX / PX name a relative deadline
+            # (this entry's index + N, in log entries, like
+            # ttl_entries — this store has no wall clock, so the
+            # Redis seconds / milliseconds are read as log
+            # entries); EXAT / PXAT name the absolute log index
+            # of the deadline; PERSIST clears it; no option
+            # leaves the deadline alone. The outcome is decided
+            # here, at apply time, like a CAS: a retry with the
+            # same session id returns the first attempt's value
+            # and deadline from the dedup table instead of
+            # re-expiring, and a missing key answers None with
+            # ``getex`` 0 — a no-op, not an error. A GETEX never
+            # changes the value, so it fires no watch event for
+            # the expiry change itself — only the purge fires a
+            # ``del`` event, when the deadline entry lands, like
+            # an expire. The one exception is an absolute
+            # deadline already past at apply time: Redis deletes
+            # the key there instead of recording a deadline
+            # nobody could ever honour, so this deletes it too
+            # — the reply is None with ``getex`` 0 and
+            # ``deleted`` set, so the apply path fires the
+            # ``del`` event for it. A relative deadline needs
+            # the log index, like a set with a TTL: applying one
+            # outside a log raises.
+            key = command["key"]
+            if key not in self._data:
+                return {"type": "client_response", "status": "ok",
+                        "value": None, "getex": 0}
+            value = self._data[key]
+            if command.get("persist"):
+                self._expiry.pop(key, None)
+                return {"type": "client_response", "status": "ok",
+                        "value": value, "getex": 1, "deadline": None}
+            deadline = None
+            if "ex" in command or "px" in command:
+                if index is None:
+                    raise ValueError(
+                        "getex needs the log index of the entry "
+                        "being applied")
+                n = (command["ex"] if "ex" in command
+                     else command["px"])
+                deadline = index + n
+            elif "exat" in command or "pxat" in command:
+                if index is None:
+                    raise ValueError(
+                        "getex needs the log index of the entry "
+                        "being applied")
+                deadline = (command["exat"] if "exat" in command
+                            else command["pxat"])
+            if deadline is not None:
+                if deadline <= index:
+                    # Already past: the key dies now, not at some
+                    # later entry — a deadline at or before this
+                    # entry's index can never be honoured, and
+                    # recording it would leave ttl() answering 0
+                    # or negative for a live key.
+                    del self._data[key]
+                    idx = bisect.bisect_left(self._keys, key)
+                    if idx < len(self._keys) and self._keys[idx] == key:
+                        del self._keys[idx]
+                    self._expiry.pop(key, None)
+                    return {"type": "client_response", "status": "ok",
+                            "value": None, "getex": 0, "deleted": True}
+                self._expiry[key] = deadline
+            return {"type": "client_response", "status": "ok",
+                    "value": value, "getex": 1,
+                    "deadline": self._expiry.get(key)}
         elif op == "setrange":
             # Overwrite part of a string value, Redis SETRANGE:
             # starting at ``offset``, replace as many characters
