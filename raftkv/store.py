@@ -11,6 +11,7 @@ pure function of (current state, command).
 import bisect
 import hashlib
 import math
+import re
 
 # Signed 64-bit bounds, the range Redis's INCR/INCRBY works in: a
 # value outside it is not an integer Redis can count, and a result
@@ -52,6 +53,33 @@ def _is_integer_string(s: str) -> bool:
     if s.startswith(("+", "-")):
         s = s[1:]
     return bool(s) and s.isdigit()
+
+
+_FLOAT_RE = re.compile(r"^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$")
+
+
+def _parse_float_string(s: str) -> float | None:
+    """Parse ``s`` as a Redis-style float, or None when it is not
+    one. ``float()`` alone is too lenient — it accepts "inf",
+    "nan", whitespace, and underscores, which Redis rejects — so
+    the shape is checked first and ``float()`` only parses what
+    already looks like a number. The result is still checked for
+    finiteness by the caller: "1e999" has the right shape but no
+    finite value."""
+    if not _FLOAT_RE.match(s):
+        return None
+    return float(s)
+
+
+def _format_float(value: float) -> str:
+    """Format a float the way Redis formats an INCRBYFLOAT result:
+    the shortest string that round-trips, with a trailing ".0"
+    dropped so an integral result reads "2", not "2.0" — the same
+    "%.17Lg" output Redis produces for one."""
+    s = repr(value)
+    if s.endswith(".0"):
+        s = s[:-2]
+    return s
 
 
 def is_hll(value) -> bool:
@@ -238,7 +266,8 @@ class KVStore:
         ``ttl_entries`` sets the same deadline (its entry's
         index + the TTL) on every pair it touches, so the whole
         batch expires together. A successful CAS keeps the key's
-        deadline, and so does a successful incr and a getset:
+        deadline, and so does a successful incr, an incrbyfloat,
+        and a getset:
         all three are updates of the value, not fresh sets, so
         none must resurrect a key that is about to expire. A
         ``setex`` carries an absolute wall-clock deadline
@@ -250,7 +279,7 @@ class KVStore:
 
         Returns a result dict for commands whose outcome depends on the
         state at apply time — currently "set", "cas", "expire", "expireat",
-        "pexpireat", "incr", "setnx", "getset", "append", "getdel",
+        "pexpireat", "incr", "incrbyfloat", "setnx", "getset", "append", "getdel",
         "setrange", "getex", "setbit", and "pfadd" —
         and None for del, whose outcome is always ok. The result is
         what the leader hands back to the waiting client and what the
@@ -591,6 +620,54 @@ class KVStore:
             self._data[key] = str(new)
             return {"type": "client_response", "status": "ok",
                     "value": str(new)}
+        elif op == "incrbyfloat":
+            # Atomic float increment, Redis INCRBYFLOAT: add
+            # ``by`` to the key's current value, which must be a
+            # float string — a missing key counts as 0, so the
+            # first incrbyfloat creates it at ``by`` — and the
+            # result must be finite, or the increment errors
+            # instead of producing NaN or Infinity. The outcome
+            # is decided here, at this exact point in the log, so
+            # every node computes the same result and a retry with
+            # the same session id returns the first attempt's
+            # outcome from the dedup table instead of adding
+            # twice. A failed incrbyfloat writes nothing at all,
+            # like a failed incr, but it still committed its
+            # entry — the failure is the entry's result, not a
+            # client error. A successful one keeps the key's
+            # deadline, like an incr, and the value is stored as
+            # its formatted string, so a later get reads back
+            # exactly what incrbyfloat returned — and a later
+            # incr on it fails, since "2.5" is not an integer
+            # string.
+            key = command["key"]
+            by = command.get("by", 1.0)
+            current = self._data.get(key)
+            if current is None:
+                current_float = 0.0
+            else:
+                current_float = _parse_float_string(current)
+                if (current_float is None
+                        or not math.isfinite(current_float)):
+                    return {"type": "client_response",
+                            "status": "incrbyfloat_failed",
+                            "reason": "not_a_float",
+                            "current": current,
+                            "error": "incrbyfloat failed: value of "
+                                     f"{key!r} is not a valid float"}
+            new = current_float + by
+            if not math.isfinite(new):
+                return {"type": "client_response",
+                        "status": "incrbyfloat_failed",
+                        "reason": "overflow",
+                        "current": current,
+                        "error": "incrbyfloat failed: increment "
+                                 "would produce NaN or Infinity"}
+            if key not in self._data:
+                bisect.insort(self._keys, key)
+            self._data[key] = _format_float(new)
+            return {"type": "client_response", "status": "ok",
+                    "value": _format_float(new)}
         elif op == "setnx":
             # Set-if-not-exists, Redis SETNX: set the key only
             # when it is absent, and answer 1 when it was set,

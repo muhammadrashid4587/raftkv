@@ -232,6 +232,32 @@ logic and the failure handling, not the key-value API on top.
   range itself: values are decimal strings, so a counter past
   9,223,372,036,854,775,807 is an error, not a wrap, and there is no
   `decr` spelling — a negative `by` is the decrement.
+- **Float counters** — since v0.54.0 `incrbyfloat key [by]`
+  (`Session.incrbyfloat(k, by=1.0)`, `client.incrbyfloat(addr, k,
+  by)`, `incrbyfloat key [by]` on the CLI) adds `by` (default
+  1.0, may be negative) to the key's float value and returns the
+  new value as a string, Redis INCRBYFLOAT: a missing key counts
+  as 0, so the first incrbyfloat creates it. The outcome is
+  decided at apply time, at the entry's exact position in the log,
+  like an incr — a non-float value fails distinctly
+  (`incrbyfloat_failed`, reason `not_a_float`, with the current
+  value in the reply) from a result that would be NaN or Infinity
+  (`overflow`), and a failed incrbyfloat writes nothing but still
+  committed its entry, so a retry with the same session id returns
+  the first attempt's exact result instead of adding twice. A
+  successful incrbyfloat keeps the key's TTL deadline, like an
+  incr, and fires a `set` watch event with the new value; a failed
+  one fires nothing. It rides the same write path as a single
+  `set` — group-commit batching, dedup, the response's log index
+  advancing a session's watermark — and `{"op": "incrbyfloat",
+  "key": k, "by": x}` is a pipeline op too. An integer string is
+  a valid float, so incrbyfloat on "41" works — and the result
+  ("41.5") is no longer an integer string, so a later incr on it
+  fails. The honest limit is the float itself: values are decimal
+  strings formatted like Redis ("2", not "2.0", for an integral
+  result, full repr precision otherwise), so 0.1 + 0.2 reads
+  "0.30000000000000004", exactly as it does in Redis — binary
+  floating point, not decimal arithmetic.
 - **Set-if-not-exists** — since v0.41.0 `setnx key value`
   (`Session.setnx(k, v)`, `client.setnx(addr, k, v)`, `setnx key
   value` on the CLI) sets the key only when it is absent and
@@ -2801,6 +2827,46 @@ entries left in `log.jsonl` are dropped by their index on reload.
   deadline and from the sweep for a future one, session
   read-your-writes, pipelined set ops with EXAT/PXAT and
   malformed ops in position, and the CLI end to end.
+- ~~INCRBYFLOAT~~ — done in v0.54.0,
+  Nov 24, 2026: `incrbyfloat key [by]` carries Redis's
+  INCRBYFLOAT — an atomic float increment, the float analogue
+  of `incr`: a missing key counts as 0, so the first
+  incrbyfloat creates it at `by`, and the outcome is decided at
+  apply time, at the entry's exact position in the log, like an
+  incr — a non-float value fails distinctly (`not_a_float`,
+  with the current value in the reply) from a result that
+  would be NaN or Infinity (`overflow`), and a failed
+  incrbyfloat writes nothing but still committed its entry, so
+  a retry with the same session id returns the first attempt's
+  exact result instead of adding twice. A successful
+  incrbyfloat keeps the key's TTL deadline, like an incr, and
+  fires a `set` watch event with the new value; a failed one
+  fires nothing. An integer string is a valid float, so
+  incrbyfloat on "41" works, and the stored value is the
+  formatted float — an integral result reads "2", not "2.0",
+  like Redis, and 0.1 + 0.2 reads "0.30000000000000004" — so a
+  later incr on it fails, since "41.5" is not an integer
+  string. It rides the same write path as a single `set` —
+  group-commit batching, dedup, the response's log index
+  advancing a session's watermark — and `{"op": "incrbyfloat",
+  "key": k, "by": x}` is a pipeline op too. `Session.incrbyfloat`
+  (with `by=`) and `incrbyfloat` on the CLI (a float `by`,
+  default 1.0) expose it. `tests/test_incrbyfloat.py` proves
+  it: store-level float adds and subtracts, an integer value
+  taking a float increment, Redis-style result formatting,
+  loose spellings ("1_0", "inf", "nan", "1e999") rejected,
+  exponent spellings ("1e3", ".5") accepted, a non-finite
+  result rejected with the value untouched, the TTL deadline
+  kept, a new key joining the sorted scan; replication to
+  every node, a non-float value failing with nothing written,
+  a bad `by` (a string, a bool, infinity) rejected with no log
+  entry, a follower redirect, dedup of a retry returning the
+  first attempt's result and of a failed retry returning the
+  first failure, continuing after a leader change, the `set`
+  watch event firing with the new value and nothing firing on
+  failure, surviving a snapshot + restart, session
+  read-your-writes, pipelined incrbyfloat ops with a malformed
+  op in position, and the CLI end to end.
   The roadmap is exhausted again, so the next real thing is
   a new roadmap item grounded in this project's purpose,
   proposed by the next run.

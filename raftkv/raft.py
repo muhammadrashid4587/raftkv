@@ -41,6 +41,7 @@ same state it had — without replaying the whole history.
 from __future__ import annotations
 
 import json
+import math
 import os
 import random
 import threading
@@ -1413,9 +1414,9 @@ class RaftNode:
                 pass
             else:
                 # The apply result matters for set, CAS, expire,
-                # expireat, pexpireat, incr, setnx, getset,
-                # append, getdel, setrange, getex, setbit, and
-                # pfadd:
+                # expireat, pexpireat, incr, incrbyfloat, setnx,
+                # getset, append, getdel, setrange, getex, setbit,
+                # and pfadd:
                 # their outcome is decided here, at this exact point
                 # in the log, so the result is recorded in the dedup
                 # table
@@ -1480,6 +1481,15 @@ class RaftNode:
                     # A successful incr fires like a set, with the
                     # new value: a failed incr wrote nothing, so it
                     # fires nothing, like a failed CAS.
+                    self.watch.notify(entry["command"]["key"],
+                                      result["value"], "set",
+                                      index=self.last_applied)
+                elif (op == "incrbyfloat" and result is not None
+                        and result.get("status") == "ok"):
+                    # A successful incrbyfloat fires like a set,
+                    # with the new value: a failed one wrote
+                    # nothing, so it fires nothing, like a failed
+                    # incr.
                     self.watch.notify(entry["command"]["key"],
                                       result["value"], "set",
                                       index=self.last_applied)
@@ -1568,7 +1578,7 @@ class RaftNode:
                                       index=self.last_applied)
                 if (op in ("set", "cas", "expire", "expireat",
                            "pexpireat",
-                           "incr", "setnx", "getset",
+                           "incr", "incrbyfloat", "setnx", "getset",
                            "append", "getdel", "setrange", "getex",
                            "setbit", "pfadd")
                         and result is not None
@@ -1582,9 +1592,9 @@ class RaftNode:
                     # without a session id has no dedup key, so it
                     # always records: its waiter is identified by
                     # index alone. Set, CAS, expire, expireat, pexpireat,
-                    # incr, setnx, getset, append, getdel, setrange,
-                    # getex, setbit, and pfadd are the ops
-                    # whose apply returns a result — a del
+                    # incr, incrbyfloat, setnx, getset, append,
+                    # getdel, setrange, getex, setbit, and pfadd are
+                    # the ops whose apply returns a result — a del
                     # returns None and has nothing to record.
                     key = _dedup_key(entry["command"])
                     if key is None or key in self._dedup_inflight:
@@ -1622,13 +1632,14 @@ class RaftNode:
         always ok once committed; for a set it is 1 or 0 — whether
         the write happened (a set that lost on NX / XX answers 0);
         for CAS, expire, expireat,
-        pexpireat, incr, setnx,
+        pexpireat, incr, incrbyfloat, setnx,
         getset, append, getdel, setrange, getex, setbit, and pfadd
         it is the
         apply-time outcome (success, mismatch, or missing key for a
         CAS; 1 or 0 for an expire; 1 or 0 for an expireat /
         pexpireat; the new value, or not_an_integer
-        / overflow for an incr; 1 or 0 for a setnx; the old value
+        / overflow for an incr; the new value, or not_a_float
+        / overflow for an incrbyfloat; 1 or 0 for a setnx; the old value
         for a getset; the new value and length, or wrongtype for
         an append; the old value and 1 or 0 for a getdel; the new
         value and length, or wrongtype for a setrange; the value
@@ -2325,7 +2336,8 @@ class RaftNode:
         key = msg.get("key")
         if op not in ("set", "get", "del", "cas", "ttl", "expire",
                       "expireat", "pexpireat",
-                      "incr", "setnx", "getset", "append", "strlen",
+                      "incr", "incrbyfloat", "setnx", "getset",
+                      "append", "strlen",
                       "getdel", "getrange", "setrange", "getex",
                       "setbit", "getbit", "pfadd", "pfcount",
                       "setex") \
@@ -2333,7 +2345,8 @@ class RaftNode:
             return {"type": "client_response", "status": "error",
                     "error": "op must be set/get/del/cas/ttl/expire/"
                              "expireat/pexpireat/"
-                             "incr/setnx/getset/append/strlen/getdel/"
+                             "incr/incrbyfloat/setnx/getset/append/"
+                             "strlen/getdel/"
                              "getrange/setrange/getex/setbit/getbit/"
                              "pfadd/pfcount/setex "
                              "with a key"}
@@ -2884,6 +2897,23 @@ class RaftNode:
             if not isinstance(by, int) or isinstance(by, bool):
                 return {"type": "client_response", "status": "error",
                         "error": "incr by must be an integer"}
+            command["by"] = by
+        if op == "incrbyfloat":
+            # An atomic float increment: add ``by`` (default 1.0)
+            # to the key's float value, decided at apply time
+            # like an incr — a missing key counts as 0, a
+            # non-float value and a non-finite result fail there,
+            # not here. Validated here only for shape: ``by`` must
+            # be a finite number (an int counts, a bool is not
+            # one), so a malformed incrbyfloat is a client error
+            # and appends no log entry.
+            by = msg.get("by", 1.0)
+            if (not isinstance(by, (int, float))
+                    or isinstance(by, bool)
+                    or not math.isfinite(by)):
+                return {"type": "client_response", "status": "error",
+                        "error": "incrbyfloat by must be a finite "
+                                 "number"}
             command["by"] = by
         # Client session id, when the client sent one: it rides in the
         # log entry so every node records the same dedup key on apply.

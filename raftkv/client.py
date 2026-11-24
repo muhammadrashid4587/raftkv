@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import uuid
 
@@ -126,7 +127,8 @@ class Session:
         # still have committed, and the next read must not claim a
         # watermark the client never saw acknowledged.
         if (resp.get("status")
-                in ("ok", "cas_failed", "incr_failed", "append_failed",
+                in ("ok", "cas_failed", "incr_failed",
+                    "incrbyfloat_failed", "append_failed",
                     "setrange_failed", "setbit_failed",
                     "pfadd_failed")
                 and resp.get("index") is not None):
@@ -313,6 +315,7 @@ class Session:
             {"op": "del", "key": k}
             {"op": "cas", "key": k, "expected": e, "value": v}
             {"op": "incr", "key": k, "by": n}
+            {"op": "incrbyfloat", "key": k, "by": x}
             {"op": "setnx", "key": k, "value": v}
             {"op": "getset", "key": k, "value": v}
             {"op": "append", "key": k, "value": v}
@@ -402,6 +405,7 @@ class Session:
                 replies[positions[j]] = resp
                 if (resp.get("status")
                         in ("ok", "cas_failed", "incr_failed",
+                            "incrbyfloat_failed",
                             "append_failed", "setrange_failed",
                             "setbit_failed", "pfadd_failed")
                         and resp.get("index") is not None):
@@ -437,6 +441,27 @@ class Session:
         incr keeps the key's TTL deadline, like a CAS."""
         return self._write({"type": "client", "op": "incr", "key": key,
                             "by": by})
+
+    def incrbyfloat(self, key: str, by: float = 1.0) -> dict:
+        """Atomically add ``by`` (default 1.0) to the key's float
+        value, Redis INCRBYFLOAT: a missing key counts as 0, so
+        the first incrbyfloat creates it at ``by``. The outcome is
+        decided at apply time, at the entry's position in the log,
+        so the reply carries the new value as a string (``value``)
+        — or ``incrbyfloat_failed`` with a reason
+        (``not_a_float`` when the current value is not a valid
+        float, ``overflow`` when the result would be NaN or
+        Infinity) and the current value. A failed incrbyfloat
+        still committed its entry, so its index is a valid
+        watermark, exactly like a failed incr; a retry with the
+        same session id returns the first attempt's result
+        instead of adding twice, and a successful incrbyfloat
+        keeps the key's TTL deadline, like an incr. An integer
+        ``by`` counts as a float, and the stored value is the
+        formatted float, so a later incr on it fails — "2.5" is
+        not an integer string."""
+        return self._write({"type": "client", "op": "incrbyfloat",
+                            "key": key, "by": by})
 
     def setnx(self, key: str, value: str) -> dict:
         """Set the key only if it does not already exist, Redis
@@ -998,7 +1023,8 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
     ``keepttl`` / ``get`` — NX and XX never together, KEEPTTL never with
     a TTL — ``del`` a string key,
     ``cas`` a string key, expected, and value, ``incr`` a string
-    key and an integer ``by`` (default 1), ``setnx`` a string key
+    key and an integer ``by`` (default 1), ``incrbyfloat`` a string
+    key and a finite number ``by`` (default 1.0), ``setnx`` a string key
     and value, ``getset`` a string key and value, ``append`` a
     string key and value, ``getdel`` a string key, ``getex`` a
     string key and at most one expiry option (``ex`` / ``px`` a
@@ -1018,12 +1044,13 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
                       "error": "pipeline op must be an object with "
                                "op, key, and value fields"}
     name = op.get("op")
-    if name not in ("set", "del", "cas", "incr", "setnx", "getset",
+    if name not in ("set", "del", "cas", "incr", "incrbyfloat",
+                    "setnx", "getset",
                     "append", "getdel", "getex", "setrange", "setbit",
                     "pfadd", "setex", "expireat", "pexpireat"):
         return None, {"type": "client_response", "status": "error",
                       "error": "pipeline op must be set, del, cas, "
-                               "incr, setnx, getset, append, "
+                               "incr, incrbyfloat, setnx, getset, append, "
                                "getdel, getex, setrange, setbit, "
                                "pfadd, setex, expireat, or pexpireat"}
     key = op.get("key")
@@ -1171,6 +1198,19 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
             return None, {"type": "client_response", "status": "error",
                           "error": "pipeline incr by must be an "
                                    "integer"}
+        msg["by"] = by
+    if name == "incrbyfloat":
+        # ``by`` rides along with a pipelined incrbyfloat,
+        # validated here so a malformed one never goes on the
+        # wire: a finite number, default 1.0 — an integer counts,
+        # a bool does not — the same shape the server enforces.
+        by = op.get("by", 1.0)
+        if (not isinstance(by, (int, float))
+                or isinstance(by, bool)
+                or not math.isfinite(by)):
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline incrbyfloat by must be "
+                                   "a finite number"}
         msg["by"] = by
     if name == "setrange":
         # ``offset`` rides along with a pipelined setrange,
@@ -1544,6 +1584,25 @@ def incr(node_addr: tuple[str, int], key: str, by: int = 1,
     range — and the current value). A missing key counts as 0, so
     the first incr creates it at ``by``."""
     return request(node_addr, {"type": "client", "op": "incr",
+                               "key": key, "by": by},
+                   timeout=timeout)
+
+
+def incrbyfloat(node_addr: tuple[str, int], key: str,
+                by: float = 1.0, timeout: float = 12.0) -> dict:
+    """Atomically add ``by`` (default 1.0) to the key's float value,
+    following leader redirects like ``request``.
+
+    One request appends the incrbyfloat entry, so the new value is
+    decided at the entry's position in the log — the single-request
+    equivalent of a read-modify-write, without the race. The reply
+    is the plain incrbyfloat response (``status`` ``ok`` with the
+    new value as a string, or ``incrbyfloat_failed`` with a reason —
+    ``not_a_float`` when the current value is not a valid float,
+    ``overflow`` when the result would be NaN or Infinity — and
+    the current value). A missing key counts as 0, so the first
+    incrbyfloat creates it at ``by``."""
+    return request(node_addr, {"type": "client", "op": "incrbyfloat",
                                "key": key, "by": by},
                    timeout=timeout)
 
@@ -2163,6 +2222,22 @@ def main(argv: list[str] | None = None) -> int:
                              "twice")
     p_incr.add_argument("--request-id", default=None,
                         help="id of this write within the client session")
+    p_incrbyfloat = sub.add_parser(
+        "incrbyfloat",
+        help="atomically add BY (default 1.0) to the key's float value "
+             "and print the new value; a missing key counts as 0, a "
+             "non-float value or a non-finite result fails")
+    p_incrbyfloat.add_argument("key")
+    p_incrbyfloat.add_argument("by", nargs="?", type=float, default=1.0,
+                               help="amount to add (default 1.0, may be "
+                                    "negative)")
+    p_incrbyfloat.add_argument("--client-id", default=None,
+                               help="session id for at-most-once writes: a retry "
+                                    "with the same client id + request id returns "
+                                    "the first attempt's result instead of writing "
+                                    "twice")
+    p_incrbyfloat.add_argument("--request-id", default=None,
+                               help="id of this write within the client session")
     p_setnx = sub.add_parser(
         "setnx",
         help="set the key only if it does not already exist and "
@@ -2424,6 +2499,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     msg: dict = {"type": "client", "op": op}
     if op in ("set", "get", "del", "cas", "ttl", "expire", "incr",
+              "incrbyfloat",
               "setnx", "getset", "append", "strlen", "getdel",
               "getex", "getrange", "setrange", "setbit", "getbit",
               "pfadd", "pfcount", "setex", "expireat", "pexpireat"):
@@ -2484,6 +2560,8 @@ def main(argv: list[str] | None = None) -> int:
         msg["timestamp_ms"] = args.timestamp_ms
     if op == "incr":
         msg["by"] = args.by
+    if op == "incrbyfloat":
+        msg["by"] = args.by
     if op == "setnx":
         msg["value"] = args.value
     if op == "getset":
@@ -2514,7 +2592,8 @@ def main(argv: list[str] | None = None) -> int:
         msg["offset"] = args.offset
     if op == "pfadd":
         msg["elements"] = args.elements
-    if op in ("set", "del", "cas", "mset", "expire", "incr", "setnx",
+    if op in ("set", "del", "cas", "mset", "expire", "incr",
+              "incrbyfloat", "setnx",
               "getset", "append", "getdel", "getex", "setrange",
               "setbit", "pfadd", "setex", "expireat", "pexpireat") \
             and args.request_id:
@@ -2555,6 +2634,8 @@ def main(argv: list[str] | None = None) -> int:
         elif op == "pexpireat":
             print(resp.get("pexpireat"))
         elif op == "incr":
+            print(resp.get("value"))
+        elif op == "incrbyfloat":
             print(resp.get("value"))
         elif op == "setnx":
             print(resp.get("setnx"))
