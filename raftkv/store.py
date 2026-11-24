@@ -96,8 +96,8 @@ class KVStore:
 
         Returns a result dict for commands whose outcome depends on the
         state at apply time — currently "cas", "expire", "incr",
-        "setnx", "getset", "append", "getdel", "setrange", and
-        "getex" —
+        "setnx", "getset", "append", "getdel", "setrange", "getex",
+        and "setbit" —
         and None for set/del, whose outcome is always ok. The result is
         what the leader hands back to the waiting client and what the
         dedup table caches for retries, so it must be a pure function
@@ -445,6 +445,81 @@ class KVStore:
             return {"type": "client_response", "status": "ok",
                     "value": value, "getex": 1,
                     "deadline": self._expiry.get(key)}
+        elif op == "setbit":
+            # Set one bit in a string value, Redis SETBIT: bit 0
+            # is the most significant bit of the first byte, bit
+            # 7 the least significant, bit 8 the most significant
+            # bit of the second byte, and so on — the bit
+            # numbering Redis uses. A missing key counts as an
+            # empty string, and when the offset lies past the end
+            # the gap is padded with zero bytes, exactly like a
+            # setrange pads with zero bytes. The reply carries
+            # the old bit value (``old_bit``) — 0 when the bit
+            # was clear or the key did not exist — and the new
+            # value, which is what the watch event fires with.
+            # The outcome is decided here, at this exact point
+            # in the log, so a retry with the same session id
+            # returns the first attempt's old bit from the dedup
+            # table instead of setting twice. A value that is
+            # not a byte string fails with WRONGTYPE, like
+            # append and setrange: every value this store holds
+            # is a string, and a bit op reads it as bytes — one
+            # byte per character, latin-1 — so a value holding
+            # a character above U+00FF has no byte form to set
+            # a bit in. A failed setbit writes nothing at all,
+            # like a failed incr. A successful setbit keeps the
+            # key's deadline, like a CAS or an append: it is an
+            # update of the value, not a fresh set, so it must
+            # not resurrect a key that is about to expire. A new
+            # key joins the sorted index, like a set of a new key.
+            # The offset itself was validated on the leader
+            # before the entry was logged (an integer from 0 to
+            # SETBIT_MAX_OFFSET) and the bit as 0 or 1, so by
+            # apply time both are in range — a hand-built log
+            # entry with a bad offset or bit still raises rather
+            # than silently setting a nonsense bit.
+            key = command["key"]
+            offset = command["offset"]
+            if (not isinstance(offset, int)
+                    or isinstance(offset, bool) or offset < 0):
+                raise ValueError(
+                    "setbit offset must be a non-negative integer")
+            bit = command["bit"]
+            if (not isinstance(bit, int) or isinstance(bit, bool)
+                    or bit not in (0, 1)):
+                raise ValueError("setbit bit must be 0 or 1")
+            current = self._data.get(key)
+            if current is not None and not isinstance(current, str):
+                return {"type": "client_response",
+                        "status": "setbit_failed",
+                        "reason": "wrongtype",
+                        "current": current,
+                        "error": "setbit failed: value of "
+                                 f"{key!r} is not a byte string"}
+            try:
+                raw = bytearray((current or "").encode("latin-1"))
+            except UnicodeEncodeError:
+                return {"type": "client_response",
+                        "status": "setbit_failed",
+                        "reason": "wrongtype",
+                        "current": current,
+                        "error": "setbit failed: value of "
+                                 f"{key!r} is not a byte string"}
+            byte_index = offset // 8
+            if byte_index >= len(raw):
+                raw.extend(b"\x00" * (byte_index - len(raw) + 1))
+            mask = 1 << (7 - offset % 8)
+            old = 1 if raw[byte_index] & mask else 0
+            if bit:
+                raw[byte_index] |= mask
+            else:
+                raw[byte_index] &= ~mask
+            new = raw.decode("latin-1")
+            if key not in self._data:
+                bisect.insort(self._keys, key)
+            self._data[key] = new
+            return {"type": "client_response", "status": "ok",
+                    "old_bit": old, "value": new}
         elif op == "setrange":
             # Overwrite part of a string value, Redis SETRANGE:
             # starting at ``offset``, replace as many characters
@@ -586,6 +661,35 @@ class KVStore:
         if start > end or n == 0:
             return ""
         return value[start:end + 1]
+
+    def getbit(self, key: str, offset: int) -> int:
+        """The bit at ``offset`` in the string value at ``key``,
+        Redis GETBIT: bit 0 is the most significant bit of the
+        first byte, bit 7 the least significant, bit 8 the most
+        significant bit of the second byte, and so on. A missing
+        key holds no bits, so any offset of it is 0, and an
+        offset past the end of the value is 0 too. Raises
+        TypeError when the value is not a byte string: every
+        value this store holds is a string, and a bit op reads
+        it as bytes — one byte per character, latin-1 — so a
+        value holding a character above U+00FF has no byte form
+        to read a bit from. Pure read: no log entry, no state
+        change."""
+        value = self._data.get(key)
+        if value is None:
+            return 0
+        if not isinstance(value, str):
+            raise TypeError(
+                f"getbit failed: value of {key!r} is not a byte string")
+        try:
+            raw = value.encode("latin-1")
+        except UnicodeEncodeError:
+            raise TypeError(
+                f"getbit failed: value of {key!r} is not a byte string")
+        byte_index = offset // 8
+        if byte_index >= len(raw):
+            return 0
+        return (raw[byte_index] >> (7 - offset % 8)) & 1
 
     def strlen(self, key: str) -> int:
         """Length of the string value at ``key`` — 0 when the key

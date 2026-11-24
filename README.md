@@ -378,6 +378,43 @@ logic and the failure handling, not the key-value API on top.
   in the log, not seconds — a key expired with EX 10 lives for
   10 further log entries, however long those take in wall-clock
   time.
+- **Bit operations** — since v0.46.0 `setbit key offset bit`
+  (`Session.setbit(k, offset, bit)`, `client.setbit(addr, k,
+  offset, bit)`, `setbit key offset bit` on the CLI) sets one
+  bit in the string at the key to 0 or 1 and answers with the
+  old bit value (`old_bit`) and the new value, and `getbit key
+  offset` (`Session.getbit(k, offset)`, `client.getbit(addr, k,
+  offset)`, `getbit key offset` on the CLI) answers the bit at
+  the offset — Redis SETBIT / GETBIT. Bit 0 is the most
+  significant bit of the first byte, bit 7 the least
+  significant, bit 8 the most significant bit of the second
+  byte, and so on. A missing key counts as an empty string, so
+  a setbit creates it and a getbit on it answers 0; when the
+  offset lies past the end the gap is padded with zero bytes,
+  and a getbit past the end answers 0. The outcome is decided
+  at apply time, at the entry's exact position in the log, like
+  a CAS: a retry with the same session id returns the first
+  attempt's old bit instead of setting twice. A successful
+  setbit fires a `set` watch event with the new value and keeps
+  the key's TTL deadline, like a CAS. A value that is not a byte
+  string fails with `setbit_failed` and reason `wrongtype`
+  instead of writing — a bit op reads the value as bytes, one
+  byte per character (latin-1), so a value holding a character
+  above U+00FF has no byte form to set a bit in. A getbit on
+  such a value is a client error, not a bit. The offset must be
+  an integer from 0 to 1,000,000 (`SETBIT_MAX_OFFSET`): a
+  negative offset or a bit other than 0 or 1 is a client error
+  and appends nothing, and the cap keeps one entry from growing
+  a value without limit — the same scale as the setrange cap,
+  for the same reason. A getbit rides the same ReadIndex path as
+  a `get`, so it carries the same session watermark and is
+  exactly as linearizable. `{"op": "setbit", "key": k,
+  "offset": n, "bit": b}` is a pipeline op too.
+  The honest limit is the encoding itself: the store's values
+  are strings, so a bit op treats each character as one byte —
+  a value written as multi-byte UTF-8 text is read as its
+  latin-1 characters, not its UTF-8 bytes, and a character
+  above U+00FF is not a byte string at all.
 - **Key enumeration** — since v0.31.0 one `keys` RPC lists the
   store's keys (`client.keys(prefix, limit, start_after)`,
   `Session.keys(prefix, limit, start_after)`, `keys --prefix p
@@ -2155,3 +2192,41 @@ entries left in `log.jsonl` are dropped by their index on reload.
   proposed by the next run — candidates: a wall-clock TTL
   variant, or Redis bit ops (SETBIT / GETBIT), or HyperLogLog
   (PFADD / PFCOUNT).
+- ~~SETBIT / GETBIT~~ — done in v0.46.0,
+  Nov 24, 2026: `setbit key offset bit` sets one bit in the
+  string at the key and answers with the old bit value and the
+  new value, `getbit key offset` answers the bit at the offset
+  — Redis SETBIT / GETBIT — bit 0 the most significant bit of
+  the first byte, a missing key counting as empty, a gap past
+  the end padded with zero bytes, a getbit past the end
+  answering 0. Decided at apply time like a CAS, so a retry
+  with the same session id returns the first attempt's old bit
+  instead of setting twice; a successful setbit fires a `set`
+  watch event with the new value and keeps the key's TTL
+  deadline, and a value that is not a byte string fails with
+  `setbit_failed` / `wrongtype`. An offset must be an integer
+  from 0 to 1,000,000 (`SETBIT_MAX_OFFSET`); a negative offset
+  or a bit other than 0 or 1 is a client error and appends
+  nothing. A getbit rides the same ReadIndex path as a `get`.
+  `{"op": "setbit"}` is a pipeline op too.
+  `Session.setbit` / `Session.getbit`,
+  `client.setbit` / `client.getbit`, and `setbit` /
+  `getbit` on the CLI expose them.
+  `tests/test_bit_ops.py` proves them: store-level setbit on a
+  missing key, setting and clearing bits across byte
+  boundaries, the old bit returned, zero-byte padding past the
+  end, getbit on a missing key and past the end, the TTL
+  deadline kept across a setbit, the new key joining the sorted
+  index, wrongtype leaving the value untouched, and a negative
+  offset and a bad bit raising; replication to every node, an
+  invalid offset and bit rejected with no log entry, redirect
+  from a follower, dedup of a setbit retry returning the first
+  attempt's old bit, continuing after a leader change, the
+  watch event on leader and follower with the new value,
+  surviving a snapshot + restart, session read-your-writes,
+  pipelined setbit ops with a bad offset and bit in position,
+  and the CLI end to end.
+  The roadmap is exhausted again, so the next real thing is
+  a new roadmap item grounded in this project's purpose,
+  proposed by the next run — candidates: a wall-clock TTL
+  variant, or HyperLogLog (PFADD / PFCOUNT).

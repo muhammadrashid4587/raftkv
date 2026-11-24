@@ -100,6 +100,15 @@ TTL_MAX_ENTRIES = 1_000_000
 # in-place overwrite, so it only rejects nonsense, never a real
 # use — the same scale as the TTL cap above, for the same reason.
 SETRANGE_MAX_OFFSET = 1_000_000
+# Largest bit offset a ``setbit`` may carry. The offset bounds how
+# far past the current value one write may reach — past it the op
+# pads with zero bytes, so an unbounded offset would let one entry
+# grow a value without limit (and replicate that growth to every
+# node). 1,000,000 bits is 125,000 bytes of value — far past any
+# real use of a bit flag, so it only rejects nonsense, never a real
+# use — the same scale as the setrange cap above, for the same
+# reason.
+SETBIT_MAX_OFFSET = 1_000_000
 # Leader lease for reads (Raft dissertation §6.4): how long a majority
 # ack stays fresh. Must be shorter than ELECTION_TIMEOUT_MIN (150ms):
 # a follower that acked at time T heard from the leader no later than
@@ -1336,8 +1345,8 @@ class RaftNode:
                 pass
             else:
                 # The apply result matters for CAS, expire, incr,
-                # setnx, getset, append, getdel, setrange, and
-                # getex:
+                # setnx, getset, append, getdel, setrange, getex,
+                # and setbit:
                 # their outcome is decided here, at this exact point
                 # in the log, so the result is recorded in the dedup
                 # table
@@ -1435,8 +1444,17 @@ class RaftNode:
                     # read-with-side-effect, not a set.
                     self.watch.notify(entry["command"]["key"], None, "del",
                                       index=self.last_applied)
+                elif (op == "setbit" and result is not None
+                        and result.get("status") == "ok"):
+                    # A successful setbit fires like a set, with
+                    # the new value: a failed setbit wrote nothing,
+                    # so it fires nothing, like a failed append.
+                    self.watch.notify(entry["command"]["key"],
+                                      result["value"], "set",
+                                      index=self.last_applied)
                 if (op in ("cas", "expire", "incr", "setnx", "getset",
-                           "append", "getdel", "setrange", "getex")
+                           "append", "getdel", "setrange", "getex",
+                           "setbit")
                         and result is not None
                         and self.role == "leader"):
                     # Record the outcome only when a local waiter is
@@ -1448,8 +1466,8 @@ class RaftNode:
                     # without a session id has no dedup key, so it
                     # always records: its waiter is identified by
                     # index alone. CAS, expire, incr, setnx, getset,
-                    # append, getdel, setrange, and getex are
-                    # the ops
+                    # append, getdel, setrange, getex, and setbit
+                    # are the ops
                     # whose apply returns a result — a set/del
                     # returns None and has nothing to record.
                     key = _dedup_key(entry["command"])
@@ -1486,7 +1504,7 @@ class RaftNode:
         The cached result is what a retry with the same session id gets
         back instead of a second log entry. For set/del the result is
         always ok once committed; for CAS, expire, incr, setnx,
-        getset, append, getdel, setrange, and getex
+        getset, append, getdel, setrange, getex, and setbit
         it is the
         apply-time outcome (success, mismatch, or missing key for a
         CAS; 1 or 0 for an expire; the new value, or not_an_integer
@@ -1494,7 +1512,8 @@ class RaftNode:
         for a getset; the new value and length, or wrongtype for
         an append; the old value and 1 or 0 for a getdel; the new
         value and length, or wrongtype for a setrange; the value
-        and 1 or 0, plus the deadline, for a getex), so a
+        and 1 or 0, plus the deadline, for a getex; the old bit
+        and the new value, or wrongtype for a setbit), so a
         retry returns the first
         attempt's exact result. The result also carries the log
         index and term of the entry that produced it: a retried write
@@ -2185,12 +2204,13 @@ class RaftNode:
         key = msg.get("key")
         if op not in ("set", "get", "del", "cas", "ttl", "expire",
                       "incr", "setnx", "getset", "append", "strlen",
-                      "getdel", "getrange", "setrange", "getex") \
+                      "getdel", "getrange", "setrange", "getex",
+                      "setbit", "getbit") \
                 or key is None:
             return {"type": "client_response", "status": "error",
                     "error": "op must be set/get/del/cas/ttl/expire/"
                              "incr/setnx/getset/append/strlen/getdel/"
-                             "getrange/setrange/getex "
+                             "getrange/setrange/getex/setbit/getbit "
                              "with a key"}
         if self._is_removed():
             return {"type": "client_response", "status": "error",
@@ -2237,6 +2257,38 @@ class RaftNode:
             return self._serve_read(getrange_key=key,
                                     getrange_start=msg["start"],
                                     getrange_end=msg["end"],
+                                    min_index=min_index,
+                                    session_term=session_term,
+                                    stale_ok=bool(msg.get("stale_ok")))
+        if op == "getbit":
+            # A single bit query: the bit at ``offset`` in the
+            # string value at this key — bit 0 the most
+            # significant bit of the first byte — 0 when the key
+            # does not exist or the offset lies past the end,
+            # Redis GETBIT. It rides the same ReadIndex/lease
+            # path as a ``get`` — one leadership confirmation,
+            # one apply wait — so the bit reflects the committed
+            # state as of the read index it names, exactly as
+            # linearizable, and a session read carries the same
+            # watermark a get would. The offset is validated
+            # here, on the leader, before anything is served: it
+            # must be an integer (a bool is not one) and not
+            # negative, so a malformed offset is a client error,
+            # not a bit of nonsense. No upper cap on the read: a
+            # read past the end is 0 and grows nothing, so there
+            # is nothing to bound — the cap belongs to setbit,
+            # which pads.
+            offset = msg.get("offset")
+            if (not isinstance(offset, int) or isinstance(offset, bool)
+                    or offset < 0):
+                return {"type": "client_response", "status": "error",
+                        "error": "getbit offset must be a "
+                                 "non-negative integer"}
+            min_index, session_term, error = self._parse_read_params(msg)
+            if error is not None:
+                return error
+            return self._serve_read(getbit_key=key,
+                                    getbit_offset=offset,
                                     min_index=min_index,
                                     session_term=session_term,
                                     stale_ok=bool(msg.get("stale_ok")))
@@ -2326,6 +2378,30 @@ class RaftNode:
                         "error": "setrange offset must be an integer "
                                  f"between 0 and {SETRANGE_MAX_OFFSET}"}
             command["offset"] = offset
+        if op == "setbit":
+            # Set one bit in a string value: the bit to set must
+            # be 0 or 1 — anything else names no bit — and the
+            # offset must be an integer from 0 to
+            # SETBIT_MAX_OFFSET: negative offsets are an error
+            # (Redis rejects them), and past the cap the op
+            # would pad an absurdly long string with zero bytes
+            # — the cap is the same scale as the setrange cap,
+            # for the same reason. Whether the key holds a byte
+            # string (and what the old bit was) is decided at
+            # apply time, like a CAS, not here.
+            bit = msg.get("bit")
+            if (not isinstance(bit, int) or isinstance(bit, bool)
+                    or bit not in (0, 1)):
+                return {"type": "client_response", "status": "error",
+                        "error": "setbit bit must be 0 or 1"}
+            offset = msg.get("offset")
+            if (not isinstance(offset, int) or isinstance(offset, bool)
+                    or offset < 0 or offset > SETBIT_MAX_OFFSET):
+                return {"type": "client_response", "status": "error",
+                        "error": "setbit offset must be an integer "
+                                 f"between 0 and {SETBIT_MAX_OFFSET}"}
+            command["offset"] = offset
+            command["bit"] = bit
         if op in ("set", "expire"):
             # A TTL, in log entries: the key lives until the log
             # reaches this entry's index + ttl_entries, then it is
@@ -3013,6 +3089,8 @@ class RaftNode:
                     getrange_key: str | None = None,
                     getrange_start: int | None = None,
                     getrange_end: int | None = None,
+                    getbit_key: str | None = None,
+                    getbit_offset: int | None = None,
                     scan_prefix: str | None = None,
                     scan_limit: int = MAX_KEYS_SCAN,
                     scan_start_after: str | None = None) -> dict:
@@ -3037,6 +3115,13 @@ class RaftNode:
         off the applied state machine the same way, so it is
         exactly as linearizable as a ``get``; a missing key
         holds the empty string, so any range of it is "".
+        ``getbit_key`` serves a single-bit query instead — the
+        bit at ``getbit_offset`` in the string value at that
+        key, bit 0 the most significant bit of the first byte,
+        Redis GETBIT — read off the applied state machine the
+        same way, so it is exactly as linearizable as a ``get``;
+        a missing key holds no bits, so any offset of it is 0,
+        and an offset past the end of the value is 0 too.
         ``scan_prefix`` serves a key enumeration instead — every key
         in the applied state machine starting with the prefix,
         sorted, at most ``scan_limit`` of them, with ``truncated``
@@ -3051,7 +3136,7 @@ class RaftNode:
         appear in a later page if it sorts ahead of the cursor.
         Everything else — the lease fast path, the pending-read wait,
         the fallback, the redirect on leadership loss — is identical
-        for all six shapes, so a scan or a TTL query is exactly as
+        for all seven shapes, so a scan or a TTL query is exactly as
         linearizable as a single ``get``.
 
         A stale read (``stale_ok``) is the one exception to the
@@ -3160,6 +3245,18 @@ class RaftNode:
                 try:
                     return {"value": self.sm.getrange(
                         getrange_key, getrange_start, getrange_end)}
+                except TypeError as e:
+                    return {"status": "error", "error": str(e)}
+            if getbit_key is not None:
+                # A single-bit query: the bit at the offset in the
+                # string value at this key — Redis GETBIT — with
+                # the same wrongtype rule as getrange: a value
+                # that is not a byte string is a client error,
+                # not a bit, carried the same way, overriding the
+                # "ok" in the response literal.
+                try:
+                    return {"bit": self.sm.getbit(
+                        getbit_key, getbit_offset)}
                 except TypeError as e:
                     return {"status": "error", "error": str(e)}
             if keys is not None:

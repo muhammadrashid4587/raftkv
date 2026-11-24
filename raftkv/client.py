@@ -127,7 +127,7 @@ class Session:
         # watermark the client never saw acknowledged.
         if (resp.get("status")
                 in ("ok", "cas_failed", "incr_failed", "append_failed",
-                    "setrange_failed")
+                    "setrange_failed", "setbit_failed")
                 and resp.get("index") is not None):
             self.last_write_index = int(resp["index"])
             self.last_write_term = int(resp.get("term") or 0)
@@ -206,6 +206,7 @@ class Session:
             {"op": "getex", "key": k, "ex": n}
             {"op": "getex", "key": k, "persist": True}
             {"op": "setrange", "key": k, "offset": n, "value": v}
+            {"op": "setbit", "key": k, "offset": n, "bit": b}
 
         The whole list goes out in batches of ``depth`` on a single
         persistent socket without waiting between requests, and the
@@ -282,7 +283,8 @@ class Session:
                 replies[positions[j]] = resp
                 if (resp.get("status")
                         in ("ok", "cas_failed", "incr_failed",
-                            "append_failed", "setrange_failed")
+                            "append_failed", "setrange_failed",
+                            "setbit_failed")
                         and resp.get("index") is not None):
                     index = int(resp["index"])
                     if index > self.last_write_index:
@@ -494,6 +496,57 @@ class Session:
         return self._write({"type": "client", "op": "setrange",
                             "key": key, "offset": offset,
                             "value": value})
+
+    def setbit(self, key: str, offset: int, bit: int) -> dict:
+        """Set the bit at ``offset`` in the string value at ``key``
+        to ``bit`` (0 or 1), Redis SETBIT: bit 0 is the most
+        significant bit of the first byte, a missing key counts
+        as an empty string, and when the offset lies past the end
+        the gap is padded with zero bytes. The reply carries the
+        old bit value (``old_bit``) — 0 when the bit was clear or
+        the key did not exist — and the new value. The outcome is
+        decided at apply time, at the entry's position in the log,
+        so a retry with the same session id returns the first
+        attempt's old bit instead of setting twice, and a
+        successful setbit keeps the key's TTL deadline, like a
+        CAS. A value that is not a byte string fails with
+        ``setbit_failed`` and reason ``wrongtype`` instead of
+        writing. A successful setbit advances the write watermark
+        from the reply's index, like any other write — and so
+        does a failed one, since it still committed its entry."""
+        return self._write({"type": "client", "op": "setbit",
+                            "key": key, "offset": offset, "bit": bit})
+
+    def getbit(self, key: str, offset: int) -> dict:
+        """Ask for the bit at ``offset`` in the string value at
+        ``key``, Redis GETBIT: bit 0 is the most significant bit
+        of the first byte, a missing key holds no bits so any
+        offset of it is 0, and an offset past the end of the
+        value is 0 too. It rides the same ReadIndex path as
+        ``get``, so it carries the same session watermark and
+        advances the read watermark from the reply's
+        ``read_index`` exactly the same way: a bit query after
+        your own write sees the bit that write set, and a later
+        read never goes backwards past it."""
+        if self.last_read_index > self.last_write_index:
+            min_index = self.last_read_index
+            term = self.last_read_term
+        else:
+            min_index = self.last_write_index
+            term = self.last_write_term
+        msg: dict = {"type": "client", "op": "getbit", "key": key,
+                     "offset": offset,
+                     "client_id": self.client_id,
+                     "min_commit_index": min_index,
+                     "session_term": term}
+        resp = request(self.node_addr, msg, pool=self._pooled)
+        if (resp.get("status") == "ok"
+                and resp.get("read_index") is not None):
+            read_index = int(resp["read_index"])
+            if read_index > self.last_read_index:
+                self.last_read_index = read_index
+                self.last_read_term = int(resp.get("read_term") or 0)
+        return resp
 
     def get(self, key: str) -> dict:
         # The read carries the higher of the two watermarks — the
@@ -777,18 +830,20 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
     string key and at most one expiry option (``ex`` / ``px`` a
     relative count of log entries, ``exat`` / ``pxat`` an absolute
     log index, ``persist`` a bare flag), ``setrange`` a
-    string key, an integer ``offset`` and a string value."""
+    string key, an integer ``offset`` and a string value,
+    ``setbit`` a string key, an integer ``offset`` and a bit
+    that is 0 or 1."""
     if not isinstance(op, dict):
         return None, {"type": "client_response", "status": "error",
                       "error": "pipeline op must be an object with "
                                "op, key, and value fields"}
     name = op.get("op")
     if name not in ("set", "del", "cas", "incr", "setnx", "getset",
-                    "append", "getdel", "getex", "setrange"):
+                    "append", "getdel", "getex", "setrange", "setbit"):
         return None, {"type": "client_response", "status": "error",
                       "error": "pipeline op must be set, del, cas, "
                                "incr, setnx, getset, append, "
-                               "getdel, getex, or setrange"}
+                               "getdel, getex, setrange, or setbit"}
     key = op.get("key")
     if not isinstance(key, str):
         return None, {"type": "client_response", "status": "error",
@@ -843,6 +898,27 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
                           "error": "pipeline setrange offset must be "
                                    "a non-negative integer"}
         msg["offset"] = offset
+    if name == "setbit":
+        # ``offset`` and ``bit`` ride along with a pipelined
+        # setbit, validated here so a malformed one never goes
+        # on the wire: a non-negative integer offset and a bit
+        # that is 0 or 1 — the same shapes the server enforces
+        # (the server also caps the offset, so a huge offset is
+        # still a client error there, not a log entry).
+        offset = op.get("offset")
+        if (not isinstance(offset, int) or isinstance(offset, bool)
+                or offset < 0):
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline setbit offset must be "
+                                   "a non-negative integer"}
+        bit = op.get("bit")
+        if (not isinstance(bit, int) or isinstance(bit, bool)
+                or bit not in (0, 1)):
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline setbit bit must be 0 "
+                                   "or 1"}
+        msg["offset"] = offset
+        msg["bit"] = bit
     if name == "getex":
         # At most one expiry option rides along with a pipelined
         # getex, validated here so a malformed one never goes on
@@ -901,7 +977,8 @@ def pipeline(node_addr: tuple[str, int], ops: list,
     """Send many writes pipelined over one connection.
 
     One ``set`` / ``del`` / ``cas`` / ``incr`` / ``setnx`` /
-    ``getset`` / ``append`` / ``getdel`` / ``getex`` / ``setrange`` op per
+    ``getset`` / ``append`` / ``getdel`` / ``getex`` / ``setrange`` /
+    ``setbit`` op per
     dict (see
     ``Session.pipeline`` for the shapes): the ops go out in
     batches of ``depth`` on a single persistent socket and the
@@ -1232,6 +1309,45 @@ def setrange(node_addr: tuple[str, int], key: str, offset: int,
     return request(node_addr, {"type": "client", "op": "setrange",
                                "key": key, "offset": offset,
                                "value": value}, timeout=timeout)
+
+
+def setbit(node_addr: tuple[str, int], key: str, offset: int,
+           bit: int, timeout: float = 12.0) -> dict:
+    """Set the bit at ``offset`` in the string value at ``key`` to
+    ``bit`` (0 or 1), following leader redirects like ``request`` —
+    Redis SETBIT.
+
+    One request appends the setbit entry, so the old bit it returns
+    is decided at the entry's position in the log: the reply is the
+    plain setbit response (``status`` ``ok`` with ``old_bit`` — the
+    bit the key held, 0 when it was clear or the key did not exist —
+    and the new ``value`` — or ``setbit_failed`` with reason
+    ``wrongtype`` when the current value is not a byte string).
+    Bit 0 is the most significant bit of the first byte; a missing
+    key counts as an empty string, and when the offset lies past
+    the end the gap is padded with zero bytes; a successful setbit
+    keeps the key's TTL deadline, like a CAS."""
+    return request(node_addr, {"type": "client", "op": "setbit",
+                               "key": key, "offset": offset,
+                               "bit": bit}, timeout=timeout)
+
+
+def getbit(node_addr: tuple[str, int], key: str, offset: int,
+           timeout: float = 12.0) -> dict:
+    """Ask for the bit at ``offset`` in the string value at ``key``,
+    following leader redirects like ``request`` — Redis GETBIT.
+
+    One request serves the bit through the leader's ReadIndex path,
+    so it reflects the committed state as of one read index,
+    exactly as linearizable as a ``get``. The reply is the plain
+    getbit response (``status`` ``ok`` with ``bit`` — 0 or 1 — plus
+    the ``read_index`` / ``read_term`` it was measured at). Bit 0
+    is the most significant bit of the first byte; a missing key
+    holds no bits, so any offset of it is 0, and an offset past the
+    end of the value is 0 too."""
+    return request(node_addr, {"type": "client", "op": "getbit",
+                               "key": key, "offset": offset},
+                   timeout=timeout)
 
 
 def mset(node_addr: tuple[str, int], pairs: list,
@@ -1637,6 +1753,35 @@ def main(argv: list[str] | None = None) -> int:
                                  "twice")
     p_setrange.add_argument("--request-id", default=None,
                             help="id of this write within the client session")
+    p_setbit = sub.add_parser(
+        "setbit",
+        help="set the bit at offset in the string at key to 0 or 1 "
+             "and print the old bit value; a missing key counts "
+             "as empty, and a gap past the end is padded with "
+             "zero bytes")
+    p_setbit.add_argument("key")
+    p_setbit.add_argument("offset", type=int,
+                          help="bit to set, 0-based, at most 1000000; "
+                               "bit 0 is the most significant bit of "
+                               "the first byte")
+    p_setbit.add_argument("bit", type=int,
+                          help="the bit to set: 0 or 1")
+    p_setbit.add_argument("--client-id", default=None,
+                          help="session id for at-most-once writes: a retry "
+                               "with the same client id + request id returns "
+                               "the first attempt's result instead of writing "
+                               "twice")
+    p_setbit.add_argument("--request-id", default=None,
+                          help="id of this write within the client session")
+    p_getbit = sub.add_parser(
+        "getbit",
+        help="print the bit at offset in the string at key (0 or 1); "
+             "0 when the key does not exist or the offset lies "
+             "past the end")
+    p_getbit.add_argument("key")
+    p_getbit.add_argument("offset", type=int,
+                          help="bit to read, 0-based; bit 0 is the most "
+                               "significant bit of the first byte")
     p_add = sub.add_parser("add-server",
                            help="add a server to the cluster (Raft §6)")
     p_add.add_argument("server_id")
@@ -1729,7 +1874,7 @@ def main(argv: list[str] | None = None) -> int:
     msg: dict = {"type": "client", "op": op}
     if op in ("set", "get", "del", "cas", "ttl", "expire", "incr",
               "setnx", "getset", "append", "strlen", "getdel",
-              "getex", "getrange", "setrange"):
+              "getex", "getrange", "setrange", "setbit", "getbit"):
         msg["key"] = args.key
     elif op == "mset":
         if len(args.pairs) % 2:
@@ -1787,8 +1932,14 @@ def main(argv: list[str] | None = None) -> int:
     if op == "setrange":
         msg["offset"] = args.offset
         msg["value"] = args.value
+    if op == "setbit":
+        msg["offset"] = args.offset
+        msg["bit"] = args.bit
+    if op == "getbit":
+        msg["offset"] = args.offset
     if op in ("set", "del", "cas", "mset", "expire", "incr", "setnx",
-              "getset", "append", "getdel", "getex", "setrange") \
+              "getset", "append", "getdel", "getex", "setrange",
+              "setbit") \
             and args.request_id:
         # A request id without an explicit client id still dedups
         # within the default "cli" session; the same id retried from
@@ -1843,6 +1994,10 @@ def main(argv: list[str] | None = None) -> int:
             print(resp.get("value") or "")
         elif op == "setrange":
             print(resp.get("length"))
+        elif op == "setbit":
+            print(resp.get("old_bit"))
+        elif op == "getbit":
+            print(resp.get("bit"))
         elif op == "mget":
             print(json.dumps(resp.get("values")))
         elif op == "keys":
