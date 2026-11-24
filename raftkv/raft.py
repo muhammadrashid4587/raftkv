@@ -69,6 +69,13 @@ WATCH_MAX_TIMEOUT = 25.0
 # snapshot chunk. A client that needs more splits the batch itself —
 # get_many already does exactly that, one pipelined batch at a time.
 MAX_MGET_KEYS = 1000
+# A multi-set RPC writes at most this many pairs in one log entry,
+# for the same reason as the mget cap: one frame carries the whole
+# batch, so an unbounded list could hold a worker (and its
+# connection) for an arbitrarily long encode — and one log entry
+# holds the whole batch, so it also bounds the entry. A client that
+# needs more splits the batch itself.
+MAX_MSET_PAIRS = 1000
 # A keys/scan RPC returns at most this many keys in one reply, for
 # the same reason as the mget cap: one frame carries the whole list,
 # so an unbounded scan could hold a worker (and its connection) for
@@ -1309,6 +1316,14 @@ class RaftNode:
                     self.watch.notify(entry["command"]["key"],
                                       entry["command"]["value"], "set",
                                       index=self.last_applied)
+                elif op == "mset":
+                    # One event per pair, in batch order, all at this
+                    # entry's index: a watcher sees the batch as the
+                    # sequence of sets it is, exactly like the
+                    # individual writes it replaces.
+                    for key, value in entry["command"]["pairs"]:
+                        self.watch.notify(key, value, "set",
+                                          index=self.last_applied)
                 elif op == "del":
                     self.watch.notify(entry["command"]["key"], None, "del",
                                       index=self.last_applied)
@@ -1932,6 +1947,34 @@ class RaftNode:
                                 session_term=session_term,
                                 stale_ok=bool(msg.get("stale_ok")))
 
+    def _on_mset(self, msg: dict) -> dict:
+        """Serve a multi-set: many key/value pairs in one request,
+        appended as ONE log entry and applied atomically at that
+        entry's position — a read after it commits sees every pair,
+        never a prefix. It rides the same write path as a single
+        ``set`` (group-commit batching, dedup by session id, the
+        response's log index/term), so a retry with the same
+        session id returns the first attempt's result instead of
+        appending a second entry, and a session's watermark
+        advances to this entry exactly as for a single write. The
+        batch is capped at MAX_MSET_PAIRS so one frame — and one
+        log entry — stays bounded."""
+        pairs = msg.get("pairs")
+        if (not isinstance(pairs, list) or not pairs
+                or len(pairs) > MAX_MSET_PAIRS
+                or not all(isinstance(p, (list, tuple)) and len(p) == 2
+                           and isinstance(p[0], str)
+                           and isinstance(p[1], str) for p in pairs)):
+            return {"type": "client_response", "status": "error",
+                    "error": "mset takes a list of 1-"
+                             f"{MAX_MSET_PAIRS} [key, value] pairs"}
+        command: dict = {"op": "mset",
+                         "pairs": [[k, v] for k, v in pairs]}
+        for field in ("client_id", "request_id"):
+            if msg.get(field):
+                command[field] = msg[field]
+        return self._submit_write(command)
+
     def _on_keys(self, msg: dict) -> dict:
         """Serve a key enumeration: every key in the applied state
         machine, sorted, optionally restricted to a prefix and to
@@ -1998,6 +2041,11 @@ class RaftNode:
                 return {"type": "client_response", "status": "error",
                         "error": "this node was removed from the cluster"}
             return self._on_keys(msg)
+        if op == "mset":
+            if self._is_removed():
+                return {"type": "client_response", "status": "error",
+                        "error": "this node was removed from the cluster"}
+            return self._on_mset(msg)
         key = msg.get("key")
         if op not in ("set", "get", "del", "cas") or key is None:
             return {"type": "client_response", "status": "error",

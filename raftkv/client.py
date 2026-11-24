@@ -133,6 +133,23 @@ class Session:
         return self._write({"type": "client", "op": "set",
                             "key": key, "value": value})
 
+    def mset(self, pairs: list) -> dict:
+        """Write many keys with one ``mset`` RPC: the whole batch
+        appends as a single log entry and applies atomically, so a
+        read after it commits sees every pair. It carries a session
+        request id like ``set`` — a retry returns the first
+        attempt's result instead of appending a second entry — and
+        the response's index advances the write watermark exactly
+        as a single write does. An empty batch is a client error —
+        the server rejects it — so this returns the error response
+        instead of sending it."""
+        if not pairs:
+            return {"type": "client_response", "status": "error",
+                    "error": "mset takes a list of 1-1000 "
+                             "[key, value] pairs"}
+        return self._write({"type": "client", "op": "mset",
+                            "pairs": [[k, v] for k, v in pairs]})
+
     def delete(self, key: str) -> dict:
         return self._write({"type": "client", "op": "del", "key": key})
 
@@ -479,6 +496,27 @@ def mget(node_addr: tuple[str, int], keys: list[str],
                                "keys": list(keys)}, timeout=timeout)
 
 
+def mset(node_addr: tuple[str, int], pairs: list,
+         timeout: float = 12.0) -> dict:
+    """Write many keys with one ``mset`` RPC, following leader
+    redirects like ``request``.
+
+    One request appends a single log entry carrying the whole
+    batch, so the batch applies atomically at one log position —
+    the single-request equivalent of many ``set`` calls, without a
+    round trip and an fsync per key. The reply is the plain write
+    response (``status`` ``ok`` with the entry's ``index`` /
+    ``term``); an empty batch never goes on the wire and returns
+    the server's error shape instead."""
+    if not pairs:
+        return {"type": "client_response", "status": "error",
+                "error": "mset takes a list of 1-1000 [key, value] "
+                         "pairs"}
+    return request(node_addr, {"type": "client", "op": "mset",
+                               "pairs": [[k, v] for k, v in pairs]},
+                   timeout=timeout)
+
+
 def keys(node_addr: tuple[str, int], prefix: str = "",
          limit: int = 1000, start_after: str | None = None,
          timeout: float = 12.0) -> dict:
@@ -589,6 +627,20 @@ def main(argv: list[str] | None = None) -> int:
                             "twice")
     p_set.add_argument("--request-id", default=None,
                        help="id of this write within the client session")
+    p_mset = sub.add_parser(
+        "mset",
+        help="write many keys with one request: mset k1 v1 k2 v2 "
+             "... appends one log entry carrying the whole batch, "
+             "so the batch applies atomically")
+    p_mset.add_argument("pairs", nargs="+",
+                        help="alternating keys and values: k1 v1 k2 v2 ...")
+    p_mset.add_argument("--client-id", default=None,
+                        help="session id for at-most-once writes: a retry "
+                             "with the same client id + request id returns "
+                             "the first attempt's result instead of writing "
+                             "twice")
+    p_mset.add_argument("--request-id", default=None,
+                        help="id of this write within the client session")
     p_get = sub.add_parser("get")
     p_get.add_argument("key")
     p_get.add_argument("--client-id", default=None,
@@ -727,6 +779,12 @@ def main(argv: list[str] | None = None) -> int:
     msg: dict = {"type": "client", "op": op}
     if op in ("set", "get", "del", "cas"):
         msg["key"] = args.key
+    elif op == "mset":
+        if len(args.pairs) % 2:
+            parser.error("mset takes alternating keys and values: "
+                         "k1 v1 k2 v2 ...")
+        msg["pairs"] = [[args.pairs[i], args.pairs[i + 1]]
+                        for i in range(0, len(args.pairs), 2)]
     elif op == "mget":
         msg["keys"] = args.keys
     elif op == "keys":
@@ -745,7 +803,7 @@ def main(argv: list[str] | None = None) -> int:
     if op == "cas":
         msg["expected"] = args.expected
         msg["value"] = args.value
-    if op in ("set", "del", "cas") and args.request_id:
+    if op in ("set", "del", "cas", "mset") and args.request_id:
         # A request id without an explicit client id still dedups
         # within the default "cli" session; the same id retried from
         # another session is a different write.

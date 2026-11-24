@@ -35,7 +35,9 @@ class KVStore:
 
     def apply(self, command: dict) -> dict | None:
         """Apply one committed log command. Commands are dicts like
-        {"op": "set", "key": "k", "value": "v"} or {"op": "del", "key": "k"}.
+        {"op": "set", "key": "k", "value": "v"}, {"op": "mset",
+        "pairs": [["k1", "v1"], ["k2", "v2"]]}, or {"op": "del",
+        "key": "k"}.
 
         Returns a result dict for commands whose outcome depends on the
         state at apply time — currently only "cas" — and None for
@@ -51,6 +53,18 @@ class KVStore:
             if key not in self._data:
                 bisect.insort(self._keys, key)
             self._data[key] = command["value"]
+            return None
+        elif op == "mset":
+            # A batch set: every pair applies in order at this one
+            # log position, so the whole batch is atomic — a read
+            # after the entry commits sees all of it, never a
+            # prefix. A duplicate key inside the batch keeps the
+            # last value, like successive sets. The sorted index
+            # is maintained per pair, exactly as for a single set.
+            for key, value in command["pairs"]:
+                if key not in self._data:
+                    bisect.insort(self._keys, key)
+                self._data[key] = value
             return None
         elif op == "del":
             key = command["key"]

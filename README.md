@@ -98,6 +98,27 @@ logic and the failure handling, not the key-value API on top.
   faster per key than pipelining, since the dispatch still
   dominates. `scripts/bench.py --mget` runs the phase
   (`--mget-batch` sets the batch size).
+- **Multi-set writes** — since v0.34.0 one `mset` RPC writes many
+  keys in a single request (`client.mset(pairs)`,
+  `Session.mset(pairs)`, `mset k1 v1 k2 v2 ...` on the CLI): the
+  whole batch appends as one log entry and applies atomically at
+  that entry's position, so a read after it commits sees every
+  pair, never a prefix — one dispatch, one entry, one fsync for
+  the batch instead of one per key. It rides the same write path
+  as a single `set`: group-commit batching, dedup by session id
+  (a retry with the same id returns the first attempt's result
+  instead of appending a second entry), the response's log index
+  and term advancing a session's watermark, and one watch event
+  per pair, in batch order, all at the batch entry's index. At
+  most 1000 pairs per request, the same cap rationale as mget,
+  so one frame — and one log entry — stays bounded; a duplicate
+  key inside a batch keeps its last value, like successive sets.
+  The honest limit is the same one group commit already has: a
+  batch that shares an fsync with other concurrent writes is no
+  faster to commit than a lone write, and a 1000-pair entry is a
+  bigger single fsync and a bigger replication frame than a
+  single set — the win is one round trip and one commit wait for
+  the batch, not a cheaper write per key.
 - **Key enumeration** — since v0.31.0 one `keys` RPC lists the
   store's keys (`client.keys(prefix, limit, start_after)`,
   `Session.keys(prefix, limit, start_after)`, `keys --prefix p
@@ -412,7 +433,7 @@ make test
 # or: python3 -m unittest discover -s tests -v
 ```
 
-207 tests, plus a smoke test for the benchmark script, all passing:
+217 tests, plus a smoke test for the benchmark script, all passing:
 
 | Test | What it proves |
 |---|---|
@@ -564,6 +585,16 @@ make test
 | `test_mget_rejects_bad_read_params` | A non-integer or negative min_commit_index is an error, exactly as for a single get |
 | `test_session_mget_is_read_your_writes` | A session mget carries the write watermark, sees its own write, and advances the read watermark |
 | `test_mget_matches_pipelined_get_many` | The same 50 keys read by one mget and by pipelined get_many agree exactly |
+| `test_mset_writes_many_keys_in_one_log_entry` | 50 pairs in one mset, values right, leader log grew by exactly one entry |
+| `test_mset_overwrites_and_last_duplicate_wins` | An mset overwrites old values; a duplicate key in one batch keeps its last value |
+| `test_mset_replicates_to_followers` | An mset lands on every follower as one entry — no follower holds half the batch |
+| `test_mset_from_follower_redirects` | An mset sent to a follower is redirected to the leader and still writes |
+| `test_mset_rejects_bad_pair_lists` | Empty, non-list, malformed, non-string, or >1000 pairs is an error, not a write |
+| `test_session_mset_is_read_your_writes` | A session mset advances the watermark; a later read (even from a follower) sees it |
+| `test_mset_retry_with_same_request_id_appends_once` | A retried mset with the same session id appends no second log entry |
+| `test_mset_fires_one_watch_event_per_pair` | A prefix watch fires once per pair, in order, all at the batch entry's index |
+| `test_mset_keys_appear_in_sorted_scan` | Keys written by mset show up in a paged scan in sorted order |
+| `test_mset_cli` | The `mset` CLI writes the batch and prints OK; an odd argument count is a usage error |
 | `test_keys_returns_all_keys_sorted` | A scan with no prefix returns every key in sorted order, with the read index/term |
 | `test_keys_start_after_pages` | Paging limit=2 through five keys returns each page in order, no repeats or gaps, last page untruncated |
 | `test_keys_start_after_with_prefix` | A cursor composes with a prefix: paging under one prefix never leaks another's keys |
@@ -1427,3 +1458,26 @@ entries left in `log.jsonl` are dropped by their index on reload.
   is exhausted again — every item is done — so the next real
   thing is a new roadmap item grounded in this project's
   purpose, proposed by the next run.
+- ~~Batch set (mset)~~ — done in v0.34.0, Nov 23, 2026: one
+  `mset` RPC writes many key/value pairs as a single log entry
+  (`KVStore.apply` gains an `"mset"` op applying the pairs in
+  order, duplicate key keeps its last value, the sorted index
+  maintained per pair), so the batch applies atomically at one
+  log position — a read after it commits sees every pair, never
+  a prefix. It rides the same write path as a single `set`:
+  `_on_mset` validates the batch (a list of 1-1000 `[key,
+  value]` string pairs, `MAX_MSET_PAIRS`) and submits it
+  through `_submit_write`, so group-commit batching, dedup by
+  session id, and the response's log index/term all work
+  unchanged; the apply path fires one watch event per pair, in
+  batch order, all at the entry's index. The client exposes it
+  as `client.mset(pairs)`, `Session.mset(pairs)` (same
+  watermark, same read-your-writes guarantees), and `mset k1 v1
+  k2 v2 ...` on the CLI (an odd argument count is a usage error,
+  not a half-written batch). `tests/test_mset.py` proves it: 50
+  pairs in one log entry, overwrite and last-duplicate-wins,
+  replication to every follower as one entry, redirect from a
+  follower, bad pair lists rejected, session read-your-writes,
+  a dedup retry appending once, one watch event per pair at the
+  batch index, mset keys in the sorted scan, and the CLI end to
+  end.
