@@ -109,6 +109,15 @@ SETRANGE_MAX_OFFSET = 1_000_000
 # use — the same scale as the setrange cap above, for the same
 # reason.
 SETBIT_MAX_OFFSET = 1_000_000
+# Largest number of elements one ``pfadd`` may carry. The elements
+# ride in one log entry and one frame, so an unbounded list would
+# let one entry grow without limit (and replicate that growth to
+# every node). 1,000 elements is far past a real use of one PFADD
+# call — a client adding more splits the batch, like an mget client
+# splits a batch past 1000 keys — so it only rejects nonsense,
+# never a real use — the same scale as the TTL cap above, for the
+# same reason.
+PFADD_MAX_ELEMENTS = 1000
 # Leader lease for reads (Raft dissertation §6.4): how long a majority
 # ack stays fresh. Must be shorter than ELECTION_TIMEOUT_MIN (150ms):
 # a follower that acked at time T heard from the leader no later than
@@ -1346,7 +1355,7 @@ class RaftNode:
             else:
                 # The apply result matters for CAS, expire, incr,
                 # setnx, getset, append, getdel, setrange, getex,
-                # and setbit:
+                # setbit, and pfadd:
                 # their outcome is decided here, at this exact point
                 # in the log, so the result is recorded in the dedup
                 # table
@@ -1452,9 +1461,21 @@ class RaftNode:
                     self.watch.notify(entry["command"]["key"],
                                       result["value"], "set",
                                       index=self.last_applied)
+                elif (op == "pfadd" and result is not None
+                        and result.get("status") == "ok"
+                        and result.get("pfadd") == 1):
+                    # A pfadd that rose a register fires like a
+                    # set, with the new (HLL blob) value: a pfadd
+                    # that changed nothing wrote nothing new, so
+                    # it fires nothing, like a failed setnx — and
+                    # a failed pfadd wrote nothing either.
+                    self.watch.notify(entry["command"]["key"],
+                                      self.sm.get(entry["command"]["key"]),
+                                      "set",
+                                      index=self.last_applied)
                 if (op in ("cas", "expire", "incr", "setnx", "getset",
                            "append", "getdel", "setrange", "getex",
-                           "setbit")
+                           "setbit", "pfadd")
                         and result is not None
                         and self.role == "leader"):
                     # Record the outcome only when a local waiter is
@@ -1466,8 +1487,8 @@ class RaftNode:
                     # without a session id has no dedup key, so it
                     # always records: its waiter is identified by
                     # index alone. CAS, expire, incr, setnx, getset,
-                    # append, getdel, setrange, getex, and setbit
-                    # are the ops
+                    # append, getdel, setrange, getex, setbit, and
+                    # pfadd are the ops
                     # whose apply returns a result — a set/del
                     # returns None and has nothing to record.
                     key = _dedup_key(entry["command"])
@@ -1504,7 +1525,7 @@ class RaftNode:
         The cached result is what a retry with the same session id gets
         back instead of a second log entry. For set/del the result is
         always ok once committed; for CAS, expire, incr, setnx,
-        getset, append, getdel, setrange, getex, and setbit
+        getset, append, getdel, setrange, getex, setbit, and pfadd
         it is the
         apply-time outcome (success, mismatch, or missing key for a
         CAS; 1 or 0 for an expire; the new value, or not_an_integer
@@ -1513,7 +1534,8 @@ class RaftNode:
         an append; the old value and 1 or 0 for a getdel; the new
         value and length, or wrongtype for a setrange; the value
         and 1 or 0, plus the deadline, for a getex; the old bit
-        and the new value, or wrongtype for a setbit), so a
+        and the new value, or wrongtype for a setbit; 1 or 0 plus
+        the estimate, or wrongtype for a pfadd), so a
         retry returns the first
         attempt's exact result. The result also carries the log
         index and term of the entry that produced it: a retried write
@@ -2205,12 +2227,13 @@ class RaftNode:
         if op not in ("set", "get", "del", "cas", "ttl", "expire",
                       "incr", "setnx", "getset", "append", "strlen",
                       "getdel", "getrange", "setrange", "getex",
-                      "setbit", "getbit") \
+                      "setbit", "getbit", "pfadd", "pfcount") \
                 or key is None:
             return {"type": "client_response", "status": "error",
                     "error": "op must be set/get/del/cas/ttl/expire/"
                              "incr/setnx/getset/append/strlen/getdel/"
-                             "getrange/setrange/getex/setbit/getbit "
+                             "getrange/setrange/getex/setbit/getbit/"
+                             "pfadd/pfcount "
                              "with a key"}
         if self._is_removed():
             return {"type": "client_response", "status": "error",
@@ -2289,6 +2312,25 @@ class RaftNode:
                 return error
             return self._serve_read(getbit_key=key,
                                     getbit_offset=offset,
+                                    min_index=min_index,
+                                    session_term=session_term,
+                                    stale_ok=bool(msg.get("stale_ok")))
+        if op == "pfcount":
+            # A cardinality estimate: the HyperLogLog estimate at
+            # this key — 0 when the key does not exist, Redis
+            # PFCOUNT. It rides the same ReadIndex/lease path as a
+            # ``get`` — one leadership confirmation, one apply
+            # wait — so the estimate reflects the committed state
+            # as of the read index it names, exactly as
+            # linearizable, and a session read carries the same
+            # watermark a get would. A string key is a client
+            # error, not an estimate: the payload carries its own
+            # "status": "error" (see _serve_read), like getbit's
+            # wrongtype.
+            min_index, session_term, error = self._parse_read_params(msg)
+            if error is not None:
+                return error
+            return self._serve_read(pfcount_key=key,
                                     min_index=min_index,
                                     session_term=session_term,
                                     stale_ok=bool(msg.get("stale_ok")))
@@ -2402,6 +2444,23 @@ class RaftNode:
                                  f"between 0 and {SETBIT_MAX_OFFSET}"}
             command["offset"] = offset
             command["bit"] = bit
+        if op == "pfadd":
+            # Add elements to a HyperLogLog: the elements must be a
+            # non-empty list of at most PFADD_MAX_ELEMENTS strings
+            # — an empty list names nothing to add, and a longer
+            # one would ride in one frame and one log entry without
+            # bound. Whether the key holds an HLL (and what the
+            # estimate becomes) is decided at apply time, like a
+            # CAS, not here.
+            elements = msg.get("elements")
+            if (not isinstance(elements, list) or not elements
+                    or len(elements) > PFADD_MAX_ELEMENTS
+                    or any(not isinstance(e, str) for e in elements)):
+                return {"type": "client_response", "status": "error",
+                        "error": "pfadd elements must be a list of "
+                                 "1 to "
+                                 f"{PFADD_MAX_ELEMENTS} strings"}
+            command["elements"] = list(elements)
         if op in ("set", "expire"):
             # A TTL, in log entries: the key lives until the log
             # reaches this entry's index + ttl_entries, then it is
@@ -3091,6 +3150,7 @@ class RaftNode:
                     getrange_end: int | None = None,
                     getbit_key: str | None = None,
                     getbit_offset: int | None = None,
+                    pfcount_key: str | None = None,
                     scan_prefix: str | None = None,
                     scan_limit: int = MAX_KEYS_SCAN,
                     scan_start_after: str | None = None) -> dict:
@@ -3122,6 +3182,12 @@ class RaftNode:
         same way, so it is exactly as linearizable as a ``get``;
         a missing key holds no bits, so any offset of it is 0,
         and an offset past the end of the value is 0 too.
+        ``pfcount_key`` serves a cardinality estimate instead —
+        the HyperLogLog estimate at that key, 0 for a missing
+        key, Redis PFCOUNT — read off the applied state machine
+        the same way, so it is exactly as linearizable as a
+        ``get``; a plain string value is a client error, not an
+        estimate.
         ``scan_prefix`` serves a key enumeration instead — every key
         in the applied state machine starting with the prefix,
         sorted, at most ``scan_limit`` of them, with ``truncated``
@@ -3136,7 +3202,7 @@ class RaftNode:
         appear in a later page if it sorts ahead of the cursor.
         Everything else — the lease fast path, the pending-read wait,
         the fallback, the redirect on leadership loss — is identical
-        for all seven shapes, so a scan or a TTL query is exactly as
+        for all eight shapes, so a scan or a TTL query is exactly as
         linearizable as a single ``get``.
 
         A stale read (``stale_ok``) is the one exception to the
@@ -3257,6 +3323,17 @@ class RaftNode:
                 try:
                     return {"bit": self.sm.getbit(
                         getbit_key, getbit_offset)}
+                except TypeError as e:
+                    return {"status": "error", "error": str(e)}
+            if pfcount_key is not None:
+                # A cardinality estimate: the HyperLogLog estimate
+                # at this key — 0 for a missing key, Redis
+                # PFCOUNT — with the same wrongtype rule as
+                # getbit: a plain string value is a client error,
+                # not an estimate, carried the same way,
+                # overriding the "ok" in the response literal.
+                try:
+                    return {"estimate": self.sm.pfcount(pfcount_key)}
                 except TypeError as e:
                     return {"status": "error", "error": str(e)}
             if keys is not None:

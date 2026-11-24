@@ -127,7 +127,8 @@ class Session:
         # watermark the client never saw acknowledged.
         if (resp.get("status")
                 in ("ok", "cas_failed", "incr_failed", "append_failed",
-                    "setrange_failed", "setbit_failed")
+                    "setrange_failed", "setbit_failed",
+                    "pfadd_failed")
                 and resp.get("index") is not None):
             self.last_write_index = int(resp["index"])
             self.last_write_term = int(resp.get("term") or 0)
@@ -207,6 +208,7 @@ class Session:
             {"op": "getex", "key": k, "persist": True}
             {"op": "setrange", "key": k, "offset": n, "value": v}
             {"op": "setbit", "key": k, "offset": n, "bit": b}
+            {"op": "pfadd", "key": k, "elements": [e1, e2, ...]}
 
         The whole list goes out in batches of ``depth`` on a single
         persistent socket without waiting between requests, and the
@@ -284,7 +286,7 @@ class Session:
                 if (resp.get("status")
                         in ("ok", "cas_failed", "incr_failed",
                             "append_failed", "setrange_failed",
-                            "setbit_failed")
+                            "setbit_failed", "pfadd_failed")
                         and resp.get("index") is not None):
                     index = int(resp["index"])
                     if index > self.last_write_index:
@@ -536,6 +538,57 @@ class Session:
             term = self.last_write_term
         msg: dict = {"type": "client", "op": "getbit", "key": key,
                      "offset": offset,
+                     "client_id": self.client_id,
+                     "min_commit_index": min_index,
+                     "session_term": term}
+        resp = request(self.node_addr, msg, pool=self._pooled)
+        if (resp.get("status") == "ok"
+                and resp.get("read_index") is not None):
+            read_index = int(resp["read_index"])
+            if read_index > self.last_read_index:
+                self.last_read_index = read_index
+                self.last_read_term = int(resp.get("read_term") or 0)
+        return resp
+
+    def pfadd(self, key: str, *elements: str) -> dict:
+        """Add ``elements`` to the HyperLogLog at ``key``, Redis
+        PFADD: each element hashes into one of 16384 registers
+        (SHA-256, deterministic across nodes), and the reply
+        carries ``pfadd`` 1 when at least one register rose — the
+        HLL was modified — and 0 when every element was already
+        counted, plus ``estimate`` — the cardinality estimate
+        after the add, good to under 1% once the count is past a
+        few thousand. A missing key is created as an empty HLL;
+        at most 1000 elements per call, like an mget batch. The
+        outcome is decided at apply time, at the entry's position
+        in the log, so a retry with the same session id returns
+        the first attempt's pfadd flag and estimate instead of
+        adding twice, and a successful pfadd keeps the key's TTL
+        deadline, like a CAS. A plain string value fails with
+        ``pfadd_failed`` and reason ``wrongtype`` instead of
+        writing. A successful pfadd advances the write watermark
+        from the reply's index, like any other write — and so
+        does a failed one, since it still committed its entry."""
+        return self._write({"type": "client", "op": "pfadd",
+                            "key": key, "elements": list(elements)})
+
+    def pfcount(self, key: str) -> dict:
+        """Ask for the HyperLogLog cardinality estimate at ``key``,
+        Redis PFCOUNT: 0 when the key does not exist, and a
+        client error — not an estimate — when the key holds a
+        plain string. It rides the same ReadIndex path as
+        ``get``, so it carries the same session watermark and
+        advances the read watermark from the reply's
+        ``read_index`` exactly the same way: an estimate query
+        after your own write sees the estimate that write
+        produced, and a later read never goes backwards past it."""
+        if self.last_read_index > self.last_write_index:
+            min_index = self.last_read_index
+            term = self.last_read_term
+        else:
+            min_index = self.last_write_index
+            term = self.last_write_term
+        msg: dict = {"type": "client", "op": "pfcount", "key": key,
                      "client_id": self.client_id,
                      "min_commit_index": min_index,
                      "session_term": term}
@@ -832,18 +885,21 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
     log index, ``persist`` a bare flag), ``setrange`` a
     string key, an integer ``offset`` and a string value,
     ``setbit`` a string key, an integer ``offset`` and a bit
-    that is 0 or 1."""
+    that is 0 or 1, ``pfadd`` a string key and a non-empty list
+    of at most 1000 string elements."""
     if not isinstance(op, dict):
         return None, {"type": "client_response", "status": "error",
                       "error": "pipeline op must be an object with "
                                "op, key, and value fields"}
     name = op.get("op")
     if name not in ("set", "del", "cas", "incr", "setnx", "getset",
-                    "append", "getdel", "getex", "setrange", "setbit"):
+                    "append", "getdel", "getex", "setrange", "setbit",
+                    "pfadd"):
         return None, {"type": "client_response", "status": "error",
                       "error": "pipeline op must be set, del, cas, "
                                "incr, setnx, getset, append, "
-                               "getdel, getex, setrange, or setbit"}
+                               "getdel, getex, setrange, setbit, or "
+                               "pfadd"}
     key = op.get("key")
     if not isinstance(key, str):
         return None, {"type": "client_response", "status": "error",
@@ -919,6 +975,21 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
                                    "or 1"}
         msg["offset"] = offset
         msg["bit"] = bit
+    if name == "pfadd":
+        # ``elements`` rides along with a pipelined pfadd,
+        # validated here so a malformed one never goes on the
+        # wire: a non-empty list of at most 1000 strings — the
+        # same shape the server enforces (the server also caps
+        # it, so a huge list is still a client error there, not
+        # a log entry).
+        elements = op.get("elements")
+        if (not isinstance(elements, list) or not elements
+                or len(elements) > 1000
+                or any(not isinstance(e, str) for e in elements)):
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline pfadd elements must be "
+                                   "a list of 1 to 1000 strings"}
+        msg["elements"] = list(elements)
     if name == "getex":
         # At most one expiry option rides along with a pipelined
         # getex, validated here so a malformed one never goes on
@@ -978,7 +1049,7 @@ def pipeline(node_addr: tuple[str, int], ops: list,
 
     One ``set`` / ``del`` / ``cas`` / ``incr`` / ``setnx`` /
     ``getset`` / ``append`` / ``getdel`` / ``getex`` / ``setrange`` /
-    ``setbit`` op per
+    ``setbit`` / ``pfadd`` op per
     dict (see
     ``Session.pipeline`` for the shapes): the ops go out in
     batches of ``depth`` on a single persistent socket and the
@@ -1348,6 +1419,43 @@ def getbit(node_addr: tuple[str, int], key: str, offset: int,
     return request(node_addr, {"type": "client", "op": "getbit",
                                "key": key, "offset": offset},
                    timeout=timeout)
+
+
+def pfadd(node_addr: tuple[str, int], key: str, *elements: str,
+          timeout: float = 12.0) -> dict:
+    """Add ``elements`` to the HyperLogLog at ``key``, following
+    leader redirects like ``request`` — Redis PFADD.
+
+    One request appends the pfadd entry, so the pfadd flag and the
+    estimate it returns are decided at the entry's position in the
+    log: the reply is the plain pfadd response (``status`` ``ok``
+    with ``pfadd`` — 1 when at least one register rose, 0 when
+    every element was already counted — and ``estimate``, the
+    cardinality estimate after the add — or ``pfadd_failed`` with
+    reason ``wrongtype`` when the current value is a plain
+    string). A missing key is created as an empty HLL; at most
+    1000 elements per call. A successful pfadd keeps the key's
+    TTL deadline, like a CAS."""
+    return request(node_addr, {"type": "client", "op": "pfadd",
+                               "key": key,
+                               "elements": list(elements)},
+                   timeout=timeout)
+
+
+def pfcount(node_addr: tuple[str, int], key: str,
+            timeout: float = 12.0) -> dict:
+    """Ask for the HyperLogLog cardinality estimate at ``key``,
+    following leader redirects like ``request`` — Redis PFCOUNT.
+
+    One request serves the estimate through the leader's ReadIndex
+    path, so it reflects the committed state as of one read index,
+    exactly as linearizable as a ``get``. The reply is the plain
+    pfcount response (``status`` ``ok`` with ``estimate`` — the
+    cardinality estimate, 0 when the key does not exist — plus the
+    ``read_index`` / ``read_term`` it was measured at). A plain
+    string value is a client error, not an estimate."""
+    return request(node_addr, {"type": "client", "op": "pfcount",
+                               "key": key}, timeout=timeout)
 
 
 def mset(node_addr: tuple[str, int], pairs: list,
@@ -1782,6 +1890,27 @@ def main(argv: list[str] | None = None) -> int:
     p_getbit.add_argument("offset", type=int,
                           help="bit to read, 0-based; bit 0 is the most "
                                "significant bit of the first byte")
+    p_pfadd = sub.add_parser(
+        "pfadd",
+        help="add elements to the HyperLogLog at key and print 1 "
+             "when at least one register rose (the HLL was "
+             "modified) or 0 when every element was already "
+             "counted; a missing key is created as an empty HLL")
+    p_pfadd.add_argument("key")
+    p_pfadd.add_argument("elements", nargs="+",
+                         help="elements to add (at most 1000)")
+    p_pfadd.add_argument("--client-id", default=None,
+                         help="session id for at-most-once writes: a retry "
+                              "with the same client id + request id returns "
+                              "the first attempt's result instead of writing "
+                              "twice")
+    p_pfadd.add_argument("--request-id", default=None,
+                         help="id of this write within the client session")
+    p_pfcount = sub.add_parser(
+        "pfcount",
+        help="print the HyperLogLog cardinality estimate at key; "
+             "0 when the key does not exist")
+    p_pfcount.add_argument("key")
     p_add = sub.add_parser("add-server",
                            help="add a server to the cluster (Raft §6)")
     p_add.add_argument("server_id")
@@ -1874,7 +2003,8 @@ def main(argv: list[str] | None = None) -> int:
     msg: dict = {"type": "client", "op": op}
     if op in ("set", "get", "del", "cas", "ttl", "expire", "incr",
               "setnx", "getset", "append", "strlen", "getdel",
-              "getex", "getrange", "setrange", "setbit", "getbit"):
+              "getex", "getrange", "setrange", "setbit", "getbit",
+              "pfadd", "pfcount"):
         msg["key"] = args.key
     elif op == "mset":
         if len(args.pairs) % 2:
@@ -1937,9 +2067,11 @@ def main(argv: list[str] | None = None) -> int:
         msg["bit"] = args.bit
     if op == "getbit":
         msg["offset"] = args.offset
+    if op == "pfadd":
+        msg["elements"] = args.elements
     if op in ("set", "del", "cas", "mset", "expire", "incr", "setnx",
               "getset", "append", "getdel", "getex", "setrange",
-              "setbit") \
+              "setbit", "pfadd") \
             and args.request_id:
         # A request id without an explicit client id still dedups
         # within the default "cli" session; the same id retried from
@@ -1998,6 +2130,10 @@ def main(argv: list[str] | None = None) -> int:
             print(resp.get("old_bit"))
         elif op == "getbit":
             print(resp.get("bit"))
+        elif op == "pfadd":
+            print(resp.get("pfadd"))
+        elif op == "pfcount":
+            print(resp.get("estimate"))
         elif op == "mget":
             print(json.dumps(resp.get("values")))
         elif op == "keys":

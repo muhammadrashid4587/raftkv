@@ -415,6 +415,41 @@ logic and the failure handling, not the key-value API on top.
   a value written as multi-byte UTF-8 text is read as its
   latin-1 characters, not its UTF-8 bytes, and a character
   above U+00FF is not a byte string at all.
+- **HyperLogLog** — since v0.47.0 `pfadd key element [element ...]`
+  (`Session.pfadd(k, *elements)`, `client.pfadd(addr, k, *elements)`,
+  `pfadd key element ...` on the CLI) adds elements to the
+  HyperLogLog at the key and answers `pfadd` 1 when at least one
+  register rose — the HLL was modified — and 0 when every element
+  was already counted, plus `estimate`, the cardinality estimate
+  after the add; and `pfcount key` (`Session.pfcount(k)`,
+  `client.pfcount(addr, k)`, `pfcount key` on the CLI) answers the
+  estimate, 0 when the key does not exist — Redis PFADD / PFCOUNT.
+  A missing key is created as an empty HLL. The registers are
+  16384 one-byte registers (precision 14, Redis's default), hashed
+  with SHA-256 of the element's UTF-8 bytes — deterministic across
+  processes and nodes, so every node applying the same log computes
+  the same bytes — and the estimate is the standard HyperLogLog one
+  with the small-range (linear counting) and large-range
+  corrections, good to under 1% once the cardinality is past a few
+  thousand. The outcome is decided at apply time, at the entry's
+  exact position in the log, like a CAS: a retry with the same
+  session id returns the first attempt's pfadd flag and estimate
+  instead of adding twice. A successful pfadd fires a `set` watch
+  event with the new value — but only when a register rose: a
+  pfadd that changed nothing fires nothing, like a failed setnx —
+  and keeps the key's TTL deadline, like a CAS. A plain string
+  value fails a pfadd with `pfadd_failed` and reason `wrongtype`
+  instead of writing, and a pfcount on one is a client error, not
+  an estimate. At most 1000 elements per pfadd, like an mget batch,
+  so one entry never carries an unbounded list. A pfcount rides
+  the same ReadIndex path as a `get`, so it carries the same
+  session watermark and is exactly as linearizable.
+  `{"op": "pfadd", "key": k, "elements": [...]}` is a pipeline op
+  too. The honest limit is the precision itself: the estimate is
+  probabilistic — it can be off by a few percent at small counts
+  and by ~0.8% (one standard error) at large ones — and each HLL
+  key costs ~16 KiB of registers however few elements it holds, so
+  an HLL is the wrong shape for counting ten things exactly.
 - **Key enumeration** — since v0.31.0 one `keys` RPC lists the
   store's keys (`client.keys(prefix, limit, start_after)`,
   `Session.keys(prefix, limit, start_after)`, `keys --prefix p
@@ -2229,4 +2264,49 @@ entries left in `log.jsonl` are dropped by their index on reload.
   The roadmap is exhausted again, so the next real thing is
   a new roadmap item grounded in this project's purpose,
   proposed by the next run — candidates: a wall-clock TTL
-  variant, or HyperLogLog (PFADD / PFCOUNT).
+  variant.
+- ~~HyperLogLog (PFADD / PFCOUNT)~~ — done in v0.47.0,
+  Nov 24, 2026: `pfadd key element [element ...]` adds elements
+  to the HyperLogLog at the key and answers `pfadd` 1 when at
+  least one register rose and 0 when every element was already
+  counted, plus `estimate`, the cardinality estimate after the
+  add, and `pfcount key` answers the estimate, 0 when the key
+  does not exist — Redis PFADD / PFCOUNT. The registers are
+  16384 one-byte registers (precision 14, Redis's default),
+  hashed with SHA-256 so every node applying the same log
+  computes the same bytes, and the estimate is the standard
+  HyperLogLog one with the small- and large-range corrections —
+  measured under 1% error at 10,000 and 100,000 distinct
+  elements. The registers ride in the keyspace as a latin-1
+  string with a marker prefix, so snapshots, the sorted index,
+  TTL expiry, and `get` treat an HLL key like any other key,
+  and a plain string fails a pfadd with `pfadd_failed` /
+  `wrongtype` instead of writing. Decided at apply time like a
+  CAS, so a retry with the same session id returns the first
+  attempt's pfadd flag and estimate instead of adding twice; a
+  successful pfadd fires a `set` watch event with the new value
+  only when a register rose, and keeps the key's TTL deadline.
+  At most 1000 elements per pfadd. A pfcount rides the same
+  ReadIndex path as a `get`. `{"op": "pfadd"}` is a pipeline op
+  too. `Session.pfadd` / `Session.pfcount`,
+  `client.pfadd` / `client.pfcount`, and `pfadd` / `pfcount`
+  on the CLI expose them.
+  `tests/test_hyperloglog.py` proves them: store-level pfadd on
+  a missing key, re-adding a counted element answering 0 with
+  the blob byte-identical, pfcount on a missing key, accuracy
+  within 5% at 1000 elements and 3% at 10000, order-independent
+  blobs, the TTL deadline kept across a pfadd, the new key
+  joining the sorted index, wrongtype leaving the value
+  untouched, bad elements raising, and the HLL surviving a
+  snapshot load; replication to every node with identical blobs,
+  invalid pfadds rejected with no log entry, wrongtype
+  replicating with pfcount erroring, dedup of a pfadd retry
+  returning the first attempt's flag and estimate, the watch
+  event on leader and follower only when a register rose,
+  continuing after a leader change, surviving a snapshot +
+  restart, session read-your-writes, pipelined pfadd ops with
+  malformed ops in position, and the CLI end to end.
+  The roadmap is exhausted again, so the next real thing is
+  a new roadmap item grounded in this project's purpose,
+  proposed by the next run — candidates: a wall-clock TTL
+  variant.

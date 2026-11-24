@@ -9,12 +9,38 @@ pure function of (current state, command).
 """
 
 import bisect
+import hashlib
+import math
 
 # Signed 64-bit bounds, the range Redis's INCR/INCRBY works in: a
 # value outside it is not an integer Redis can count, and a result
 # outside it is an overflow, not a bigger number.
 _INT64_MIN = -(2 ** 63)
 _INT64_MAX = 2 ** 63 - 1
+
+# HyperLogLog (PFADD / PFCOUNT), Redis-style probabilistic
+# cardinality. Precision 14: 2**14 = 16384 registers, one byte each
+# (a register holds a rho of 0..51, so a byte is plenty) — about
+# 16 KiB per key, standard error ~1.04/sqrt(m) ≈ 0.81%. The
+# registers ride in _data as a latin-1 string — the same string
+# keyspace every other value lives in, so snapshots, the sorted
+# index, TTL expiry, and `get` all treat an HLL key like any other
+# key (Redis stores its HLL the same way, as a string-encoded blob
+# in the keyspace) — with a marker prefix so a PFADD / PFCOUNT can
+# tell an HLL apart from a plain string and answer WRONGTYPE on the
+# latter instead of counting bytes as registers. The hash is SHA-256
+# of the element's UTF-8 bytes: deterministic across processes and
+# nodes — Python's hash() is salted per process, so it could never
+# be used here: every node applying the same log must compute the
+# same registers, and a replay after restart must rebuild the
+# identical blob. The tradeoff is the precision itself: a smaller p
+# would halve the memory per step but double the error, a larger p
+# the reverse — 14 is Redis's default, and the estimate is good to
+# under 1% once the cardinality is past a few thousand.
+HLL_PRECISION = 14
+HLL_REGISTERS = 1 << HLL_PRECISION
+HLL_PREFIX = "\x00raftkv-hll\x00"
+HLL_VALUE_LENGTH = len(HLL_PREFIX) + HLL_REGISTERS
 
 
 def _is_integer_string(s: str) -> bool:
@@ -26,6 +52,76 @@ def _is_integer_string(s: str) -> bool:
     if s.startswith(("+", "-")):
         s = s[1:]
     return bool(s) and s.isdigit()
+
+
+def is_hll(value) -> bool:
+    """Whether ``value`` is a HyperLogLog blob: a string of exactly
+    the HLL length carrying the marker prefix. A plain string can
+    only pass this by being hand-built to the exact length with
+    the exact prefix — the same class of collision Redis's own
+    encoding check has — so a PFADD / PFCOUNT trusts the shape."""
+    return (isinstance(value, str)
+            and len(value) == HLL_VALUE_LENGTH
+            and value.startswith(HLL_PREFIX))
+
+
+def _hll_registers(value: str) -> bytearray:
+    """The register bytes behind an HLL blob, as a mutable
+    bytearray — the prefix stripped, the rest decoded latin-1,
+    one byte per register. Only called on values ``is_hll``
+    already accepted, so every character is at most U+00FF and
+    the decode cannot fail."""
+    return bytearray(value[len(HLL_PREFIX):].encode("latin-1"))
+
+
+def _hll_value(registers) -> str:
+    """Registers as a stored blob: the marker prefix plus the
+    registers encoded latin-1, one byte each."""
+    return HLL_PREFIX + bytes(registers).decode("latin-1")
+
+
+def _hll_add(registers: bytearray, element: str) -> bool:
+    """Hash one element into ``registers``: the top
+    ``HLL_PRECISION`` bits of the SHA-256 pick the register, the
+    remaining bits give rho — the position of the first 1-bit,
+    1..51 — and the register keeps the largest rho it has seen.
+    Returns True when a register rose, False when the element was
+    already counted (or hashed no higher than what was there):
+    that is what PFADD answers 1 or 0 on. Pure function of
+    (registers, element): the same elements in any order build
+    the same registers, which is what makes the op replay-safe."""
+    digest = hashlib.sha256(element.encode("utf-8")).digest()
+    x = int.from_bytes(digest[:8], "big")
+    j = x >> (64 - HLL_PRECISION)
+    w = x & ((1 << (64 - HLL_PRECISION)) - 1)
+    rho = (64 - HLL_PRECISION) - w.bit_length() + 1 if w else \
+        (64 - HLL_PRECISION) + 1
+    if rho > registers[j]:
+        registers[j] = rho
+        return True
+    return False
+
+
+def hll_estimate(registers) -> int:
+    """The cardinality estimate for a register set: the standard
+    HyperLogLog raw estimate — alpha * m**2 / sum(2**-register) —
+    with the small-range correction (linear counting off the empty
+    registers, while the estimate is under 2.5 * m) and the
+    large-range correction (for a 64-bit hash, past 2**64 / 30 —
+    unreachable in practice, but the formula is the honest one).
+    Rounded to the nearest integer: the estimate is a float, and
+    callers compare integers. Pure function of the registers."""
+    m = len(registers)
+    alpha = 0.7213 / (1 + 1.079 / m)
+    estimate = alpha * m * m / sum(2.0 ** -r for r in registers)
+    if estimate <= 2.5 * m:
+        zeros = sum(1 for r in registers if r == 0)
+        if zeros:
+            estimate = m * math.log(m / zeros)
+    elif estimate > (1 << 64) / 30.0:
+        estimate = -(1 << 64) * math.log(
+            1.0 - estimate / (1 << 64))
+    return int(round(estimate))
 
 
 class KVStore:
@@ -97,7 +193,7 @@ class KVStore:
         Returns a result dict for commands whose outcome depends on the
         state at apply time — currently "cas", "expire", "incr",
         "setnx", "getset", "append", "getdel", "setrange", "getex",
-        and "setbit" —
+        "setbit", and "pfadd" —
         and None for set/del, whose outcome is always ok. The result is
         what the leader hands back to the waiting client and what the
         dedup table caches for retries, so it must be a pure function
@@ -520,6 +616,68 @@ class KVStore:
             self._data[key] = new
             return {"type": "client_response", "status": "ok",
                     "old_bit": old, "value": new}
+        elif op == "pfadd":
+            # Add elements to a HyperLogLog, Redis PFADD: each
+            # element hashes (SHA-256, deterministic across nodes)
+            # into one of 16384 registers, and the register keeps
+            # the longest run of leading zeros it has seen — the
+            # estimate is the standard HLL one, with the small- and
+            # large-range corrections (see hll_estimate). The reply
+            # carries ``pfadd`` 1 when at least one register rose
+            # — the HLL was modified — and 0 when every element
+            # was already counted, plus the estimate after the add.
+            # The outcome is decided here, at this exact point in
+            # the log, so a retry with the same session id returns
+            # the first attempt's pfadd flag and estimate from the
+            # dedup table instead of adding twice. A missing key
+            # is created as an empty HLL; a key holding a plain
+            # string fails with WRONGTYPE, like a setbit on a value
+            # that is not a byte string — a pfadd must not count
+            # bytes as registers. A failed pfadd writes nothing at
+            # all, like a failed incr. A successful pfadd keeps the
+            # key's deadline, like a CAS or a setbit: it is an
+            # update of the value, not a fresh set, so it must not
+            # resurrect a key that is about to expire. A new key
+            # joins the sorted index, like a set of a new key. The
+            # registers ride in _data as a latin-1 string with the
+            # HLL marker prefix, so they survive snapshots and
+            # replay exactly like any other value — and the stored
+            # blob is a pure function of the elements added, so
+            # every node computes the same bytes. The elements
+            # were validated on the leader before the entry was
+            # logged (a non-empty list of at most
+            # PFADD_MAX_ELEMENTS strings), so by apply time they
+            # are well-formed — a hand-built log entry with a bad
+            # elements list still raises rather than silently
+            # counting nonsense.
+            key = command["key"]
+            elements = command.get("elements")
+            if (not isinstance(elements, list) or not elements
+                    or any(not isinstance(e, str) for e in elements)):
+                raise ValueError(
+                    "pfadd elements must be a non-empty list of "
+                    "strings")
+            current = self._data.get(key)
+            if current is not None and not is_hll(current):
+                return {"type": "client_response",
+                        "status": "pfadd_failed",
+                        "reason": "wrongtype",
+                        "current": current,
+                        "error": "pfadd failed: value of "
+                                 f"{key!r} is not a hyperloglog"}
+            registers = (_hll_registers(current)
+                         if current is not None
+                         else bytearray(HLL_REGISTERS))
+            changed = False
+            for element in elements:
+                if _hll_add(registers, element):
+                    changed = True
+            if key not in self._data:
+                bisect.insort(self._keys, key)
+            self._data[key] = _hll_value(registers)
+            return {"type": "client_response", "status": "ok",
+                    "pfadd": 1 if changed else 0,
+                    "estimate": hll_estimate(registers)}
         elif op == "setrange":
             # Overwrite part of a string value, Redis SETRANGE:
             # starting at ``offset``, replace as many characters
@@ -661,6 +819,22 @@ class KVStore:
         if start > end or n == 0:
             return ""
         return value[start:end + 1]
+
+    def pfcount(self, key: str) -> int:
+        """The HyperLogLog cardinality estimate at ``key`` — 0 when
+        the key does not exist, Redis PFCOUNT. Raises TypeError
+        when the value is a plain string: a PFCOUNT counts an HLL,
+        not bytes, so a string key is WRONGTYPE, like a getbit on
+        a value that is not a byte string. Pure read: no log
+        entry, no state change."""
+        value = self._data.get(key)
+        if value is None:
+            return 0
+        if not is_hll(value):
+            raise TypeError(
+                f"pfcount failed: value of {key!r} is not a "
+                "hyperloglog")
+        return hll_estimate(_hll_registers(value))
 
     def getbit(self, key: str, offset: int) -> int:
         """The bit at ``offset`` in the string value at ``key``,
