@@ -163,8 +163,8 @@ class KVStore:
         # same idea: ``_wall_expiry[key]`` is the absolute Unix
         # time (``time.time()`` seconds) at which the key stops
         # existing, fixed once by the leader when the ``setex``
-        # entry was logged — or when a ``set`` carried EX / PX —
-        # and stored in the entry itself — or
+        # entry was logged — or when a ``set`` carried EX / PX /
+        # EXAT / PXAT — and stored in the entry itself — or
         # when an ``expireat`` / ``pexpireat`` entry fixed one
         # on a key that already exists — so every replica
         # applies the same deadline, and replaying the log or
@@ -205,10 +205,13 @@ class KVStore:
         meaningless, so a ``set`` with ``ttl_entries`` and no
         index raises; callers that apply commands outside a log
         (unit tests, mostly) pass no TTL. A ``set`` carrying a
-        ``wall_deadline`` — SET ... EX / PX, fixed by the leader
-        at log time — records a wall-clock deadline instead, and
-        drops any log-entry deadline, so a key still holds at
-        most one kind of TTL. A plain ``set`` without a TTL clears
+        ``wall_deadline`` — SET ... EX / PX / EXAT / PXAT, fixed
+        by the leader at log time — records a wall-clock deadline
+        instead, and drops any log-entry deadline, so a key still
+        holds at most one kind of TTL; a ``wall_deadline``
+        already past at log time (``delete_now``) deletes the key
+        outright instead of recording it. A plain ``set`` without
+        a TTL clears
         any deadline the key had — like Redis, a fresh SET drops
         the old TTL — and so do an ``mset`` without a TTL and
         ``del``. A ``set`` carrying NX or XX is
@@ -298,18 +301,48 @@ class KVStore:
             # exact point in the log — None when it was absent —
             # read before the write overwrites it.
             old = self._data.get(key)
+            wall = command.get("wall_deadline")
+            if wall is not None and command.get("delete_now"):
+                # SET ... EXAT / PXAT with a deadline already
+                # past at log time: the key dies at once, like
+                # an ``expireat`` / ``getex`` whose absolute
+                # deadline was already past — the value is never
+                # recorded, and an existing key is deleted
+                # outright instead of living with a deadline
+                # nobody could honour. The set still answers
+                # ``set`` 1, with ``deleted`` set when a key
+                # actually went, so the apply path fires the
+                # ``del`` event for it; a missing key answers
+                # ``set`` 1 with nothing deleted and fires
+                # nothing, since there was nothing to delete.
+                # A losing conditional set never reaches here —
+                # NX / XX are decided above — so a past
+                # deadline on a losing set deletes nothing.
+                result = {"type": "client_response", "status": "ok",
+                          "set": 1}
+                if key in self._data:
+                    del self._data[key]
+                    idx = bisect.bisect_left(self._keys, key)
+                    if idx < len(self._keys) and self._keys[idx] == key:
+                        del self._keys[idx]
+                    self._expiry.pop(key, None)
+                    self._wall_expiry.pop(key, None)
+                    result["deleted"] = True
+                if get:
+                    result["old_value"] = old
+                return result
             if key not in self._data:
                 bisect.insort(self._keys, key)
             self._data[key] = command["value"]
             ttl = command.get("ttl_entries")
-            wall = command.get("wall_deadline")
             if wall is not None:
-                # SET ... EX / PX: an inline wall-clock TTL — the
-                # leader fixed the absolute deadline at log time,
-                # so every replica applies the same one, like a
-                # setex. A fresh life on the log side too: any
-                # log-entry deadline the key had is dropped, so a
-                # key still holds at most one kind of TTL.
+                # SET ... EX / PX / EXAT / PXAT: an inline
+                # wall-clock TTL — the leader fixed the absolute
+                # deadline at log time, so every replica applies
+                # the same one, like a setex. A fresh life on
+                # the log side too: any log-entry deadline the
+                # key had is dropped, so a key still holds at
+                # most one kind of TTL.
                 self._wall_expiry[key] = float(wall)
                 self._expiry.pop(key, None)
             elif ttl is not None:

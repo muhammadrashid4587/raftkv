@@ -138,7 +138,8 @@ class Session:
             ttl_entries: int | None = None,
             nx: bool = False, xx: bool = False,
             keepttl: bool = False, get: bool = False,
-            ex: int | None = None, px: int | None = None) -> dict:
+            ex: int | None = None, px: int | None = None,
+            exat: int | None = None, pxat: int | None = None) -> dict:
         """Write one key. With ``ttl_entries`` (a positive number
         of log entries) the key expires when the log reaches this
         entry's index + ``ttl_entries`` — a distance in the log,
@@ -160,13 +161,23 @@ class Session:
         TTL — Redis SET ... EX / PX: the leader fixes the
         absolute deadline at log time, so every replica applies
         the same one and the key dies when the wall clock reaches
-        it, like a ``setex`` written as a plain set. The outcome
-        is decided at apply time, at the entry's exact position
-        in the log, like a CAS: a retry with the same session id
-        returns the first attempt's result instead of writing
-        twice. NX and XX together, EX and PX together, EX/PX
-        with a log-entry TTL, or EX/PX with KEEPTTL, is a client
-        error — the server rejects it and appends no log entry."""
+        it, like a ``setex`` written as a plain set. With
+        ``exat`` (Unix seconds) or ``pxat`` (Unix milliseconds)
+        the write carries an absolute wall-clock deadline
+        instead — Redis SET ... EXAT / PXAT: the timestamp
+        itself is the deadline, recorded as-is by the leader,
+        so the key dies when the wall clock reaches it; a
+        deadline already past deletes the key at apply time
+        instead, like an ``expireat`` whose deadline was already
+        past, and the reply carries ``deleted`` when a key
+        actually went. The outcome is decided at apply time, at
+        the entry's exact position in the log, like a CAS: a
+        retry with the same session id returns the first
+        attempt's result instead of writing twice. NX and XX
+        together, any two of EX / PX / EXAT / PXAT together,
+        EX/PX/EXAT/PXAT with a log-entry TTL, or with KEEPTTL,
+        is a client error — the server rejects it and appends no
+        log entry."""
         msg: dict = {"type": "client", "op": "set",
                      "key": key, "value": value}
         if ttl_entries is not None:
@@ -183,6 +194,10 @@ class Session:
             msg["ex"] = ex
         if px is not None:
             msg["px"] = px
+        if exat is not None:
+            msg["exat"] = exat
+        if pxat is not None:
+            msg["pxat"] = pxat
         return self._write(msg)
 
     def setex(self, key: str, value: str, seconds: int) -> dict:
@@ -293,6 +308,8 @@ class Session:
             {"op": "set", "key": k, "value": v, "keepttl": True}
             {"op": "set", "key": k, "value": v, "ex": n}
             {"op": "set", "key": k, "value": v, "px": n}
+            {"op": "set", "key": k, "value": v, "exat": t}
+            {"op": "set", "key": k, "value": v, "pxat": t}
             {"op": "del", "key": k}
             {"op": "cas", "key": k, "expected": e, "value": v}
             {"op": "incr", "key": k, "by": n}
@@ -1064,7 +1081,11 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
         # number of seconds / milliseconds, 1..1,000,000 /
         # 1..1,000,000,000, never together, never with a
         # log-entry TTL and never with KEEPTTL — the same shapes
-        # the server enforces.
+        # the server enforces. EXAT / PXAT ride along the same
+        # way: an absolute Unix time in seconds / milliseconds,
+        # a positive integer like ``expireat`` takes, never with
+        # each other, never with EX or PX, never with a log-entry
+        # TTL and never with KEEPTTL.
         ex = op.get("ex")
         if (ex is not None
                 and (not isinstance(ex, int) or isinstance(ex, bool)
@@ -1079,24 +1100,61 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
             return None, {"type": "client_response", "status": "error",
                           "error": "pipeline set PX must be an "
                                    "integer between 1 and 1000000000"}
+        exat = op.get("exat")
+        if (exat is not None
+                and (not isinstance(exat, int) or isinstance(exat, bool)
+                     or exat < 1)):
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline set EXAT must be a "
+                                   "positive integer"}
+        pxat = op.get("pxat")
+        if (pxat is not None
+                and (not isinstance(pxat, int) or isinstance(pxat, bool)
+                     or pxat < 1)):
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline set PXAT must be a "
+                                   "positive integer"}
         if ex is not None and px is not None:
             return None, {"type": "client_response", "status": "error",
                           "error": "pipeline set EX and PX are "
                                    "mutually exclusive"}
+        if exat is not None and pxat is not None:
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline set EXAT and PXAT are "
+                                   "mutually exclusive"}
+        if ((exat is not None or pxat is not None)
+                and (ex is not None or px is not None)):
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline set EXAT/PXAT cannot be "
+                                   "combined with EX/PX"}
         if ((ex is not None or px is not None)
                 and op.get("ttl_entries") is not None):
             return None, {"type": "client_response", "status": "error",
                           "error": "pipeline set EX/PX cannot be "
+                                   "combined with ttl_entries"}
+        if ((exat is not None or pxat is not None)
+                and op.get("ttl_entries") is not None):
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline set EXAT/PXAT cannot be "
                                    "combined with ttl_entries"}
         if ((ex is not None or px is not None)
                 and op.get("keepttl")):
             return None, {"type": "client_response", "status": "error",
                           "error": "pipeline set EX/PX cannot be "
                                    "combined with KEEPTTL"}
+        if ((exat is not None or pxat is not None)
+                and op.get("keepttl")):
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline set EXAT/PXAT cannot be "
+                                   "combined with KEEPTTL"}
         if ex is not None:
             msg["ex"] = ex
         if px is not None:
             msg["px"] = px
+        if exat is not None:
+            msg["exat"] = exat
+        if pxat is not None:
+            msg["pxat"] = pxat
     if name == "cas":
         expected = op.get("expected")
         if not isinstance(expected, str):
@@ -1888,6 +1946,17 @@ def main(argv: list[str] | None = None) -> int:
                            "after the write (Redis SET PX): the same "
                            "wall-clock deadline as --ex, in "
                            "milliseconds")
+    g_ex.add_argument("--exat", type=int, default=None,
+                      help="expire the key at this Unix time in "
+                           "seconds (Redis SET EXAT): the timestamp "
+                           "itself is the deadline, recorded as-is "
+                           "by the leader, so every replica applies "
+                           "the same one")
+    g_ex.add_argument("--pxat", type=int, default=None,
+                      help="expire the key at this Unix time in "
+                           "milliseconds (Redis SET PXAT): the same "
+                           "absolute deadline as --exat, in "
+                           "milliseconds")
     p_set.add_argument("--client-id", default=None,
                        help="session id for at-most-once writes: a retry "
                             "with the same client id + request id returns "
@@ -2394,6 +2463,10 @@ def main(argv: list[str] | None = None) -> int:
             msg["ex"] = args.ex
         if args.px is not None:
             msg["px"] = args.px
+        if args.exat is not None:
+            msg["exat"] = args.exat
+        if args.pxat is not None:
+            msg["pxat"] = args.pxat
     if op == "mset":
         if args.ttl_entries is not None:
             msg["ttl_entries"] = args.ttl_entries

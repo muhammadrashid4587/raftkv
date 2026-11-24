@@ -1438,9 +1438,21 @@ class RaftNode:
                     # A winning set fires like a set always did;
                     # a set that lost on NX / XX wrote nothing,
                     # so it fires nothing, like a failed CAS.
-                    self.watch.notify(entry["command"]["key"],
-                                      entry["command"]["value"], "set",
-                                      index=self.last_applied)
+                    # A set whose absolute deadline was already
+                    # past deleted the key outright instead: it
+                    # fires like a del, like an expireat whose
+                    # deadline was already past — and on a
+                    # missing key it fires nothing at all, since
+                    # the value was never recorded.
+                    if result.get("deleted"):
+                        self.watch.notify(entry["command"]["key"],
+                                          None, "del",
+                                          index=self.last_applied)
+                    elif not entry["command"].get("delete_now"):
+                        self.watch.notify(entry["command"]["key"],
+                                          entry["command"]["value"],
+                                          "set",
+                                          index=self.last_applied)
                 elif op == "setex":
                     # A setex writes like a set, so it fires like
                     # one, with the value it wrote.
@@ -2678,6 +2690,25 @@ class RaftNode:
             # has). The values are validated here, on the leader,
             # before the command is ever logged — a bad one is a
             # client error, not a log entry.
+            #
+            # SET ... EXAT / PXAT is the absolute analogue:
+            # EXAT names the deadline as Unix seconds, PXAT as
+            # Unix milliseconds — the timestamp itself is the
+            # deadline, so nothing is added to ``now`` here, it
+            # is just recorded (milliseconds divided by 1000)
+            # and every replica applies it as-is. A timestamp
+            # must be a positive integer — the same validation
+            # ``expireat`` / ``pexpireat`` use for the same
+            # absolute deadline, since a relative cap like
+            # EX's 1..1,000,000 would reject every real Unix
+            # time. All four TTL options are mutually exclusive
+            # (Redis rejects any two of them), and EXAT / PXAT
+            # ride with neither a log-entry TTL nor KEEPTTL.
+            # A deadline already past at log time deletes the
+            # key outright at apply time instead of recording a
+            # deadline nobody could honour, so the command
+            # carries ``delete_now`` — like an ``expireat``
+            # whose deadline was already past.
             ex = msg.get("ex")
             if (ex is not None
                     and (not isinstance(ex, int)
@@ -2696,18 +2727,53 @@ class RaftNode:
                         "error": "set PX must be an integer "
                                  "between 1 and "
                                  f"{WALL_TTL_MAX_MS}"}
+            exat = msg.get("exat")
+            if (exat is not None
+                    and (not isinstance(exat, int)
+                         or isinstance(exat, bool)
+                         or exat < 1)):
+                return {"type": "client_response", "status": "error",
+                        "error": "set EXAT must be a positive "
+                                 "integer"}
+            pxat = msg.get("pxat")
+            if (pxat is not None
+                    and (not isinstance(pxat, int)
+                         or isinstance(pxat, bool)
+                         or pxat < 1)):
+                return {"type": "client_response", "status": "error",
+                        "error": "set PXAT must be a positive "
+                                 "integer"}
             if ex is not None and px is not None:
                 return {"type": "client_response", "status": "error",
                         "error": "set EX and PX are mutually "
                                  "exclusive"}
+            if exat is not None and pxat is not None:
+                return {"type": "client_response", "status": "error",
+                        "error": "set EXAT and PXAT are mutually "
+                                 "exclusive"}
+            if ((exat is not None or pxat is not None)
+                    and (ex is not None or px is not None)):
+                return {"type": "client_response", "status": "error",
+                        "error": "set EXAT/PXAT cannot be combined "
+                                 "with EX/PX"}
             if ((ex is not None or px is not None)
                     and msg.get("ttl_entries") is not None):
                 return {"type": "client_response", "status": "error",
                         "error": "set EX/PX cannot be combined "
                                  "with ttl_entries"}
+            if ((exat is not None or pxat is not None)
+                    and msg.get("ttl_entries") is not None):
+                return {"type": "client_response", "status": "error",
+                        "error": "set EXAT/PXAT cannot be combined "
+                                 "with ttl_entries"}
             if (ex is not None or px is not None) and msg.get("keepttl"):
                 return {"type": "client_response", "status": "error",
                         "error": "set EX/PX cannot be combined "
+                                 "with KEEPTTL"}
+            if ((exat is not None or pxat is not None)
+                    and msg.get("keepttl")):
+                return {"type": "client_response", "status": "error",
+                        "error": "set EXAT/PXAT cannot be combined "
                                  "with KEEPTTL"}
             if ex is not None:
                 command["ex"] = ex
@@ -2715,6 +2781,16 @@ class RaftNode:
             elif px is not None:
                 command["px"] = px
                 command["wall_deadline"] = time.time() + px / 1000.0
+            elif exat is not None:
+                command["exat"] = exat
+                command["wall_deadline"] = float(exat)
+                if command["wall_deadline"] <= time.time():
+                    command["delete_now"] = True
+            elif pxat is not None:
+                command["pxat"] = pxat
+                command["wall_deadline"] = pxat / 1000.0
+                if command["wall_deadline"] <= time.time():
+                    command["delete_now"] = True
             for field in ("nx", "xx", "keepttl", "get"):
                 if msg.get(field):
                     command[field] = True

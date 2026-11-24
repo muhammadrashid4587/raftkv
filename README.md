@@ -523,6 +523,51 @@ logic and the failure handling, not the key-value API on top.
   limit is the same clock as `setex`: the deadline is
   identical on every node, but each node enforces it against
   its own clock.
+- **SET with EXAT / PXAT** — since v0.53.0 `set key value
+  [--exat timestamp | --pxat timestamp_ms]` (`Session.set(k,
+  v, exat=t, pxat=t)`, `set key value --exat t` / `--pxat t`
+  on the CLI) carries Redis's SET EXAT / PXAT options: an
+  absolute wall-clock deadline inline on SET, the absolute
+  analogue of EX / PX — EXAT names the deadline as Unix
+  seconds, PXAT as Unix milliseconds, and the timestamp
+  itself is the deadline, recorded as-is by the leader, so
+  every replica applies the same one and the key dies when
+  the wall clock reaches it, enforced by the same three paths
+  as a `setex` deadline: the background sweep every 100ms,
+  the purge before each log entry applies, and the purge
+  before serving a read. A winning EXAT/PXAT set is a fresh
+  life for the key: any log-entry deadline it had is dropped,
+  so a key still holds at most one kind of TTL, and a plain
+  `set` clears an EXAT/PXAT deadline like any other wall
+  deadline. EXAT and PXAT are mutually exclusive, and neither
+  rides with EX or PX, with a log-entry TTL, or with KEEPTTL
+  — Redis rejects all of those combinations, and the server
+  rejects them as client errors that append no log entry. A
+  timestamp must be a positive integer — the same validation
+  `expireat` / `pexpireat` use for the same absolute
+  deadline. A deadline already past at log time deletes the
+  key outright at apply time instead of recording a deadline
+  nobody could honour, like an `expireat` whose deadline was
+  already past: the set still answers `set` 1, with
+  `deleted` set when a key actually went, and the apply path
+  fires a `del` watch event for it — a past deadline on a
+  missing key writes nothing and fires nothing, and a losing
+  conditional set deletes nothing either. It composes with
+  NX / XX and with GET exactly like the other flags: a losing
+  conditional set writes nothing, deadline included, and
+  answers `old_value` None with GET, while a winning GET set
+  with a past deadline reports the old value it replaced.
+  The `ttl` query reports the deadline it sets, in `wall_ttl`
+  / `wall_deadline`, exactly like a `setex` deadline. It rides
+  the same write path as a single `set` — group-commit
+  batching, dedup (a retry with the same session id returns
+  the first attempt's result instead of setting twice, and the
+  deadline stays the first attempt's), the response's log index
+  advancing a session's watermark — and `{"op": "set", "key":
+  k, "value": v, "exat": t}` is a pipeline op too. The honest
+  limit is the same clock as `setex`: the deadline is
+  identical on every node, but each node enforces it against
+  its own clock.
 - **Bit operations** — since v0.46.0 `setbit key offset bit`
   (`Session.setbit(k, offset, bit)`, `client.setbit(addr, k,
   offset, bit)`, `setbit key offset bit` on the CLI) sets one
@@ -2702,9 +2747,60 @@ entries left in `log.jsonl` are dropped by their index on reload.
   original deadline, session read-your-writes, pipelined set
   ops with EX/PX and malformed ops in position, and the CLI
   end to end.
+- ~~SET with EXAT / PXAT~~ — done in v0.53.0,
+  Nov 24, 2026: `set key value [--exat timestamp | --pxat
+  timestamp_ms]` carries Redis's SET EXAT / PXAT options —
+  an absolute wall-clock deadline inline on SET, the absolute
+  analogue of EX / PX: EXAT names the deadline as Unix
+  seconds, PXAT as Unix milliseconds, and the timestamp
+  itself is the deadline, recorded as-is by the leader, so
+  every replica applies the same one and the key dies by the
+  same three enforcements as a `setex` deadline — the
+  background sweep every 100ms, the purge before each log
+  entry applies, and the purge before serving a read. A
+  winning EXAT/PXAT set is a fresh life for the key: any
+  log-entry deadline it had is dropped, so a key still holds
+  at most one kind of TTL, and a plain `set` clears an
+  EXAT/PXAT deadline like any other wall deadline. EXAT and
+  PXAT are mutually exclusive, and neither rides with EX or
+  PX, with a log-entry TTL, or with KEEPTTL — all are client
+  errors that append no log entry — and a timestamp must be a
+  positive integer, the same validation `expireat` /
+  `pexpireat` use. A deadline already past at log time
+  deletes the key outright at apply time, like an `expireat`
+  whose deadline was already past: the set still answers
+  `set` 1, with `deleted` set when a key actually went, and
+  the apply path fires a `del` watch event for it, while a
+  past deadline on a missing key writes nothing and fires
+  nothing and a losing conditional set deletes nothing. It
+  composes with NX / XX and with GET exactly like the other
+  flags, and the `ttl` query reports the deadline in
+  `wall_ttl` / `wall_deadline`. It rides the same write path
+  as a single `set` — group-commit batching, dedup of a retry
+  returning the first attempt's result with the first deadline
+  kept, the response's log index advancing a session's
+  watermark — and `{"op": "set", "key": k, "value": v,
+  "exat": t}` is a pipeline op too. `Session.set` (with
+  `exat=` / `pxat=`) and `set` on the CLI (`--exat` /
+  `--pxat`, mutually exclusive with `--ex` / `--px`) expose
+  it. `tests/test_set_exat_pxat.py` proves it: store-level
+  EXAT recording a wall deadline and dropping a log deadline,
+  GET with EXAT reporting the old value, a plain set clearing
+  an EXAT deadline, a losing NX and a losing XX with EXAT
+  writing nothing, a past deadline deleting an existing key
+  at apply time with `deleted` set and the old value reported
+  with GET, a past deadline on a missing key writing nothing,
+  and a losing NX with a past deadline deleting nothing;
+  replication to every node with the key readable then gone
+  past the deadline for EXAT and for PXAT, the TTL query
+  reporting the exact timestamp, an EXAT set clearing a log
+  deadline on the cluster, invalid values and invalid
+  combinations rejected with no log entry, dedup of a retry
+  returning the first attempt's result with the first deadline
+  kept, the `del` watch event firing at apply time for a past
+  deadline and from the sweep for a future one, session
+  read-your-writes, pipelined set ops with EXAT/PXAT and
+  malformed ops in position, and the CLI end to end.
   The roadmap is exhausted again, so the next real thing is
   a new roadmap item grounded in this project's purpose,
-  proposed by the next run — candidate: SET with EXAT / PXAT
-  (an absolute wall-clock deadline inline on SET, Redis's
-  EXAT seconds / PXAT milliseconds, the absolute analogue
-  of EX / PX).
+  proposed by the next run.
