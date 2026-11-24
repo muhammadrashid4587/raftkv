@@ -148,6 +148,24 @@ class Session:
             msg["ttl_entries"] = ttl_entries
         return self._write(msg)
 
+    def setex(self, key: str, value: str, seconds: int) -> dict:
+        """Write one key with a wall-clock TTL, Redis SETEX: the
+        key dies ``seconds`` wall-clock seconds after the leader
+        logs the entry — an absolute deadline fixed by the leader
+        at log time, so every replica applies the same deadline.
+        The opt-in alternative to a log-entry TTL: use it when the
+        expiry must be a duration in seconds, not a distance in
+        the log — and accept that two nodes' clocks may disagree
+        briefly about whether the key is alive, which a log-entry
+        TTL can never do. Like ``set`` it is a fresh life for the
+        key: any deadline it had (log or wall-clock) is dropped.
+        A write like ``set``: it appends a log entry, carries a
+        session request id, and advances the write watermark from
+        the reply's index."""
+        return self._write({"type": "client", "op": "setex",
+                            "key": key, "value": value,
+                            "seconds": seconds})
+
     def expire(self, key: str, entries: int) -> dict:
         """Set a deadline on a key that already exists: the key is
         purged when the log reaches this entry's index + ``entries``
@@ -209,6 +227,7 @@ class Session:
             {"op": "setrange", "key": k, "offset": n, "value": v}
             {"op": "setbit", "key": k, "offset": n, "bit": b}
             {"op": "pfadd", "key": k, "elements": [e1, e2, ...]}
+            {"op": "setex", "key": k, "value": v, "seconds": n}
 
         The whole list goes out in batches of ``depth`` on a single
         persistent socket without waiting between requests, and the
@@ -886,7 +905,10 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
     string key, an integer ``offset`` and a string value,
     ``setbit`` a string key, an integer ``offset`` and a bit
     that is 0 or 1, ``pfadd`` a string key and a non-empty list
-    of at most 1000 string elements."""
+    of at most 1000 string elements, ``setex`` a string key and
+    value plus an integer ``seconds`` from 1 to 1000000 — the
+    wall-clock TTL, whose absolute deadline the leader fixes at
+    log time."""
     if not isinstance(op, dict):
         return None, {"type": "client_response", "status": "error",
                       "error": "pipeline op must be an object with "
@@ -894,18 +916,19 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
     name = op.get("op")
     if name not in ("set", "del", "cas", "incr", "setnx", "getset",
                     "append", "getdel", "getex", "setrange", "setbit",
-                    "pfadd"):
+                    "pfadd", "setex"):
         return None, {"type": "client_response", "status": "error",
                       "error": "pipeline op must be set, del, cas, "
                                "incr, setnx, getset, append, "
-                               "getdel, getex, setrange, setbit, or "
-                               "pfadd"}
+                               "getdel, getex, setrange, setbit, "
+                               "pfadd, or setex"}
     key = op.get("key")
     if not isinstance(key, str):
         return None, {"type": "client_response", "status": "error",
                       "error": f"pipeline {name} needs a string key"}
     msg: dict = {"type": "client", "op": name, "key": key}
-    if name in ("set", "cas", "setnx", "getset", "append", "setrange"):
+    if name in ("set", "cas", "setnx", "getset", "append", "setrange",
+                "setex"):
         value = op.get("value")
         if not isinstance(value, str):
             return None, {"type": "client_response", "status": "error",
@@ -990,6 +1013,18 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
                           "error": "pipeline pfadd elements must be "
                                    "a list of 1 to 1000 strings"}
         msg["elements"] = list(elements)
+    if name == "setex":
+        # ``seconds`` rides along with a pipelined setex,
+        # validated here so a malformed one never goes on the
+        # wire: an integer number of wall-clock seconds,
+        # 1..1,000,000, the same bounds the server enforces.
+        seconds = op.get("seconds")
+        if (not isinstance(seconds, int) or isinstance(seconds, bool)
+                or seconds < 1 or seconds > 1_000_000):
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline setex seconds must be "
+                                   "an integer between 1 and 1000000"}
+        msg["seconds"] = seconds
     if name == "getex":
         # At most one expiry option rides along with a pipelined
         # getex, validated here so a malformed one never goes on
@@ -1049,7 +1084,7 @@ def pipeline(node_addr: tuple[str, int], ops: list,
 
     One ``set`` / ``del`` / ``cas`` / ``incr`` / ``setnx`` /
     ``getset`` / ``append`` / ``getdel`` / ``getex`` / ``setrange`` /
-    ``setbit`` / ``pfadd`` op per
+    ``setbit`` / ``pfadd`` / ``setex`` op per
     dict (see
     ``Session.pipeline`` for the shapes): the ops go out in
     batches of ``depth`` on a single persistent socket and the
@@ -1203,6 +1238,22 @@ def expire(node_addr: tuple[str, int], key: str, entries: int,
     return request(node_addr, {"type": "client", "op": "expire",
                                "key": key, "ttl_entries": entries},
                    timeout=timeout)
+
+
+def setex(node_addr: tuple[str, int], key: str, value: str,
+          seconds: int, timeout: float = 12.0) -> dict:
+    """Write one key with a wall-clock TTL, Redis SETEX, following
+    leader redirects like ``request``.
+
+    One request appends the setex entry, so the deadline is the
+    leader's wall clock at log time + ``seconds`` — an absolute
+    Unix time every replica applies, so the key dies everywhere at
+    the same wall-clock moment (up to clock skew between nodes).
+    The reply is the plain write response (``status`` ``ok`` with
+    the entry's index and term)."""
+    return request(node_addr, {"type": "client", "op": "setex",
+                               "key": key, "value": value,
+                               "seconds": seconds}, timeout=timeout)
 
 
 def incr(node_addr: tuple[str, int], key: str, by: int = 1,
@@ -1685,6 +1736,25 @@ def main(argv: list[str] | None = None) -> int:
     p_expire.add_argument("--request-id", default=None,
                           help="id of this write within the client "
                                "session")
+    p_setex = sub.add_parser(
+        "setex",
+        help="set a key with a wall-clock TTL, Redis SETEX: "
+             "prints OK; the key dies SECONDS wall-clock seconds "
+             "after the leader logs the entry, at the same absolute "
+             "deadline on every replica (up to clock skew)")
+    p_setex.add_argument("key")
+    p_setex.add_argument("value")
+    p_setex.add_argument("seconds", type=int,
+                         help="wall-clock seconds until the key is "
+                              "purged (1-1000000)")
+    p_setex.add_argument("--client-id", default=None,
+                         help="session id for at-most-once writes: a "
+                              "retry with the same client id + request "
+                              "id returns the first attempt's result "
+                              "instead of writing twice")
+    p_setex.add_argument("--request-id", default=None,
+                         help="id of this write within the client "
+                              "session")
     p_mget = sub.add_parser(
         "mget",
         help="read many keys with one request: prints the values as "
@@ -2004,7 +2074,7 @@ def main(argv: list[str] | None = None) -> int:
     if op in ("set", "get", "del", "cas", "ttl", "expire", "incr",
               "setnx", "getset", "append", "strlen", "getdel",
               "getex", "getrange", "setrange", "setbit", "getbit",
-              "pfadd", "pfcount"):
+              "pfadd", "pfcount", "setex"):
         msg["key"] = args.key
     elif op == "mset":
         if len(args.pairs) % 2:
@@ -2037,6 +2107,9 @@ def main(argv: list[str] | None = None) -> int:
         msg["value"] = args.value
     if op == "expire":
         msg["ttl_entries"] = args.entries
+    if op == "setex":
+        msg["value"] = args.value
+        msg["seconds"] = args.seconds
     if op == "incr":
         msg["by"] = args.by
     if op == "setnx":
@@ -2071,7 +2144,7 @@ def main(argv: list[str] | None = None) -> int:
         msg["elements"] = args.elements
     if op in ("set", "del", "cas", "mset", "expire", "incr", "setnx",
               "getset", "append", "getdel", "getex", "setrange",
-              "setbit", "pfadd") \
+              "setbit", "pfadd", "setex") \
             and args.request_id:
         # A request id without an explicit client id still dedups
         # within the default "cli" session; the same id retried from

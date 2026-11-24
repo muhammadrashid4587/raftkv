@@ -92,6 +92,20 @@ MAX_KEYS_SCAN = 1000
 # past any live cluster's log between snapshots, so it only rejects
 # nonsense, never a real use.
 TTL_MAX_ENTRIES = 1_000_000
+# Largest wall-clock TTL a ``setex`` may carry, in seconds. The
+# deadline is an absolute Unix time (now + seconds), so the cap
+# bounds how far ahead one key's deadline can sit — 1,000,000
+# seconds is about 11 days, far past any real cache TTL, so it
+# only rejects nonsense, never a real use. The same scale as the
+# log-entry TTL cap, for the same reason.
+WALL_TTL_MAX_SECONDS = 1_000_000
+# How often the background sweep checks for wall-clock deadlines
+# that have passed: a key dies at most this long after its
+# deadline even on a quiet cluster, with no log advance at all.
+# Reads purge first anyway (see _serve_read), so a read never
+# waits for the sweep — the sweep is what retires the key
+# (and fires its watch event) when nobody is reading it.
+WALL_TTL_SWEEP_INTERVAL = 0.1
 # Largest offset a ``setrange`` may carry. The offset bounds how
 # far past the current value one write may reach — past it the op
 # pads with zero bytes, so an unbounded offset would let one entry
@@ -512,6 +526,11 @@ class RaftNode:
         self._running = False
         self._server = None
         self._timer_thread: threading.Thread | None = None
+        # Last wall-clock sweep (monotonic seconds): the timer loop
+        # purges wall-expired keys at most every
+        # WALL_TTL_SWEEP_INTERVAL, so a quiet cluster still retires
+        # them promptly without scanning on every tick.
+        self._last_wall_sweep = 0.0
 
         self._load_persistent_state()
 
@@ -570,7 +589,8 @@ class RaftNode:
             self.snapshot_index = int(snap.get("last_included_index", 0))
             self.snapshot_term = int(snap.get("last_included_term", 0))
             self.sm.load(snap.get("state") or {},
-                         snap.get("expiry") or {})
+                         snap.get("expiry") or {},
+                         snap.get("wall_expiry") or {})
             # The dedup table for entries the snapshot covers: without
             # it a retry of a compacted-away write would append a
             # duplicate. The result is always ok once committed for
@@ -747,6 +767,16 @@ class RaftNode:
             # purged when those entries applied, so every deadline
             # here is still in the future.
             "expiry": self.sm.expiries(),
+            # The live wall-clock deadlines as of the snapshot
+            # index, alongside the log-entry ones: a node that
+            # installs this snapshot keeps expiring wall-clock
+            # keys on schedule instead of holding them forever.
+            # A wall deadline can already be past in wall-clock
+            # time when the snapshot is written (the key just
+            # has not been swept yet) — the sweep purges it on
+            # the installing node, so carrying it is still
+            # correct: it is a deadline, not a live key.
+            "wall_expiry": self.sm.wall_expiries(),
             "config": self._config_list(),
             # C-new while a joint transition is in flight: a snapshot
             # taken mid-transition carries it, so a follower that
@@ -1316,6 +1346,22 @@ class RaftNode:
         self._fail_pending_reads()
         self._reset_election_timer()
 
+    def _purge_wall_expired(self) -> list[str]:
+        """Drop every key whose wall-clock deadline has passed and
+        fire a ``del`` watch event per key, at the currently applied
+        index — the index the state reflects, so a watcher can order
+        the event against the log. Lock held. Called from three
+        places: the apply path (before each entry applies), the
+        background sweep in the timer loop (so a key dies on a quiet
+        cluster too), and the read path (so a read never returns a
+        key whose deadline passed between sweeps). Returns the
+        dropped keys, sorted."""
+        expired = self.sm.expire_wall_up_to(time.time())
+        for key in expired:
+            self.watch.notify(key, None, "del",
+                              index=self.last_applied)
+        return expired
+
     def _apply_committed(self) -> None:
         """Apply every committed-but-unapplied entry, in order. Lock held.
 
@@ -1341,6 +1387,15 @@ class RaftNode:
             for key in self.sm.expire_up_to(self.last_applied):
                 self.watch.notify(key, None, "del",
                                   index=self.last_applied)
+            # Wall-clock expiry runs the same way, before the entry
+            # applies: a key whose wall deadline passed since the
+            # last entry is gone before this entry's effect lands,
+            # with the same ``del`` watch event at this entry's
+            # index. The log advancing is not what moves this
+            # clock — the sweep and the read path purge too — but
+            # purging here keeps a busy cluster's purges in log
+            # order with the other events from this apply.
+            self._purge_wall_expired()
             # Membership commands are Raft state, not key-value data:
             # they update the config (and the address book) instead of
             # the state machine. A "noop" entry (appended by a new
@@ -1374,6 +1429,12 @@ class RaftNode:
                 # node sees exactly the changes that committed, and a
                 # failed CAS (no state change) fires nothing.
                 if op == "set":
+                    self.watch.notify(entry["command"]["key"],
+                                      entry["command"]["value"], "set",
+                                      index=self.last_applied)
+                elif op == "setex":
+                    # A setex writes like a set, so it fires like
+                    # one, with the value it wrote.
                     self.watch.notify(entry["command"]["key"],
                                       entry["command"]["value"], "set",
                                       index=self.last_applied)
@@ -2227,13 +2288,14 @@ class RaftNode:
         if op not in ("set", "get", "del", "cas", "ttl", "expire",
                       "incr", "setnx", "getset", "append", "strlen",
                       "getdel", "getrange", "setrange", "getex",
-                      "setbit", "getbit", "pfadd", "pfcount") \
+                      "setbit", "getbit", "pfadd", "pfcount",
+                      "setex") \
                 or key is None:
             return {"type": "client_response", "status": "error",
                     "error": "op must be set/get/del/cas/ttl/expire/"
                              "incr/setnx/getset/append/strlen/getdel/"
                              "getrange/setrange/getex/setbit/getbit/"
-                             "pfadd/pfcount "
+                             "pfadd/pfcount/setex "
                              "with a key"}
         if self._is_removed():
             return {"type": "client_response", "status": "error",
@@ -2367,7 +2429,8 @@ class RaftNode:
                                     session_term=session_term,
                                     stale_ok=bool(msg.get("stale_ok")))
         command = {"op": op, "key": key}
-        if op in ("set", "setnx", "getset", "append", "setrange"):
+        if op in ("set", "setnx", "getset", "append", "setrange",
+                  "setex"):
             command["value"] = msg.get("value")
         if op == "setnx":
             # Set-if-not-exists: the value is required, like a
@@ -2461,6 +2524,33 @@ class RaftNode:
                                  "1 to "
                                  f"{PFADD_MAX_ELEMENTS} strings"}
             command["elements"] = list(elements)
+        if op == "setex":
+            # Set a key with a wall-clock TTL, Redis SETEX: the
+            # value is required, like a set's — a setex with no
+            # value names nothing to write, so it is a client
+            # error and appends no log entry — and ``seconds``
+            # must be an integer from 1 to WALL_TTL_MAX_SECONDS.
+            # The absolute deadline is fixed here, on the leader,
+            # before the command is ever logged: time.time() +
+            # seconds, stored in the command itself, so every
+            # replica applies the same deadline and a replay or a
+            # snapshot restores it exactly. Fixing it at log time
+            # (rather than at apply time, when followers would
+            # each read their own clock) is what keeps the
+            # deadline identical across nodes; the leader's clock
+            # is the only one that decides when the key dies.
+            if msg.get("value") is None:
+                return {"type": "client_response", "status": "error",
+                        "error": "setex requires value"}
+            seconds = msg.get("seconds")
+            if (not isinstance(seconds, int) or isinstance(seconds, bool)
+                    or seconds < 1 or seconds > WALL_TTL_MAX_SECONDS):
+                return {"type": "client_response", "status": "error",
+                        "error": "setex seconds must be an integer "
+                                 "between 1 and "
+                                 f"{WALL_TTL_MAX_SECONDS}"}
+            command["seconds"] = seconds
+            command["wall_deadline"] = time.time() + seconds
         if op in ("set", "expire"):
             # A TTL, in log entries: the key lives until the log
             # reaches this entry's index + ttl_entries, then it is
@@ -3266,7 +3356,12 @@ class RaftNode:
             shifts after a miss — or ``keys`` plus ``truncated``
             and ``next_start_after`` for a scan, the matching keys
             in sorted order capped at the scan limit, resumed past
-            ``scan_start_after`` when one is given."""
+            ``scan_start_after`` when one is given. A read purges
+            wall-expired keys first, so it never returns a key
+            whose wall-clock deadline passed between sweeps — the
+            sweep retires the key when nobody is reading it, the
+            read retires it when somebody is."""
+            self._purge_wall_expired()
             if scan_prefix is not None:
                 # One page off the state machine's sorted index:
                 # bisect to the cursor, then walk at most the page
@@ -3283,10 +3378,21 @@ class RaftNode:
                 # has left, in Redis's -2/-1 convention, plus the
                 # deadline itself — measured against the applied
                 # index this reply names, so the number and the
-                # read index agree with each other.
+                # read index agree with each other. The wall-clock
+                # side rides along too: ``wall_ttl`` the whole
+                # seconds left until the wall deadline (-2 the key
+                # does not exist, -1 it exists with no wall
+                # deadline) and ``wall_deadline`` the absolute Unix
+                # time it dies at, or None without one — so a
+                # client can read back what a setex set, in the
+                # same reply as the log-entry TTL.
                 remaining, deadline = self.sm.ttl(ttl_key,
                                                   self.last_applied)
-                return {"ttl": remaining, "deadline": deadline}
+                wall_remaining, wall_deadline = self.sm.wall_ttl(
+                    ttl_key, time.time())
+                return {"ttl": remaining, "deadline": deadline,
+                        "wall_ttl": wall_remaining,
+                        "wall_deadline": wall_deadline}
             if strlen_key is not None:
                 # A length query: the length of the string value
                 # at this key, 0 for a missing key — Redis STRLEN.
@@ -4139,6 +4245,7 @@ class RaftNode:
     # ------------------------------------------------------------------
     def _timer_loop(self) -> None:
         while True:
+            sweep_due = False
             with self.lock:
                 if not self._running:
                     return
@@ -4161,8 +4268,21 @@ class RaftNode:
                     )
                     if heartbeat_due:
                         self._last_heartbeat_sent = now
+                    # Wall-clock sweep, at most every
+                    # WALL_TTL_SWEEP_INTERVAL: a key whose wall
+                    # deadline passed dies here even on a quiet
+                    # cluster, with no log advance and no read to
+                    # trigger the purge. Every role sweeps its own
+                    # state — a follower's wall-expired keys are
+                    # dead on the follower too, not just the leader.
+                    if now - self._last_wall_sweep >= WALL_TTL_SWEEP_INTERVAL:
+                        self._last_wall_sweep = now
+                        sweep_due = True
             if role == "leader" and heartbeat_due:
                 self._send_heartbeats()
             elif role != "leader" and timed_out:
                 self._run_election()
+            if sweep_due:
+                with self.lock:
+                    self._purge_wall_expired()
             time.sleep(0.005)

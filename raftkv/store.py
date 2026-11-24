@@ -159,6 +159,28 @@ class KVStore:
         # ``_keys``: replaying the log rebuilds it entry by entry,
         # and ``load`` restores it from the snapshot.
         self._expiry: dict[str, int] = {}
+        # Wall-clock expiry deadlines, the opt-in variant of the
+        # same idea: ``_wall_expiry[key]`` is the absolute Unix
+        # time (``time.time()`` seconds) at which the key stops
+        # existing, fixed once by the leader when the ``setex``
+        # entry was logged and stored in the entry itself — so
+        # every replica applies the same deadline, and replaying
+        # the log or installing a snapshot restores it exactly.
+        # The leader's clock is the only one that matters for
+        # the deadline; each node enforces it against its own
+        # clock (a background sweep plus a purge before serving
+        # a read — see RaftNode), so two nodes' clocks may
+        # disagree briefly about whether a key is alive, the
+        # way a wall-clock TTL always can. That is the honest
+        # limit of this variant, and why it is opt-in: the
+        # log-entry deadline above stays the default, and the
+        # two kinds never mix on one key — a fresh ``set`` (with
+        # or without a log TTL) drops the wall deadline, and a
+        # ``setex`` drops the log deadline, so a key holds at
+        # most one kind at a time. Derived state like ``_expiry``:
+        # replaying the log rebuilds it entry by entry, and
+        # ``load`` restores it from the snapshot.
+        self._wall_expiry: dict[str, float] = {}
 
     # Sentinel for "key absent": distinct from any value a client can
     # store, so a CAS against a missing key is distinguishable from a
@@ -188,7 +210,13 @@ class KVStore:
         batch expires together. A successful CAS keeps the key's
         deadline, and so does a successful incr and a getset:
         all three are updates of the value, not fresh sets, so
-        none must resurrect a key that is about to expire.
+        none must resurrect a key that is about to expire. A
+        ``setex`` carries an absolute wall-clock deadline
+        (``wall_deadline``, fixed by the leader before the entry
+        was logged) instead of a log distance: it is recorded
+        the same way, purged by the wall-clock path (see
+        ``expire_wall_up_to``) instead of the log path, and a
+        plain ``set`` clears it just as it clears a log deadline.
 
         Returns a result dict for commands whose outcome depends on the
         state at apply time — currently "cas", "expire", "incr",
@@ -215,6 +243,38 @@ class KVStore:
                 self._expiry[key] = index + ttl
             else:
                 self._expiry.pop(key, None)
+            # A fresh set drops the wall-clock deadline too: a
+            # key holds at most one kind of TTL, and a plain set
+            # is a new life for the key either way.
+            self._wall_expiry.pop(key, None)
+            return None
+        elif op == "setex":
+            # Set a key with a wall-clock TTL, Redis SETEX: the
+            # value is written like a ``set``, and the key dies
+            # when the wall clock reaches ``wall_deadline`` — an
+            # absolute Unix time, fixed once by the leader when
+            # the entry was logged and carried in the command
+            # itself, so every replica applies the same deadline
+            # and a replay or a snapshot restores it exactly.
+            # Like a plain set it is a fresh life for the key: any
+            # log-entry deadline the key had is dropped, so the
+            # two TTL kinds never mix on one key. The deadline
+            # needs no log index — it is already absolute — so
+            # ``index`` is unused here; a command without one
+            # raises instead of recording a deadline nobody
+            # could agree on. Returns None, like a set: the
+            # outcome is always ok once committed.
+            key = command["key"]
+            deadline = command.get("wall_deadline")
+            if deadline is None:
+                raise ValueError(
+                    "setex needs a wall_deadline computed by the "
+                    "leader before the entry was logged")
+            if key not in self._data:
+                bisect.insort(self._keys, key)
+            self._data[key] = command["value"]
+            self._expiry.pop(key, None)
+            self._wall_expiry[key] = float(deadline)
             return None
         elif op == "mset":
             # A batch set: every pair applies in order at this one
@@ -247,6 +307,10 @@ class KVStore:
                     self._expiry[key] = index + ttl
                 else:
                     self._expiry.pop(key, None)
+                # A fresh batch set drops any wall-clock deadline
+                # too, like a plain set: a key holds at most one
+                # kind of TTL.
+                self._wall_expiry.pop(key, None)
             return None
         elif op == "del":
             key = command["key"]
@@ -256,6 +320,7 @@ class KVStore:
                 if idx < len(self._keys) and self._keys[idx] == key:
                     del self._keys[idx]
             self._expiry.pop(key, None)
+            self._wall_expiry.pop(key, None)
             return None
         elif op == "expire":
             # Set a deadline on an existing key: the key is purged
@@ -379,6 +444,7 @@ class KVStore:
             bisect.insort(self._keys, key)
             self._data[key] = command["value"]
             self._expiry.pop(key, None)
+            self._wall_expiry.pop(key, None)
             return {"type": "client_response", "status": "ok",
                     "setnx": 1}
         elif op == "getset":
@@ -466,6 +532,7 @@ class KVStore:
             if idx < len(self._keys) and self._keys[idx] == key:
                 del self._keys[idx]
             self._expiry.pop(key, None)
+            self._wall_expiry.pop(key, None)
             return {"type": "client_response", "status": "ok",
                     "value": old, "getdel": 1}
         elif op == "getex":
@@ -535,6 +602,7 @@ class KVStore:
                     if idx < len(self._keys) and self._keys[idx] == key:
                         del self._keys[idx]
                     self._expiry.pop(key, None)
+                    self._wall_expiry.pop(key, None)
                     return {"type": "client_response", "status": "ok",
                             "value": None, "getex": 0, "deleted": True}
                 self._expiry[key] = deadline
@@ -763,6 +831,60 @@ class KVStore:
         instead of holding them forever."""
         return dict(self._expiry)
 
+    def expire_wall_up_to(self, now: float) -> list[str]:
+        """Drop every key whose wall-clock deadline is at or
+        before ``now`` (Unix seconds, ``time.time()``) and return
+        the dropped keys, sorted. The Raft layer calls this from
+        three places: before applying each log entry (so a key
+        whose wall deadline passed is gone before the next
+        entry's effect lands, like the log-entry purge), from a
+        background sweep thread (so a key also dies on a quiet
+        cluster, with no log advance at all), and before serving
+        a read (so a read never returns a key whose deadline
+        passed between sweeps). The order is sorted so watch
+        events fired for the expiry are deterministic across
+        nodes. Pure function of (state, now) — except for the
+        clock itself: two nodes may disagree briefly about
+        whether a key is alive, which is the honest limit of a
+        wall-clock TTL, and why it is opt-in."""
+        expired = sorted(k for k, d in self._wall_expiry.items()
+                         if d <= now)
+        for key in expired:
+            del self._wall_expiry[key]
+            if key in self._data:
+                del self._data[key]
+                idx = bisect.bisect_left(self._keys, key)
+                if idx < len(self._keys) and self._keys[idx] == key:
+                    del self._keys[idx]
+        return expired
+
+    def wall_expiries(self) -> dict[str, float]:
+        """The live wall-clock deadlines, as ``{key: deadline}``
+        in Unix seconds — what a snapshot carries alongside the
+        data and the log-entry deadlines, so a node that installs
+        the snapshot keeps expiring wall-clock keys on schedule
+        instead of holding them forever."""
+        return dict(self._wall_expiry)
+
+    def wall_ttl(self, key: str, now: float) -> tuple[int, float | None]:
+        """How many more wall-clock seconds ``key`` has left, as
+        of ``now`` — Redis's TTL, in seconds instead of log
+        entries: -2 when the key does not exist, -1 when it
+        exists with no wall-clock deadline, otherwise the whole
+        seconds left until the deadline. The second value is the
+        deadline itself — the absolute Unix time at which the key
+        is purged — or None without one. A key that exists with
+        a wall deadline always has at least zero seconds left:
+        the purge runs before the deadline is served, so a live
+        key can never sit past its own deadline. Pure read: no
+        log entry, no state change."""
+        if key not in self._data:
+            return -2, None
+        deadline = self._wall_expiry.get(key)
+        if deadline is None:
+            return -1, None
+        return max(0, int(deadline - now)), deadline
+
     def ttl(self, key: str, index: int) -> tuple[int, int | None]:
         """How many more log entries ``key`` has left, as of the
         state applied up to ``index`` — Redis's TTL, in log
@@ -928,7 +1050,8 @@ class KVStore:
         return page[:limit], truncated
 
     def load(self, state: dict[str, str],
-             expiry: dict[str, int] | None = None) -> None:
+             expiry: dict[str, int] | None = None,
+             wall_expiry: dict[str, float] | None = None) -> None:
         """Replace the whole state with ``state`` (used when installing
         a snapshot: the snapshot *is* the state as of its last included
         index, so anything the store held before is discarded). The
@@ -937,11 +1060,19 @@ class KVStore:
         replayed the log to the same state. ``expiry`` restores the
         deadlines the snapshot carries (``None`` for snapshots
         written before TTL existed: those hold no deadlines, so
-        nothing expires — exactly as the old nodes behaved)."""
+        nothing expires — exactly as the old nodes behaved).
+        ``wall_expiry`` restores the wall-clock deadlines the same
+        way (``None`` for snapshots written before wall-clock TTL
+        existed). Both maps are filtered to keys the snapshot
+        holds: a deadline for a key that is not in the state is
+        stale, not a key to resurrect."""
         self._data = dict(state)
         self._keys = sorted(state)
         self._expiry = {k: int(v) for k, v in (expiry or {}).items()
                         if k in self._data}
+        self._wall_expiry = {k: float(v)
+                             for k, v in (wall_expiry or {}).items()
+                             if k in self._data}
 
     def items(self) -> dict[str, str]:
         return dict(self._data)

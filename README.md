@@ -378,6 +378,37 @@ logic and the failure handling, not the key-value API on top.
   in the log, not seconds — a key expired with EX 10 lives for
   10 further log entries, however long those take in wall-clock
   time.
+- **Wall-clock TTL** — since v0.48.0 `setex key value seconds`
+  (`Session.setex(k, v, seconds)`, `client.setex(addr, k, v,
+  seconds)`, `setex key value seconds` on the CLI) writes the key
+  with a wall-clock TTL — Redis SETEX. The leader fixes the
+  absolute deadline (its wall clock at log time + seconds) in the
+  log entry itself, so every replica applies the same deadline,
+  and the key dies when the wall clock reaches it — enforced by
+  a background sweep every 100ms (so a key dies on a quiet
+  cluster too, with no log advance at all), by a purge before
+  each log entry applies, and by a purge before serving a read,
+  so a read never returns a key whose deadline passed between
+  sweeps. A plain `set` clears a wall deadline and a `setex`
+  clears a log deadline, so a key holds at most one kind of TTL;
+  a successful CAS or incr keeps the wall deadline, like it keeps
+  the log one. The deadline rides snapshots like any other, so a
+  node that installs one keeps expiring the key on schedule, and
+  expiry fires a `del` watch event like a log-entry expiry. The
+  `ttl` query reports the wall side too — `wall_ttl` the whole
+  seconds left (-2 the key does not exist, -1 it exists with no
+  wall deadline) and `wall_deadline` the absolute Unix time, or
+  None without one. It rides the same write path as a single
+  `set` — group-commit batching, dedup, the response's log index
+  advancing a session's watermark — and `{"op": "setex", "key":
+  k, "value": v, "seconds": n}` is a pipeline op too. Seconds
+  must be an integer from 1 to 1,000,000
+  (`WALL_TTL_MAX_SECONDS`); a bad value is a client error and
+  appends no log entry. The honest limit is the clock itself:
+  the deadline is identical on every node, but each node
+  enforces it against its own clock, so two nodes may disagree
+  briefly about whether a key is alive — which is why this is
+  opt-in, and the log-entry TTL stays the default.
 - **Bit operations** — since v0.46.0 `setbit key offset bit`
   (`Session.setbit(k, offset, bit)`, `client.setbit(addr, k,
   offset, bit)`, `setbit key offset bit` on the CLI) sets one
@@ -764,7 +795,7 @@ make test
 # or: python3 -m unittest discover -s tests -v
 ```
 
-406 tests, plus a smoke test for the benchmark script, all passing:
+466 tests, plus a smoke test for the benchmark script, all passing:
 
 | Test | What it proves |
 |---|---|
@@ -1025,6 +1056,23 @@ make test
 | `test_session_set_with_ttl` | Session.set takes ttl_entries, and read-your-writes still works before and after expiry |
 | `test_pipeline_set_with_ttl` | A pipelined set may carry ttl_entries; a malformed TTL is an error in its position and the ops around it still run |
 | `test_ttl_cli` | The `set --ttl-entries N` CLI writes the key with a deadline, and a bad TTL is rejected instead of writing |
+| `test_store_setex_records_wall_deadline` | A setex records its absolute wall deadline, alive before it and gone at it |
+| `test_store_setex_without_deadline_raises` | A setex with no wall deadline raises instead of recording one nobody could agree on |
+| `test_store_plain_set_mset_del_clear_wall_deadline` | A plain set, an mset pair, and a delete all drop the key's wall deadline |
+| `test_store_cas_and_incr_keep_wall_deadline` | A successful CAS and incr update the value but keep the wall deadline |
+| `test_store_setex_clears_log_deadline` | A setex drops the key's log-entry deadline — a key holds at most one kind of TTL |
+| `test_store_wall_ttl_remaining` | `KVStore.wall_ttl` answers in Redis's convention, in seconds, plus the absolute deadline |
+| `test_store_load_restores_wall_deadline` | A snapshot load restores the wall deadlines alongside the data |
+| `test_setex_readable_then_expires` | A key with a 1-second wall TTL is readable at once and gone past the deadline, on every node |
+| `test_ttl_query_reports_wall_deadline` | A TTL query reports `wall_ttl` and `wall_deadline` while the log-entry TTL stays -1 |
+| `test_setex_rejects_bad_seconds` | Seconds of 0, negative, non-integer, or past the cap is a client error and appends no log entry |
+| `test_plain_set_clears_wall_deadline_on_cluster` | Re-setting a key without a TTL clears its wall deadline on the cluster |
+| `test_wall_expiry_fires_del_watch_event` | A watch fires a del event once the wall deadline passes, with no log entry landing |
+| `test_wall_deadline_survives_snapshot_and_restart` | A wall deadline survives log compaction and a restart, and the key still expires at its original deadline |
+| `test_expired_key_leaves_sorted_scan` | A key that expires by the wall clock disappears from the keys scan too |
+| `test_session_setex` | Session.setex writes with a wall TTL, and read-your-writes still works before and after expiry |
+| `test_pipeline_setex` | A pipelined setex may carry seconds; a malformed value is an error in its position |
+| `test_setex_cli` | The `setex` CLI writes the key with a wall deadline, and a bad seconds value is rejected instead of writing |
 | `test_store_expire_sets_deadline_at_apply_index` | An expire at index 11 with 5 entries sets the deadline to 16 — alive at 15, gone at 16 |
 | `test_store_expire_missing_key_returns_zero` | Expiring a missing key answers 0, records no deadline, and touches no other key |
 | `test_store_expire_replaces_deadline` | Re-expiring replaces the deadline, whether it came from a set TTL or an earlier expire |
@@ -2306,7 +2354,42 @@ entries left in `log.jsonl` are dropped by their index on reload.
   continuing after a leader change, surviving a snapshot +
   restart, session read-your-writes, pipelined pfadd ops with
   malformed ops in position, and the CLI end to end.
+- ~~Wall-clock TTL (setex)~~ — done in v0.48.0,
+  Nov 24, 2026: `setex key value seconds` writes the key with a
+  wall-clock TTL — Redis SETEX — the leader fixing the absolute
+  deadline (its wall clock at log time + seconds) in the log
+  entry itself, so every replica applies the same deadline, and
+  the key dies when the wall clock reaches it: a background sweep
+  every 100ms, a purge before each log entry applies, and a purge
+  before serving a read, so a read never returns a key whose
+  deadline passed between sweeps. A plain `set` clears a wall
+  deadline and a `setex` clears a log deadline, so a key holds at
+  most one kind of TTL; a successful CAS or incr keeps the wall
+  deadline, like it keeps the log one; the deadline rides
+  snapshots, and expiry fires a `del` watch event. The `ttl`
+  query reports the wall side too — `wall_ttl` the seconds left
+  and `wall_deadline` the absolute Unix time. Seconds must be an
+  integer from 1 to 1,000,000 (`WALL_TTL_MAX_SECONDS`); a bad
+  value is a client error and appends no log entry. It rides the
+  same write path as a `set` (group-commit batching, dedup,
+  session watermark), and `{"op": "setex"}` is a pipeline op too.
+  `Session.setex`, `client.setex`, and `setex key value seconds`
+  on the CLI expose it. `tests/test_wall_ttl.py` proves it:
+  store-level setex recording its absolute deadline, a missing
+  deadline raising, plain set / mset / del clearing the wall
+  deadline, CAS and incr keeping it, setex clearing the log
+  deadline, `wall_ttl` in Redis's convention, and a snapshot load
+  restoring the wall deadlines; replication to every node with
+  the key readable then gone past the deadline, the TTL query
+  reporting the wall deadline, bad seconds rejected with no log
+  entry, a plain set clearing the wall deadline on the cluster,
+  the `del` watch event firing from the sweep with no log entry,
+  surviving a snapshot + restart with the key still expiring at
+  its original deadline, the expired key leaving the sorted
+  scan, session read-your-writes, pipelined setex ops with a bad
+  seconds value in position, and the CLI end to end.
   The roadmap is exhausted again, so the next real thing is
   a new roadmap item grounded in this project's purpose,
-  proposed by the next run — candidates: a wall-clock TTL
-  variant.
+  proposed by the next run — candidates: a wall-clock
+  `expireat` / `pexpireat` (set an absolute wall-clock deadline
+  on an existing key), or SET with NX / XX / KEEPTTL flags.
