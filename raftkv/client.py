@@ -135,17 +135,36 @@ class Session:
         return resp
 
     def set(self, key: str, value: str,
-            ttl_entries: int | None = None) -> dict:
+            ttl_entries: int | None = None,
+            nx: bool = False, xx: bool = False,
+            keepttl: bool = False) -> dict:
         """Write one key. With ``ttl_entries`` (a positive number
         of log entries) the key expires when the log reaches this
         entry's index + ``ttl_entries`` — a distance in the log,
         not a duration in seconds, so every node agrees on when
         the key goes (see KVStore). Without it the write clears
-        any deadline the key had."""
+        any deadline the key had. With ``nx`` the write happens
+        only when the key does not exist, with ``xx`` only when
+        it does — Redis SET NX / XX — and the reply carries
+        ``set`` 1 when the key was written, 0 when the condition
+        failed and nothing changed. With ``keepttl`` the write
+        keeps whatever deadline the key had instead of clearing
+        it — Redis SET KEEPTTL. The outcome is decided at apply
+        time, at the entry's exact position in the log, like a
+        CAS: a retry with the same session id returns the first
+        attempt's result instead of writing twice. NX and XX
+        together, or KEEPTTL with a TTL, is a client error — the
+        server rejects it and appends no log entry."""
         msg: dict = {"type": "client", "op": "set",
                      "key": key, "value": value}
         if ttl_entries is not None:
             msg["ttl_entries"] = ttl_entries
+        if nx:
+            msg["nx"] = True
+        if xx:
+            msg["xx"] = True
+        if keepttl:
+            msg["keepttl"] = True
         return self._write(msg)
 
     def setex(self, key: str, value: str, seconds: int) -> dict:
@@ -251,6 +270,9 @@ class Session:
 
             {"op": "set", "key": k, "value": v}
             {"op": "set", "key": k, "value": v, "ttl_entries": n}
+            {"op": "set", "key": k, "value": v, "nx": True}
+            {"op": "set", "key": k, "value": v, "xx": True}
+            {"op": "set", "key": k, "value": v, "keepttl": True}
             {"op": "del", "key": k}
             {"op": "cas", "key": k, "expected": e, "value": v}
             {"op": "incr", "key": k, "by": n}
@@ -933,7 +955,11 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
     Returns (message, None) for a well-formed op, or (None, error
     response) when the op is malformed — the error goes in the
     op's reply position and nothing goes on the wire for it.
-    ``set`` needs a string key and value, ``del`` a string key,
+    ``set`` needs a string key and value, and may carry
+    ``ttl_entries`` (an integer number of log entries,
+    1..1000000) and the bare boolean flags ``nx`` / ``xx`` /
+    ``keepttl`` — NX and XX never together, KEEPTTL never with
+    a TTL — ``del`` a string key,
     ``cas`` a string key, expected, and value, ``incr`` a string
     key and an integer ``by`` (default 1), ``setnx`` a string key
     and value, ``getset`` a string key and value, ``append`` a
@@ -988,6 +1014,31 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
                           "error": "pipeline set ttl_entries must be "
                                    "an integer between 1 and 1000000"}
         msg["ttl_entries"] = ttl
+    if name == "set":
+        # NX / XX / KEEPTTL ride along with a pipelined set,
+        # validated here so a malformed one never goes on the
+        # wire: bare boolean flags, NX and XX never together,
+        # KEEPTTL never with a TTL — the same shapes the server
+        # enforces.
+        for field in ("nx", "xx", "keepttl"):
+            if (op.get(field) is not None
+                    and op[field] is not True):
+                return None, {"type": "client_response",
+                              "status": "error",
+                              "error": f"pipeline set {field.upper()} "
+                                       "takes no argument"}
+        if op.get("nx") and op.get("xx"):
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline set NX and XX are "
+                                   "mutually exclusive"}
+        if (op.get("keepttl")
+                and op.get("ttl_entries") is not None):
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline set KEEPTTL cannot be "
+                                   "combined with ttl_entries"}
+        for field in ("nx", "xx", "keepttl"):
+            if op.get(field):
+                msg[field] = True
     if name == "cas":
         expected = op.get("expected")
         if not isinstance(expected, str):
@@ -1751,6 +1802,18 @@ def main(argv: list[str] | None = None) -> int:
                             "log entries: the key lives until the log "
                             "reaches this entry's index + ttl-entries "
                             "(a distance in the log, not seconds)")
+    g_set = p_set.add_mutually_exclusive_group()
+    g_set.add_argument("--nx", action="store_true",
+                       help="set only when the key does not exist "
+                            "(Redis NX): prints 1 when the key was "
+                            "written, 0 when it already existed")
+    g_set.add_argument("--xx", action="store_true",
+                       help="set only when the key exists (Redis "
+                            "XX): prints 1 when the key was written, "
+                            "0 when it did not exist")
+    p_set.add_argument("--keepttl", action="store_true",
+                       help="keep the key's existing TTL instead of "
+                            "clearing it (Redis KEEPTTL)")
     p_set.add_argument("--client-id", default=None,
                        help="session id for at-most-once writes: a retry "
                             "with the same client id + request id returns "
@@ -2245,6 +2308,12 @@ def main(argv: list[str] | None = None) -> int:
         msg["value"] = args.value
         if args.ttl_entries is not None:
             msg["ttl_entries"] = args.ttl_entries
+        if args.nx:
+            msg["nx"] = True
+        if args.xx:
+            msg["xx"] = True
+        if args.keepttl:
+            msg["keepttl"] = True
     if op == "mset":
         if args.ttl_entries is not None:
             msg["ttl_entries"] = args.ttl_entries
@@ -2365,6 +2434,10 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(resp.get("values")))
         elif op == "keys":
             print(json.dumps(resp.get("keys")))
+        elif op == "set" and (args.nx or args.xx):
+            # A conditional set prints whether it wrote, like
+            # setnx does — a plain set prints OK below.
+            print(resp.get("set"))
         else:
             print("OK")
         return 0

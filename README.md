@@ -443,6 +443,31 @@ logic and the failure handling, not the key-value API on top.
   deadline. The honest limit is the same clock as `setex`: the
   deadline is identical on every node, but each node enforces
   it against its own clock.
+- **SET NX / XX / KEEPTTL** — since v0.50.0 `set key value
+  [--nx | --xx] [--keepttl]` (`Session.set(k, v, nx=True, ...)`,
+  `set key value --nx` on the CLI) carries Redis's SET options:
+  NX sets only when the key does not exist, XX only when it
+  does, and KEEPTTL preserves the deadline a plain set would
+  clear — log-entry or wall-clock — instead of dropping it. The
+  reply carries `set` 1 when the key was written, 0 when the
+  condition failed and nothing changed, so a plain set answers
+  `set` 1 too. The outcome is decided at apply time, at the
+  entry's exact position in the log, like a CAS: two concurrent
+  conditional sets race in log order and exactly one wins, and
+  a retry with the same session id returns the first attempt's
+  result instead of setting twice. A losing set writes nothing
+  at all — the value and any deadline stay exactly as they
+  were — and fires no watch event; a winning one fires a `set`
+  event with the new value, like a plain set. NX and XX
+  together, or KEEPTTL with a fresh TTL, is a client error and
+  appends no log entry. It rides the same write path as a
+  single `set` — group-commit batching, dedup, the response's
+  log index advancing a session's watermark — and `{"op":
+  "set", "key": k, "value": v, "nx": true}` is a pipeline op
+  too. The honest limit is the same one every single-key
+  conditional write has: NX is a claim, not a lease — a key
+  claimed by NX lives until it is deleted or overwritten, so
+  pair it with a TTL for a lock with an expiry.
 - **Bit operations** — since v0.46.0 `setbit key offset bit`
   (`Session.setbit(k, offset, bit)`, `client.setbit(addr, k,
   offset, bit)`, `setbit key offset bit` on the CLI) sets one
@@ -1138,6 +1163,29 @@ make test
 | `test_expire_retry_with_same_request_id_appends_once` | A retried expire returns the first attempt's result and appends no second entry, so the deadline is not pushed out |
 | `test_session_expire_is_read_your_writes` | Session.expire sets the deadline, advances the watermark, and a read after it sees the key until it expires |
 | `test_expire_cli` | The `expire` CLI prints 1 for an existing key and 0 for a missing one, and a bad count is rejected |
+| `test_store_plain_set_answers_one` | A plain set applies and answers `set` 1, with the value stored |
+| `test_store_set_nx_wins_on_missing_key` | An NX set on a missing key answers 1 and writes the value |
+| `test_store_set_nx_loses_on_existing_key` | An NX set on an existing key answers 0, and the value and deadline are untouched |
+| `test_store_set_xx_wins_on_existing_key` | An XX set on an existing key answers 1 and overwrites the value |
+| `test_store_set_xx_loses_on_missing_key` | An XX set on a missing key answers 0, and the key stays absent |
+| `test_store_set_nx_after_delete_wins` | An NX set wins again after the key was deleted — existence is live state, not history |
+| `test_store_set_keepttl_keeps_log_deadline` | A KEEPTTL overwrite changes the value but keeps the log-entry deadline; a plain set after it clears it |
+| `test_store_set_keepttl_keeps_wall_deadline` | A KEEPTTL overwrite keeps the wall-clock deadline; a plain set after it clears it |
+| `test_store_set_keepttl_on_missing_key_records_no_deadline` | A KEEPTTL set of a new key answers 1 and records no deadline |
+| `test_store_set_xx_with_keepttl_keeps_deadline` | XX with KEEPTTL composes: the write happens and the deadline is kept, and a losing XX writes nothing |
+| `test_set_nx_xx_replicate` | A winning NX and a winning XX replicate to every node |
+| `test_set_nx_loses_on_existing_key_everywhere` | A losing NX changes the value on no node |
+| `test_set_xx_loses_on_missing_key_everywhere` | A losing XX leaves the key absent on every node |
+| `test_set_flags_rejected_with_no_log_entry` | NX with XX, KEEPTTL with a TTL, or a non-boolean flag is a client error and appends no log entry |
+| `test_set_retry_returns_first_outcome` | A retried winning NX returns 1 and a retried losing NX returns 0, each appending no second entry |
+| `test_set_keepttl_keeps_deadline_on_cluster` | A KEEPTTL overwrite keeps the same deadline on the cluster; a plain set clears it |
+| `test_set_keepttl_keeps_wall_deadline_on_cluster` | A KEEPTTL overwrite keeps the wall deadline on the cluster |
+| `test_set_fires_watch_event_only_on_win` | A watch fires on a winning set on leader and follower, and nothing on a losing NX or XX |
+| `test_set_continues_after_leader_change` | A conditional set keeps working after a leader change, deciding against the new leader's state |
+| `test_set_flags_survive_snapshot_and_restart` | A conditional set survives compaction and a restart — the key is still there, so NX still loses |
+| `test_session_set_flags_is_read_your_writes` | Session.set with NX / XX answers 1 / 0, advances the watermark even on a losing set, and reads see the write |
+| `test_pipeline_set_flags` | Pipelined set ops carry NX / XX / KEEPTTL; malformed flag combinations are errors in position |
+| `test_set_flags_cli` | The `set` CLI prints 1 / 0 for --nx / --xx, rejects --nx with --xx as a usage error, and keeps the deadline with --keepttl |
 
 Tests use real nodes (real TCP, real threads, real disk) on localhost —
 no mocks of the consensus path.
@@ -2476,7 +2524,39 @@ entries left in `log.jsonl` are dropped by their index on reload.
   deadline on the cluster, session read-your-writes, pipelined
   expireat / pexpireat ops with a bad timestamp in position, and
   the CLI end to end.
+- ~~SET with NX / XX / KEEPTTL flags~~ — done in v0.50.0,
+  Nov 24, 2026: `set key value [--nx | --xx] [--keepttl]` carries
+  Redis's SET options — NX sets only when the key does not exist,
+  XX only when it does, KEEPTTL preserves the deadline a plain set
+  would clear (log-entry or wall-clock) — decided at apply time
+  like a CAS, so a retry with the same session id returns the
+  first attempt's result instead of setting twice. The reply
+  carries `set` 1 when the key was written, 0 when the condition
+  failed; a losing set writes nothing at all and fires no watch
+  event, a winning one fires a `set` event with the new value.
+  NX and XX together, or KEEPTTL with a fresh TTL, is a client
+  error and appends no log entry. A plain `set` answers `set` 1
+  too. `{"op": "set", "key": k, "value": v, "nx": true}` is a
+  pipeline op too. `Session.set` and `set` on the CLI expose
+  them.
+  `tests/test_set_flags.py` proves them: store-level plain set
+  answering 1, NX winning on a missing key and losing on an
+  existing one with value and deadline untouched, XX winning on
+  an existing key and losing on a missing one with the key still
+  absent, NX winning again after a delete, KEEPTTL keeping a
+  log-entry deadline and a wall-clock deadline across an
+  overwrite, KEEPTTL on a missing key recording no deadline, and
+  XX with KEEPTTL composing; replication to every node, a losing
+  NX and a losing XX changing nothing on any node, invalid flag
+  combinations rejected with no log entry, dedup of a winning
+  and a losing retry returning the first attempt's result,
+  KEEPTTL keeping both kinds of deadline on the cluster, the
+  watch event firing only on a win, continuing after a leader
+  change, surviving a snapshot + restart, session
+  read-your-writes with the watermark advancing on a losing set
+  too, pipelined set ops with flags and malformed ops in
+  position, and the CLI end to end.
   The roadmap is exhausted again, so the next real thing is
   a new roadmap item grounded in this project's purpose,
-  proposed by the next run — candidate: SET with NX / XX /
-  KEEPTTL flags.
+  proposed by the next run — candidate: SET with GET (return the
+  old value atomically, Redis's GET option).

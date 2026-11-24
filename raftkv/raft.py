@@ -1408,7 +1408,7 @@ class RaftNode:
             elif op == "noop":
                 pass
             else:
-                # The apply result matters for CAS, expire,
+                # The apply result matters for set, CAS, expire,
                 # expireat, pexpireat, incr, setnx, getset,
                 # append, getdel, setrange, getex, setbit, and
                 # pfadd:
@@ -1418,7 +1418,7 @@ class RaftNode:
                 # (a retry gets the first attempt's outcome, not a
                 # re-execution) and, while this node is the leader,
                 # by log index for the waiter that submitted the entry
-                # (see _flush_write_batch). Set/del return None: their
+                # (see _flush_write_batch). Del returns None: its
                 # outcome is always ok. The index rides along so a
                 # ``set`` with a TTL — or an ``expire`` — can record
                 # its deadline (index + ttl_entries) deterministically.
@@ -1429,7 +1429,11 @@ class RaftNode:
                 # order, from the apply path — so a watcher on any
                 # node sees exactly the changes that committed, and a
                 # failed CAS (no state change) fires nothing.
-                if op == "set":
+                if (op == "set" and result is not None
+                        and result.get("set") == 1):
+                    # A winning set fires like a set always did;
+                    # a set that lost on NX / XX wrote nothing,
+                    # so it fires nothing, like a failed CAS.
                     self.watch.notify(entry["command"]["key"],
                                       entry["command"]["value"], "set",
                                       index=self.last_applied)
@@ -1546,7 +1550,8 @@ class RaftNode:
                                       self.sm.get(entry["command"]["key"]),
                                       "set",
                                       index=self.last_applied)
-                if (op in ("cas", "expire", "expireat", "pexpireat",
+                if (op in ("set", "cas", "expire", "expireat",
+                           "pexpireat",
                            "incr", "setnx", "getset",
                            "append", "getdel", "setrange", "getex",
                            "setbit", "pfadd")
@@ -1560,10 +1565,10 @@ class RaftNode:
                     # would sit in _apply_results forever. A write
                     # without a session id has no dedup key, so it
                     # always records: its waiter is identified by
-                    # index alone. CAS, expire, expireat, pexpireat,
+                    # index alone. Set, CAS, expire, expireat, pexpireat,
                     # incr, setnx, getset, append, getdel, setrange,
                     # getex, setbit, and pfadd are the ops
-                    # whose apply returns a result — a set/del
+                    # whose apply returns a result — a del
                     # returns None and has nothing to record.
                     key = _dedup_key(entry["command"])
                     if key is None or key in self._dedup_inflight:
@@ -1597,8 +1602,10 @@ class RaftNode:
                       term: int | None = None) -> None:
         """Record an applied client write in the dedup table. Lock held.
         The cached result is what a retry with the same session id gets
-        back instead of a second log entry. For set/del the result is
-        always ok once committed; for CAS, expire, expireat,
+        back instead of a second log entry. For del the result is
+        always ok once committed; for a set it is 1 or 0 — whether
+        the write happened (a set that lost on NX / XX answers 0);
+        for CAS, expire, expireat,
         pexpireat, incr, setnx,
         getset, append, getdel, setrange, getex, setbit, and pfadd
         it is the
@@ -2624,6 +2631,37 @@ class RaftNode:
             elif op == "expire":
                 return {"type": "client_response", "status": "error",
                         "error": "expire requires ttl_entries"}
+        if op == "set":
+            # Redis SET options, decided at apply time like a
+            # CAS, not here: NX sets only when the key does not
+            # exist, XX only when it does, KEEPTTL preserves the
+            # deadline a plain set would clear. Validated here,
+            # on the leader, before the command is ever logged —
+            # NX and XX are mutually exclusive (Redis rejects the
+            # combination), KEEPTTL cannot ride with a fresh TTL
+            # (Redis rejects that combination too), and each flag
+            # is a bare boolean, so a malformed flag is a client
+            # error, not a log entry. Whether the key exists, and
+            # what the deadline becomes, is the entry's result.
+            for field in ("nx", "xx", "keepttl"):
+                if (msg.get(field) is not None
+                        and msg[field] is not True):
+                    return {"type": "client_response",
+                            "status": "error",
+                            "error": f"set {field.upper()} takes no "
+                                     "argument"}
+            if msg.get("nx") and msg.get("xx"):
+                return {"type": "client_response", "status": "error",
+                        "error": "set NX and XX are mutually "
+                                 "exclusive"}
+            if (msg.get("keepttl")
+                    and msg.get("ttl_entries") is not None):
+                return {"type": "client_response", "status": "error",
+                        "error": "set KEEPTTL cannot be combined "
+                                 "with ttl_entries"}
+            for field in ("nx", "xx", "keepttl"):
+                if msg.get(field):
+                    command[field] = True
         if op == "getex":
             # Get the value and optionally set, refresh, or clear
             # its expiry in the same atomic operation, Redis
@@ -3210,8 +3248,8 @@ class RaftNode:
         # dedup table already holds it via _apply_committed) or the
         # batch failed (so nothing was appended), and a retry arriving
         # after this point takes the _dedup path or appends fresh.
-        # A waiter whose entry has an apply-time result (a CAS, an
-        # expire, an expireat / pexpireat, or a getex) gets that
+        # A waiter whose entry has an apply-time result (a set, a CAS,
+        # an expire, an expireat / pexpireat, or a getex) gets that
         # result, not the shared ok: the outcome was
         # decided when the entry applied, and the waiter must learn it,
         # not just that the entry committed. Apply results for this

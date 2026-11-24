@@ -206,7 +206,17 @@ class KVStore:
         (unit tests, mostly) pass no TTL. A plain ``set`` without
         a TTL clears any deadline the key had — like Redis, a
         fresh SET drops the old TTL — and so do an ``mset``
-        without a TTL and ``del``. An ``mset`` carrying
+        without a TTL and ``del``. A ``set`` carrying NX or XX is
+        conditional instead of unconditional: NX writes only
+        when the key does not exist, XX only when it does, and
+        a losing set writes nothing at all — the value and any
+        deadline stay exactly as they were — and answers ``set``
+        0, while a winning one answers ``set`` 1. A ``set``
+        carrying KEEPTTL preserves whatever deadline the key
+        had (log-entry or wall-clock) instead of clearing it
+        like a plain set; a set carrying ``ttl_entries`` records
+        a fresh deadline instead, and drops the wall one, so a
+        key still holds at most one kind of TTL. An ``mset`` carrying
         ``ttl_entries`` sets the same deadline (its entry's
         index + the TTL) on every pair it touches, so the whole
         batch expires together. A successful CAS keeps the key's
@@ -221,10 +231,10 @@ class KVStore:
         plain ``set`` clears it just as it clears a log deadline.
 
         Returns a result dict for commands whose outcome depends on the
-        state at apply time — currently "cas", "expire", "expireat",
+        state at apply time — currently "set", "cas", "expire", "expireat",
         "pexpireat", "incr", "setnx", "getset", "append", "getdel",
         "setrange", "getex", "setbit", and "pfadd" —
-        and None for set/del, whose outcome is always ok. The result is
+        and None for del, whose outcome is always ok. The result is
         what the leader hands back to the waiting client and what the
         dedup table caches for retries, so it must be a pure function
         of (state before, command): every node applying the same log
@@ -232,7 +242,30 @@ class KVStore:
         """
         op = command.get("op")
         if op == "set":
+            # A plain set writes unconditionally, but a set may
+            # also carry Redis's conditional flags, decided here,
+            # at this exact point in the log, like a CAS: NX sets
+            # only when the key does not exist, XX only when it
+            # does — a losing set writes nothing, leaves the value
+            # and any deadline untouched, and answers ``set`` 0,
+            # while a winning one answers ``set`` 1. KEEPTTL
+            # preserves whatever deadline the key had (log-entry
+            # or wall-clock) instead of clearing it like a plain
+            # set; without it a fresh set is a new life for the
+            # key and both deadlines are dropped, and a set
+            # carrying ``ttl_entries`` records a fresh deadline
+            # instead. The flags were validated on the leader
+            # before the entry was logged — NX and XX never
+            # together, KEEPTTL never with a TTL — so by apply
+            # time they are well-formed.
             key = command["key"]
+            if command.get("nx") and key in self._data:
+                return {"type": "client_response", "status": "ok",
+                        "set": 0}
+            if command.get("xx") and key not in self._data:
+                return {"type": "client_response", "status": "ok",
+                        "set": 0}
+            keepttl = bool(command.get("keepttl"))
             if key not in self._data:
                 bisect.insort(self._keys, key)
             self._data[key] = command["value"]
@@ -243,13 +276,23 @@ class KVStore:
                         "ttl_entries needs the log index of the "
                         "entry being applied")
                 self._expiry[key] = index + ttl
+                # An explicit TTL is a fresh life on the wall
+                # side too: the wall deadline is dropped, so a
+                # key still holds at most one kind of TTL.
+                self._wall_expiry.pop(key, None)
+            elif keepttl:
+                # KEEPTTL keeps both deadlines exactly as they
+                # were — a missing key has none to keep, so a
+                # KEEPTTL set of a new key simply records none.
+                pass
             else:
                 self._expiry.pop(key, None)
-            # A fresh set drops the wall-clock deadline too: a
-            # key holds at most one kind of TTL, and a plain set
-            # is a new life for the key either way.
-            self._wall_expiry.pop(key, None)
-            return None
+                # A fresh set drops the wall-clock deadline too:
+                # a key holds at most one kind of TTL, and a
+                # plain set is a new life for the key either way.
+                self._wall_expiry.pop(key, None)
+            return {"type": "client_response", "status": "ok",
+                    "set": 1}
         elif op == "setex":
             # Set a key with a wall-clock TTL, Redis SETEX: the
             # value is written like a ``set``, and the key dies
@@ -264,7 +307,7 @@ class KVStore:
             # needs no log index — it is already absolute — so
             # ``index`` is unused here; a command without one
             # raises instead of recording a deadline nobody
-            # could agree on. Returns None, like a set: the
+            # could agree on. Returns None, like a del: the
             # outcome is always ok once committed.
             key = command["key"]
             deadline = command.get("wall_deadline")
