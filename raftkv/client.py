@@ -130,7 +130,7 @@ class Session:
                 in ("ok", "cas_failed", "incr_failed",
                     "incrbyfloat_failed", "append_failed",
                     "setrange_failed", "setbit_failed",
-                    "pfadd_failed", "hset_failed")
+                    "pfadd_failed", "hset_failed", "hdel_failed")
                 and resp.get("index") is not None):
             self.last_write_index = int(resp["index"])
             self.last_write_term = int(resp.get("term") or 0)
@@ -409,7 +409,7 @@ class Session:
                             "incrbyfloat_failed",
                             "append_failed", "setrange_failed",
                             "setbit_failed", "pfadd_failed",
-                            "hset_failed")
+                            "hset_failed", "hdel_failed")
                         and resp.get("index") is not None):
                     index = int(resp["index"])
                     if index > self.last_write_index:
@@ -764,6 +764,23 @@ class Session:
                             "pairs": [[f, v]
                                       for f, v in fields.items()]})
 
+    def hdel(self, key: str, *fields: str) -> dict:
+        """Delete ``fields`` from the hash at ``key``, Redis HDEL:
+        the reply carries ``hdel`` — the number of fields actually
+        removed (a missing key or a missing field counts 0, and
+        removing the last field deletes the key outright). The
+        outcome is decided at apply time, at the entry's position
+        in the log, so a retry with the same session id returns
+        the first attempt's count instead of deleting twice, and
+        an hdel that leaves fields behind keeps the key's TTL
+        deadline, like an hset. A plain string value fails with
+        ``hdel_failed`` and reason ``wrongtype`` instead of
+        writing. A successful hdel advances the write watermark
+        from the reply's index, like any other write — and so
+        does a failed one, since it still committed its entry."""
+        return self._write({"type": "client", "op": "hdel",
+                            "key": key, "fields": list(fields)})
+
     def hget(self, key: str, field: str) -> dict:
         """Ask for the value of ``field`` in the hash at ``key``,
         Redis HGET: None when the key does not exist or the field
@@ -782,6 +799,35 @@ class Session:
             term = self.last_write_term
         msg: dict = {"type": "client", "op": "hget", "key": key,
                      "field": field,
+                     "client_id": self.client_id,
+                     "min_commit_index": min_index,
+                     "session_term": term}
+        resp = request(self.node_addr, msg, pool=self._pooled)
+        if (resp.get("status") == "ok"
+                and resp.get("read_index") is not None):
+            read_index = int(resp["read_index"])
+            if read_index > self.last_read_index:
+                self.last_read_index = read_index
+                self.last_read_term = int(resp.get("read_term") or 0)
+        return resp
+
+    def hgetall(self, key: str) -> dict:
+        """Ask for every field and value in the hash at ``key``,
+        Redis HGETALL: an empty dict when the key does not exist,
+        and a client error — not a field map — when the key holds
+        a plain string. It rides the same ReadIndex path as
+        ``get``, so it carries the same session watermark and
+        advances the read watermark from the reply's
+        ``read_index`` exactly the same way: a field map queried
+        after your own write shows the fields that write set,
+        and a later read never goes backwards past it."""
+        if self.last_read_index > self.last_write_index:
+            min_index = self.last_read_index
+            term = self.last_read_term
+        else:
+            min_index = self.last_write_index
+            term = self.last_write_term
+        msg: dict = {"type": "client", "op": "hgetall", "key": key,
                      "client_id": self.client_id,
                      "min_commit_index": min_index,
                      "session_term": term}
@@ -1086,7 +1132,8 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
     that is 0 or 1, ``pfadd`` a string key and a non-empty list
     of at most 1000 string elements, ``hset`` a string key and a
     non-empty list of at most 1000 [field, value] string pairs,
-    ``setex`` a string key and
+    ``hdel`` a string key and a non-empty list of at most 1000
+    string fields, ``setex`` a string key and
     value plus an integer ``seconds`` from 1 to 1000000 — the
     wall-clock TTL, whose absolute deadline the leader fixes at
     log time — ``expireat`` a string key and a positive integer
@@ -1100,12 +1147,14 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
     if name not in ("set", "del", "cas", "incr", "incrbyfloat",
                     "setnx", "getset",
                     "append", "getdel", "getex", "setrange", "setbit",
-                    "pfadd", "hset", "setex", "expireat", "pexpireat"):
+                    "pfadd", "hset", "hdel", "setex", "expireat",
+                    "pexpireat"):
         return None, {"type": "client_response", "status": "error",
                       "error": "pipeline op must be set, del, cas, "
                                "incr, incrbyfloat, setnx, getset, append, "
                                "getdel, getex, setrange, setbit, "
-                               "pfadd, hset, setex, expireat, or pexpireat"}
+                               "pfadd, hset, hdel, setex, expireat, or "
+                               "pexpireat"}
     key = op.get("key")
     if not isinstance(key, str):
         return None, {"type": "client_response", "status": "error",
@@ -1334,6 +1383,20 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
                                    "list of 1 to 1000 [field, value] "
                                    "string pairs"}
         msg["pairs"] = [[f, v] for f, v in pairs]
+    if name == "hdel":
+        # ``fields`` rides along with a pipelined hdel, validated
+        # here so a malformed one never goes on the wire: a
+        # non-empty list of at most 1000 strings — the same shape
+        # the server enforces (the server also caps it, so a huge
+        # list is still a client error there, not a log entry).
+        fields = op.get("fields")
+        if (not isinstance(fields, list) or not fields
+                or len(fields) > 1000
+                or any(not isinstance(f, str) for f in fields)):
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline hdel fields must be a "
+                                   "list of 1 to 1000 strings"}
+        msg["fields"] = list(fields)
     if name == "setex":
         # ``seconds`` rides along with a pipelined setex,
         # validated here so a malformed one never goes on the
@@ -1952,6 +2015,42 @@ def hget(node_addr: tuple[str, int], key: str, field: str,
                    timeout=timeout)
 
 
+def hdel(node_addr: tuple[str, int], key: str,
+         fields: list[str], timeout: float = 12.0) -> dict:
+    """Delete ``fields`` from the hash at ``key``, following leader
+    redirects like ``request`` — Redis HDEL.
+
+    One request appends the hdel entry, so the count it returns is
+    decided at the entry's position in the log: the reply is the
+    plain hdel response (``status`` ``ok`` with ``hdel`` — the
+    number of fields actually removed, 0 for a missing key or a
+    missing field — or ``hdel_failed`` with reason ``wrongtype``
+    when the current value is a plain string). Removing the last
+    field deletes the key outright; at most 1000 fields per call.
+    An hdel that leaves fields behind keeps the key's TTL deadline,
+    like an hset."""
+    return request(node_addr, {"type": "client", "op": "hdel",
+                               "key": key, "fields": list(fields)},
+                   timeout=timeout)
+
+
+def hgetall(node_addr: tuple[str, int], key: str,
+            timeout: float = 12.0) -> dict:
+    """Ask for every field and value in the hash at ``key``,
+    following leader redirects like ``request`` — Redis HGETALL.
+
+    One request serves the field map through the leader's ReadIndex
+    path, so it reflects the committed state as of one read index,
+    exactly as linearizable as a ``get``. The reply is the plain
+    hgetall response (``status`` ``ok`` with ``fields`` — the whole
+    field map, an empty dict when the key does not exist — plus the
+    ``read_index`` / ``read_term`` it was measured at). A plain
+    string value is a client error, not a field map."""
+    return request(node_addr, {"type": "client", "op": "hgetall",
+                               "key": key},
+                   timeout=timeout)
+
+
 def mset(node_addr: tuple[str, int], pairs: list,
          ttl_entries: int | None = None,
          timeout: float = 12.0) -> dict:
@@ -2541,6 +2640,27 @@ def main(argv: list[str] | None = None) -> int:
              "when the key does not exist or the field is not set)")
     p_hget.add_argument("key")
     p_hget.add_argument("field")
+    p_hdel = sub.add_parser(
+        "hdel",
+        help="delete fields from the hash at key and print the number "
+             "of fields actually removed; removing the last field "
+             "deletes the key")
+    p_hdel.add_argument("key")
+    p_hdel.add_argument("fields", nargs="+",
+                        help="fields to delete: f1 f2 ... "
+                             "(at most 1000 fields)")
+    p_hdel.add_argument("--client-id", default=None,
+                        help="session id for at-most-once writes: a retry "
+                             "with the same client id + request id returns "
+                             "the first attempt's result instead of writing "
+                             "twice")
+    p_hdel.add_argument("--request-id", default=None,
+                        help="id of this write within the client session")
+    p_hgetall = sub.add_parser(
+        "hgetall",
+        help="print every field and value in the hash at key as JSON "
+             "({} when the key does not exist)")
+    p_hgetall.add_argument("key")
     p_add = sub.add_parser("add-server",
                            help="add a server to the cluster (Raft §6)")
     p_add.add_argument("server_id")
@@ -2635,7 +2755,8 @@ def main(argv: list[str] | None = None) -> int:
               "incrbyfloat",
               "setnx", "getset", "append", "strlen", "getdel",
               "getex", "getrange", "setrange", "setbit", "getbit",
-              "pfadd", "pfcount", "hset", "hget", "setex", "expireat",
+              "pfadd", "pfcount", "hset", "hget", "hdel", "hgetall",
+              "setex", "expireat",
               "pexpireat"):
         msg["key"] = args.key
     elif op == "mset":
@@ -2734,10 +2855,12 @@ def main(argv: list[str] | None = None) -> int:
                         for i in range(0, len(args.pairs), 2)]
     if op == "hget":
         msg["field"] = args.field
+    if op == "hdel":
+        msg["fields"] = args.fields
     if op in ("set", "del", "cas", "mset", "expire", "incr",
               "incrbyfloat", "setnx",
               "getset", "append", "getdel", "getex", "setrange",
-              "setbit", "pfadd", "hset", "setex", "expireat",
+              "setbit", "pfadd", "hset", "hdel", "setex", "expireat",
               "pexpireat") \
             and args.request_id:
         # A request id without an explicit client id still dedups
@@ -2812,6 +2935,10 @@ def main(argv: list[str] | None = None) -> int:
         elif op == "hget":
             value = resp.get("value")
             print(value if value is not None else "(nil)")
+        elif op == "hdel":
+            print(resp.get("hdel"))
+        elif op == "hgetall":
+            print(json.dumps(resp.get("fields")))
         elif op == "mget":
             print(json.dumps(resp.get("values")))
         elif op == "keys":

@@ -319,9 +319,10 @@ class KVStore:
         index + the TTL) on every pair it touches, so the whole
         batch expires together. A successful CAS keeps the key's
         deadline, and so does a successful incr, an incrbyfloat,
-        a getset, and an hset:
-        all four are updates of the value, not fresh sets, so
-        none must resurrect a key that is about to expire. A
+        a getset, an hset, and an hdel that leaves fields behind:        all five are updates of the value, not fresh sets, so
+        none must resurrect a key that is about to expire. (An
+        hdel that removes the last field deletes the key, and
+        the deadline goes with it.) A
         ``setex`` carries an absolute wall-clock deadline
         (``wall_deadline``, fixed by the leader before the entry
         was logged) instead of a log distance: it is recorded
@@ -332,7 +333,7 @@ class KVStore:
         Returns a result dict for commands whose outcome depends on the
         state at apply time — currently "set", "cas", "expire", "expireat",
         "pexpireat", "incr", "incrbyfloat", "setnx", "getset", "append", "getdel",
-        "setrange", "getex", "setbit", "pfadd", and "hset" —
+        "setrange", "getex", "setbit", "pfadd", "hset", and "hdel" —
         and None for del, whose outcome is always ok. The result is
         what the leader hands back to the waiting client and what the
         dedup table caches for retries, so it must be a pure function
@@ -1107,6 +1108,73 @@ class KVStore:
             self._data[key] = _hash_value(fields)
             return {"type": "client_response", "status": "ok",
                     "hset": added}
+        elif op == "hdel":
+            # Delete fields from a hash, Redis HDEL: each field
+            # named is removed when present, and the reply
+            # carries ``hdel`` — the number of fields actually
+            # removed (a field repeated in one call counts once,
+            # a field that was never there counts not at all).
+            # The outcome is decided here, at this exact point
+            # in the log, so a retry with the same session id
+            # returns the first attempt's count from the dedup
+            # table instead of deleting twice. A missing key is
+            # a no-op, not an error: Redis answers 0 there, and
+            # the entry still committed (the outcome is the
+            # entry's result, not a client error). Removing the
+            # last field deletes the key outright, like Redis —
+            # the key leaves the sorted index and takes its
+            # deadline with it, so there is nothing left to
+            # expire — and the reply carries ``deleted`` so the
+            # apply path fires a ``del`` watch event for it
+            # instead of a ``set`` one. Removing fields while
+            # some remain keeps the key's deadline, like an
+            # hset: it is an update of the value, not a fresh
+            # set, so it must not resurrect a key that is about
+            # to expire. A key holding a plain string fails
+            # with WRONGTYPE, like an hset — an hdel must not
+            # parse bytes as fields — and writes nothing at
+            # all, like a failed hset. The fields were validated
+            # on the leader before the entry was logged (a
+            # non-empty list of at most HDEL_MAX_FIELDS
+            # strings), so by apply time they are well-formed —
+            # a hand-built log entry with bad fields still raises
+            # rather than silently writing nonsense.
+            key = command["key"]
+            fields = command.get("fields")
+            if (not isinstance(fields, list) or not fields
+                    or any(not isinstance(f, str) for f in fields)):
+                raise ValueError(
+                    "hdel fields must be a non-empty list of "
+                    "strings")
+            current = self._data.get(key)
+            if current is None:
+                return {"type": "client_response", "status": "ok",
+                        "hdel": 0}
+            if not is_hash(current):
+                return {"type": "client_response",
+                        "status": "hdel_failed",
+                        "reason": "wrongtype",
+                        "current": current,
+                        "error": "hdel failed: value of "
+                                 f"{key!r} is not a hash"}
+            remaining = _hash_fields(current)
+            removed = 0
+            for field in fields:
+                if field in remaining:
+                    del remaining[field]
+                    removed += 1
+            if not remaining:
+                del self._data[key]
+                idx = bisect.bisect_left(self._keys, key)
+                if idx < len(self._keys) and self._keys[idx] == key:
+                    del self._keys[idx]
+                self._expiry.pop(key, None)
+                self._wall_expiry.pop(key, None)
+                return {"type": "client_response", "status": "ok",
+                        "hdel": removed, "deleted": True}
+            self._data[key] = _hash_value(remaining)
+            return {"type": "client_response", "status": "ok",
+                    "hdel": removed}
         elif op == "setrange":
             # Overwrite part of a string value, Redis SETRANGE:
             # starting at ``offset``, replace as many characters
@@ -1333,6 +1401,22 @@ class KVStore:
             raise TypeError(
                 f"hget failed: value of {key!r} is not a hash")
         return _hash_fields(value).get(field)
+
+    def hgetall(self, key: str) -> dict[str, str]:
+        """Every field and value in the hash at ``key`` — an empty
+        dict when the key does not exist, Redis HGETALL. Raises
+        TypeError when the value is a plain string: an HGETALL
+        reads a hash, not bytes, so a string key is WRONGTYPE,
+        like an hget on a plain string. Pure read: no log entry,
+        no state change. The dict is a fresh copy of the fields,
+        so the caller cannot mutate the stored blob's parse."""
+        value = self._data.get(key)
+        if value is None:
+            return {}
+        if not is_hash(value):
+            raise TypeError(
+                f"hgetall failed: value of {key!r} is not a hash")
+        return dict(_hash_fields(value))
 
     def getbit(self, key: str, offset: int) -> int:
         """The bit at ``offset`` in the string value at ``key``,

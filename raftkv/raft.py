@@ -146,6 +146,15 @@ PFADD_MAX_ELEMENTS = 1000
 # never a real use — the same scale as the pfadd cap above, for the
 # same reason.
 HSET_MAX_PAIRS = 1000
+# Largest number of fields one ``hdel`` may carry. The fields
+# ride in one log entry and one frame, so an unbounded list would
+# let one entry grow without limit (and replicate that growth to
+# every node). 1,000 fields is far past a real use of one HDEL
+# call — a client deleting more splits the batch, like an mget
+# client splits a batch past 1000 keys — so it only rejects
+# nonsense, never a real use — the same scale as the hset cap
+# above, for the same reason.
+HDEL_MAX_FIELDS = 1000
 # Leader lease for reads (Raft dissertation §6.4): how long a majority
 # ack stays fresh. Must be shorter than ELECTION_TIMEOUT_MIN (150ms):
 # a follower that acked at time T heard from the leader no later than
@@ -1425,7 +1434,7 @@ class RaftNode:
                 # The apply result matters for set, CAS, expire,
                 # expireat, pexpireat, incr, incrbyfloat, setnx,
                 # getset, append, getdel, setrange, getex, setbit,
-                # pfadd, and hset:
+                # pfadd, hset, and hdel:
                 # their outcome is decided here, at this exact point
                 # in the log, so the result is recorded in the dedup
                 # table
@@ -1595,11 +1604,33 @@ class RaftNode:
                                       self.sm.get(entry["command"]["key"]),
                                       "set",
                                       index=self.last_applied)
+                elif (op == "hdel" and result is not None
+                        and result.get("status") == "ok"
+                        and result.get("hdel", 0) > 0):
+                    # An hdel that removed fields fires like the
+                    # change it made: a ``del`` when the last
+                    # field took the key with it, a ``set`` with
+                    # the new (hash blob) value while fields
+                    # remain. An hdel that removed nothing — a
+                    # missing key or missing fields — changed
+                    # nothing, so it fires nothing, like a failed
+                    # hset — and a failed hdel wrote nothing
+                    # either.
+                    if result.get("deleted"):
+                        self.watch.notify(entry["command"]["key"],
+                                          None, "del",
+                                          index=self.last_applied)
+                    else:
+                        self.watch.notify(
+                            entry["command"]["key"],
+                            self.sm.get(entry["command"]["key"]),
+                            "set",
+                            index=self.last_applied)
                 if (op in ("set", "cas", "expire", "expireat",
                            "pexpireat",
                            "incr", "incrbyfloat", "setnx", "getset",
                            "append", "getdel", "setrange", "getex",
-                           "setbit", "pfadd", "hset")
+                           "setbit", "pfadd", "hset", "hdel")
                         and result is not None
                         and self.role == "leader"):
                     # Record the outcome only when a local waiter is
@@ -1653,7 +1684,7 @@ class RaftNode:
         for CAS, expire, expireat,
         pexpireat, incr, incrbyfloat, setnx,
         getset, append, getdel, setrange, getex, setbit, pfadd,
-        and hset
+        hset, and hdel
         it is the
         apply-time outcome (success, mismatch, or missing key for a
         CAS; 1 or 0 for an expire; 1 or 0 for an expireat /
@@ -1666,7 +1697,8 @@ class RaftNode:
         and 1 or 0, plus the deadline, for a getex; the old bit
         and the new value, or wrongtype for a setbit; 1 or 0 plus
         the estimate, or wrongtype for a pfadd; the count of
-        newly added fields, or wrongtype for an hset), so a
+        newly added fields, or wrongtype for an hset; the count
+        of removed fields, or wrongtype for an hdel), so a
         retry returns the first
         attempt's exact result. The result also carries the log
         index and term of the entry that produced it: a retried write
@@ -2361,7 +2393,7 @@ class RaftNode:
                       "append", "strlen",
                       "getdel", "getrange", "setrange", "getex",
                       "setbit", "getbit", "pfadd", "pfcount",
-                      "hset", "hget",
+                      "hset", "hget", "hdel", "hgetall",
                       "setex") \
                 or key is None:
             return {"type": "client_response", "status": "error",
@@ -2370,7 +2402,7 @@ class RaftNode:
                              "incr/incrbyfloat/setnx/getset/append/"
                              "strlen/getdel/"
                              "getrange/setrange/getex/setbit/getbit/"
-                             "pfadd/pfcount/hset/hget/setex "
+                             "pfadd/pfcount/hset/hget/hdel/hgetall/setex "
                              "with a key"}
         if self._is_removed():
             return {"type": "client_response", "status": "error",
@@ -2493,6 +2525,25 @@ class RaftNode:
             if error is not None:
                 return error
             return self._serve_read(hget_key=key, hget_field=field,
+                                    min_index=min_index,
+                                    session_term=session_term,
+                                    stale_ok=bool(msg.get("stale_ok")))
+        if op == "hgetall":
+            # Every field of a hash: the whole field map at this
+            # key — an empty dict when the key does not exist,
+            # Redis HGETALL. It rides the same ReadIndex/lease
+            # path as a ``get`` — one leadership confirmation,
+            # one apply wait — so the fields reflect the
+            # committed state as of the read index it names,
+            # exactly as linearizable, and a session read
+            # carries the same watermark a get would. A string
+            # key is a client error, not a field map: the
+            # payload carries its own "status": "error" (see
+            # _serve_read), like hget's wrongtype.
+            min_index, session_term, error = self._parse_read_params(msg)
+            if error is not None:
+                return error
+            return self._serve_read(hgetall_key=key,
                                     min_index=min_index,
                                     session_term=session_term,
                                     stale_ok=bool(msg.get("stale_ok")))
@@ -2645,6 +2696,23 @@ class RaftNode:
                                  f"{HSET_MAX_PAIRS} [field, value] "
                                  "string pairs"}
             command["pairs"] = [[f, v] for f, v in pairs]
+        if op == "hdel":
+            # Delete fields from a hash: the fields must be a
+            # non-empty list of at most HDEL_MAX_FIELDS strings
+            # — an empty list names nothing to delete, and a
+            # longer one would ride in one frame and one log
+            # entry without bound. Whether the key holds a hash
+            # (and how many fields are actually removed, and
+            # whether the last one deletes the key) is decided
+            # at apply time, like a CAS, not here.
+            fields = msg.get("fields")
+            if (not isinstance(fields, list) or not fields
+                    or len(fields) > HDEL_MAX_FIELDS
+                    or any(not isinstance(f, str) for f in fields)):
+                return {"type": "client_response", "status": "error",
+                        "error": "hdel fields must be a list of 1 to "
+                                 f"{HDEL_MAX_FIELDS} strings"}
+            command["fields"] = list(fields)
         if op == "setex":
             # Set a key with a wall-clock TTL, Redis SETEX: the
             # value is required, like a set's — a setex with no
@@ -3562,6 +3630,7 @@ class RaftNode:
                     pfcount_key: str | None = None,
                     hget_key: str | None = None,
                     hget_field: str | None = None,
+                    hgetall_key: str | None = None,
                     scan_prefix: str | None = None,
                     scan_limit: int = MAX_KEYS_SCAN,
                     scan_start_after: str | None = None) -> dict:
@@ -3605,6 +3674,11 @@ class RaftNode:
         applied state machine the same way, so it is exactly as
         linearizable as a ``get``; a plain string value is a client
         error, not a field.
+        ``hgetall_key`` serves every field of a hash instead — the
+        whole field map at that key, an empty dict for a missing
+        key, Redis HGETALL — read off the applied state machine
+        the same way, so it is exactly as linearizable as a ``get``;
+        a plain string value is a client error, not a field map.
         ``scan_prefix`` serves a key enumeration instead — every key
         in the applied state machine starting with the prefix,
         sorted, at most ``scan_limit`` of them, with ``truncated``
@@ -3619,7 +3693,7 @@ class RaftNode:
         appear in a later page if it sorts ahead of the cursor.
         Everything else — the lease fast path, the pending-read wait,
         the fallback, the redirect on leadership loss — is identical
-        for all nine shapes, so a scan or a TTL query is exactly as
+        for all ten shapes, so a scan or a TTL query is exactly as
         linearizable as a single ``get``.
 
         A stale read (``stale_ok``) is the one exception to the
@@ -3779,6 +3853,17 @@ class RaftNode:
                 # literal.
                 try:
                     return {"value": self.sm.hget(hget_key, hget_field)}
+                except TypeError as e:
+                    return {"status": "error", "error": str(e)}
+            if hgetall_key is not None:
+                # Every field of a hash: the whole field map at
+                # this key — an empty dict for a missing key,
+                # Redis HGETALL — with the same wrongtype rule
+                # as hget: a plain string value is a client
+                # error, not a field map, carried the same way,
+                # overriding the "ok" in the response literal.
+                try:
+                    return {"fields": self.sm.hgetall(hgetall_key)}
                 except TypeError as e:
                     return {"status": "error", "error": str(e)}
             if keys is not None:

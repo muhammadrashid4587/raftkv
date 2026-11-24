@@ -698,9 +698,38 @@ logic and the failure handling, not the key-value API on top.
   ...]}` is a pipeline op too. The honest limit is the encoding
   itself: a plain `get` on a hash key returns the encoded blob,
   not a field, and the string ops see the blob as a plain string,
-  exactly as they see an HLL blob — and there is no HDEL or
-  HGETALL yet, so fields can only be added or overwritten, never
-  removed or listed except one at a time.
+  exactly as they see an HLL blob.
+- **Hash field removal and listing** — since v0.56.0 `hdel key
+  field [field ...]` (`Session.hdel(k, *fields)`,
+  `client.hdel(addr, k, fields)`, `hdel key f1 f2 ...` on the
+  CLI) deletes fields from the hash at the key and answers with
+  the number of fields actually removed — Redis HDEL — and
+  `hgetall key` (`Session.hgetall(k)`, `client.hgetall(addr, k)`,
+  `hgetall key` on the CLI) answers the whole field map as one
+  JSON object, an empty dict when the key does not exist — Redis
+  HGETALL. A missing key or a missing field counts 0 on an hdel,
+  not an error, and a field repeated in one call counts once;
+  removing the last field deletes the key outright, like Redis —
+  the key leaves the sorted index and takes its deadline with
+  it. The outcome is decided at apply time, at the entry's exact
+  position in the log, like a CAS: a retry with the same session
+  id returns the first attempt's count instead of deleting
+  twice. A key holding a plain string fails an hdel with
+  `hdel_failed` and reason `wrongtype` instead of writing, and
+  an hgetall on one is a client error, not a field map. An hdel
+  that leaves fields behind keeps the key's TTL deadline, like
+  an hset, and fires a `set` watch event with the new value;
+  an hdel that takes the last field fires a `del` event instead,
+  like a getdel; an hdel that removes nothing fires nothing.
+  An hgetall rides the same ReadIndex path as a `get`, so it
+  carries the same session watermark and is exactly as
+  linearizable. At most 1000 fields per hdel, like an hset
+  batch, so one entry never carries an unbounded list.
+  `{"op": "hdel", "key": k, "fields": [f, ...]}` is a pipeline
+  op too. The honest limit is the same encoding as hset: a plain
+  `get` on a hash key still returns the encoded blob, and there
+  is no HLEN or HEXISTS yet, so the size of a hash and the
+  presence of one field are only answerable by listing it.
 - **Key enumeration** — since v0.31.0 one `keys` RPC lists the
   store's keys (`client.keys(prefix, limit, start_after)`,
   `Session.keys(prefix, limit, start_after)`, `keys --prefix p
@@ -2946,6 +2975,50 @@ entries left in `log.jsonl` are dropped by their index on reload.
   with the hash still readable, session read-your-writes,
   pipelined hset ops with a malformed op in position, and the
   CLI end to end.
+- ~~Hashes (HDEL / HGETALL)~~ — done in v0.56.0,
+  Nov 24, 2026: `hdel key field [field ...]` deletes fields
+  from the hash at the key and answers with the number of fields
+  actually removed — Redis HDEL — and `hgetall key` answers the
+  whole field map as one JSON object, an empty dict when the key
+  does not exist — Redis HGETALL. A missing key or a missing
+  field counts 0, not an error, and a field repeated in one call
+  counts once; removing the last field deletes the key outright,
+  like Redis — the key leaves the sorted index and takes its
+  deadline with it. The outcome is decided at apply time, at the
+  entry's exact position in the log, like a CAS, so a retry with
+  the same session id returns the first attempt's count instead
+  of deleting twice. A key holding a plain string fails an hdel
+  with `hdel_failed` and reason `wrongtype`, and an hgetall on
+  one is a client error; an hdel that leaves fields behind keeps
+  the key's TTL deadline, like an hset, and fires a `set` watch
+  event with the new value, an hdel that takes the last field
+  fires a `del` event instead, and an hdel that removes nothing
+  fires nothing. An hgetall rides the same ReadIndex path as a
+  `get`, so it is exactly as linearizable. At most 1000 fields
+  per hdel, like an hset batch. `Session.hdel` /
+  `Session.hgetall`, `client.hdel` / `client.hgetall`, and
+  `hdel` / `hgetall` on the CLI expose them, and `{"op":
+  "hdel", "key": k, "fields": [f, ...]}` is a pipeline op too.
+  `tests/test_hash.py` proves them: store-level removal and
+  counting, a repeated field counting once, missing key and
+  missing field answering 0, removing the last field deleting
+  the key (sorted index, deadline, and plain `get` all agree it
+  is gone), a plain string failing wrongtype with nothing
+  written, an hgetall on a plain string raising, malformed
+  fields raising, the TTL deadline kept while fields remain,
+  and the whole field map surviving a snapshot load;
+  replication to every node, a missing key and field answering
+  0 on the cluster, a plain string failing with nothing
+  written, an hgetall on a plain string a client error, bad
+  fields rejected with no log entry, a follower redirect, dedup
+  of a retry returning the first attempt's count and of a failed
+  retry returning the first failure, continuing after a leader
+  change, the `set` watch event firing while fields remain, the
+  `del` event firing when the last field goes, and nothing
+  firing when nothing is removed, surviving a snapshot +
+  restart with the hash still listable, session
+  read-your-writes, pipelined hdel ops with a malformed op in
+  position, and the CLI end to end.
   The roadmap is exhausted again, so the next real thing is
   a new roadmap item grounded in this project's purpose,
   proposed by the next run.
