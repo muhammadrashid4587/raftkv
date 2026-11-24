@@ -119,6 +119,38 @@ logic and the failure handling, not the key-value API on top.
   bigger single fsync and a bigger replication frame than a
   single set — the win is one round trip and one commit wait for
   the batch, not a cheaper write per key.
+- **Pipelined batch writes** — since v0.35.0 a client can send
+  many write ops over one persistent connection without waiting
+  for each reply (`Session.pipeline(ops, depth=50)`,
+  `client.pipeline(addr, ops)`, `pipeline` on the CLI reading
+  JSON ops one per line from stdin): the ops go out in batches
+  of `depth` and the replies come back aligned by position, a
+  failed op an `error` response in its place instead of an
+  exception. Every op carries its own session request id, so a
+  batch re-sent after a redirect, or a reply lost to a dead
+  connection and retried once with the same ids, returns the
+  first attempt's result instead of applying twice — the dedup
+  table is what makes pipelining writes safe where pipelining
+  bare writes would not be. A malformed op never goes on the
+  wire: its position comes back an error and the ops around it
+  still run. The write watermark advances to the highest index
+  any reply carries, so a later read through the same session
+  is still read-your-writes. This is not `mset`: each op
+  appends its own log entry and pays its own fsync, so the
+  batch is not atomic — a failure part-way leaves the earlier
+  ops applied — and a batch of pure sets is cheaper as one
+  `mset` (one entry, one fsync, atomic). Measured on this box
+  (see Benchmark): pipelined writes run at ~85-96 ops/s
+  against ~84-99 sequential in the same runs — no measurable
+  gain on localhost, as expected: the ~0.2ms round-trip wait
+  pipelining removes is noise next to an ~8-9ms commit, and
+  the server dispatches frames from one connection in order,
+  so pipelined writes never overlap server-side and cannot
+  share an fsync the way concurrent clients do under group
+  commit. The win is one connection and no per-op round trip,
+  which matters over a real network RTT, not on loopback.
+  `scripts/bench.py --pipelined-writes` runs the phase
+  (`--pipeline-depth` sets the batch size).
 - **Key enumeration** — since v0.31.0 one `keys` RPC lists the
   store's keys (`client.keys(prefix, limit, start_after)`,
   `Session.keys(prefix, limit, start_after)`, `keys --prefix p
@@ -748,6 +780,32 @@ them one at a time. The sustained concurrent ceiling does not move
 on the leader — which is the honest limit of this box: pipelining
 lifts a single client to the server's per-request cost, it does not
 make the server cheaper.
+
+Pipelined writes (v0.35.0) are the same trick applied where it
+cannot pay, and the bench says so plainly:
+
+```
+$ python3 scripts/bench.py --pool-size 10 --pipelined --pipelined-writes  # three runs
+sequential writes          200 ops   83.9-99.1 ops/s   p50  8.4-8.8ms
+pipelined writes           200 ops   85.3-95.9 ops/s   mean 10.4-11.7ms/op  (batches of 50)
+```
+
+A batch of 50 pipelined sets takes ~470-600ms — ~9.4-12ms per op,
+the same as a sequential write — because every op still appends
+its own log entry, still waits for a majority round, and still
+pays its own fsync, and the server dispatches the frames from
+one connection in order, so the fifty writes never overlap
+server-side and never share an fsync the way ten concurrent
+clients do under group commit (~1000 ops/s in the same runs).
+The ~0.2ms round-trip wait pipelining removes is noise next to
+an ~8-9ms commit on loopback. What the client does get is one
+connection instead of fifty round trips and one session's dedup
+ids across the batch, so a lost reply is retried safely instead
+of applied twice — and over a real network, where the RTT is
+milliseconds rather than ~0.2ms, the overlapped waits are the
+same win pipelined replication already gets. On localhost the
+number to beat for writes stays the concurrent one, not the
+pipelined one.
 
 ## Architecture
 
@@ -1481,3 +1539,33 @@ entries left in `log.jsonl` are dropped by their index on reload.
   a dedup retry appending once, one watch event per pair at the
   batch index, mset keys in the sorted scan, and the CLI end to
   end.
+- ~~Pipelined batch writes~~ — done in v0.35.0, Nov 23, 2026: a
+  client-side batch-write path that pipelines many set/del/cas
+  ops over one connection (`Session.pipeline(ops, depth=50)`,
+  `client.pipeline(addr, ops)`, and `pipeline` on the CLI
+  reading JSON ops one per line from stdin and printing one
+  JSON response per line). Every op carries its own session
+  request id, so a batch re-sent after a redirect, or a reply
+  lost to a dead connection and retried once with the same ids,
+  returns the first attempt's result instead of appending a
+  second entry — the dedup table is what makes pipelining
+  writes safe. Replies come back aligned by position, a failed
+  op an `error` response in its place, a malformed op rejected
+  client-side without going on the wire, and the session's write
+  watermark advancing to the highest index any reply carries.
+  Documented honestly: each op is still its own log entry with
+  its own fsync, so the batch is not atomic and a batch of pure
+  sets is cheaper as one `mset`; and the server dispatches
+  frames from one connection in order, so pipelined writes
+  never overlap server-side and cannot share an fsync — measured
+  on this box at ~85-96 ops/s against ~84-99 sequential, no
+  gain on localhost, the win being one connection and no per-op
+  round trip over a real network RTT. `scripts/bench.py
+  --pipelined-writes` adds the phase. `tests/
+  test_pipeline_writes.py` proves it: mixed set/del in order,
+  a failed CAS aligned in the middle with the ops around it
+  still applied, malformed ops as errors in position, redirect
+  from a follower applying each op exactly once, the session
+  watermark advancing, 120 ops split by depth, a fake server
+  swallowing a batch and the retry reusing the same request
+  ids, and the CLI end to end.

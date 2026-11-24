@@ -10,6 +10,7 @@ Examples:
     python -m raftkv.client --node 127.0.0.1:5001 get mykey
     python -m raftkv.client --node 127.0.0.1:5001 mget mykey otherkey
     python -m raftkv.client --node 127.0.0.1:5001 keys --prefix my
+    python -m raftkv.client --node 127.0.0.1:5001 pipeline < ops.jsonl
     python -m raftkv.client --node 127.0.0.1:5001 del mykey
     python -m raftkv.client --node 127.0.0.1:5001 cas mykey myvalue newvalue
     python -m raftkv.client --node 127.0.0.1:5001 watch mykey --timeout 10
@@ -149,6 +150,100 @@ class Session:
                              "[key, value] pairs"}
         return self._write({"type": "client", "op": "mset",
                             "pairs": [[k, v] for k, v in pairs]})
+
+    def pipeline(self, ops: list, depth: int = 50,
+                 timeout: float = 12.0) -> list[dict]:
+        """Send many writes pipelined over one connection.
+
+        ``ops`` is a list of write operations, one dict each:
+
+            {"op": "set", "key": k, "value": v}
+            {"op": "del", "key": k}
+            {"op": "cas", "key": k, "expected": e, "value": v}
+
+        The whole list goes out in batches of ``depth`` on a single
+        persistent socket without waiting between requests, and the
+        replies come back aligned by position: the i-th reply
+        answers the i-th op. A failed op is an ``error`` response in
+        its position, never an exception, so a partial batch is
+        still usable — and a batch that hits a follower is re-sent
+        to the leader it names, like ``request`` follows a redirect.
+
+        Each op carries its own session request id, so the batch is
+        safe to re-send: the server dedups by (client_id,
+        request_id), and a retry returns the first attempt's
+        result instead of appending a second entry. That is what
+        makes pipelining writes safe where pipelining bare writes
+        would not be. A reply lost to a dead connection is retried
+        once, with the same request ids, on a fresh connection —
+        so a write whose reply was lost but which did apply still
+        comes back ``ok`` with its original index instead of
+        applying twice.
+
+        This is NOT ``mset``: every op appends its own log entry
+        and pays its own fsync, so the batch is not atomic — a
+        failure part-way leaves the earlier ops applied — and a
+        batch of pure sets is cheaper as one ``mset`` (one entry,
+        one fsync, atomic). Pipelining removes the client's
+        round-trip wait between writes, not the server's per-entry
+        fsync: on localhost that wait is ~0.2ms against an ~8-9ms
+        commit, so expect a modest gain here and a bigger one over
+        a real network RTT. The write watermark advances to the
+        highest committed index any reply in the batch carries, so
+        a later read through this session still sees every write
+        the batch acknowledged.
+
+        An op that is not a well-formed dict (unknown op, missing
+        or non-string key/value) never goes on the wire: its
+        position comes back an ``error`` response, and the ops
+        around it still run. An empty list sends nothing and
+        returns an empty list.
+        """
+        if not ops:
+            return []
+        msgs: list[dict] = []
+        positions: list[int] = []
+        replies: list[dict | None] = [None] * len(ops)
+        for i, op in enumerate(ops):
+            msg, err = _pipeline_op_message(op)
+            if err is not None:
+                replies[i] = err
+                continue
+            self._next_request += 1
+            msg["client_id"] = self.client_id
+            msg["request_id"] = str(self._next_request)
+            msgs.append(msg)
+            positions.append(i)
+        if msgs:
+            sent = request_many(self.node_addr, msgs,
+                                timeout=timeout, depth=depth)
+            # A reply lost to a dead connection is retried once
+            # with the same request ids — dedup makes the re-send
+            # safe even if the first attempt applied and only its
+            # reply was lost. Anything the server actually answered
+            # (including an error) is final and is not retried.
+            failed = [j for j, resp in enumerate(sent)
+                      if resp.get("status") == "error"
+                      and "did not answer"
+                      in (resp.get("error") or "")]
+            if failed:
+                retried = request_many(
+                    self.node_addr, [msgs[j] for j in failed],
+                    timeout=timeout, depth=depth)
+                for j, resp in zip(failed, retried):
+                    sent[j] = resp
+            for j, resp in enumerate(sent):
+                replies[positions[j]] = resp
+                if (resp.get("status") in ("ok", "cas_failed")
+                        and resp.get("index") is not None):
+                    index = int(resp["index"])
+                    if index > self.last_write_index:
+                        self.last_write_index = index
+                        self.last_write_term = int(resp.get("term") or 0)
+        return [r if r is not None else
+                {"type": "client_response", "status": "error",
+                 "error": "no reply for pipeline op"}
+                for r in replies]
 
     def delete(self, key: str) -> dict:
         return self._write({"type": "client", "op": "del", "key": key})
@@ -394,6 +489,64 @@ def _format_membership_status(status: dict) -> list[str]:
     return lines
 
 
+def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
+    """Validate one pipeline op dict into its wire message.
+
+    Returns (message, None) for a well-formed op, or (None, error
+    response) when the op is malformed — the error goes in the
+    op's reply position and nothing goes on the wire for it.
+    ``set`` needs a string key and value, ``del`` a string key,
+    ``cas`` a string key, expected, and value."""
+    if not isinstance(op, dict):
+        return None, {"type": "client_response", "status": "error",
+                      "error": "pipeline op must be an object with "
+                               "op, key, and value fields"}
+    name = op.get("op")
+    if name not in ("set", "del", "cas"):
+        return None, {"type": "client_response", "status": "error",
+                      "error": "pipeline op must be set, del, or cas"}
+    key = op.get("key")
+    if not isinstance(key, str):
+        return None, {"type": "client_response", "status": "error",
+                      "error": f"pipeline {name} needs a string key"}
+    msg: dict = {"type": "client", "op": name, "key": key}
+    if name in ("set", "cas"):
+        value = op.get("value")
+        if not isinstance(value, str):
+            return None, {"type": "client_response", "status": "error",
+                          "error": f"pipeline {name} needs a string "
+                                   "value"}
+        msg["value"] = value
+    if name == "cas":
+        expected = op.get("expected")
+        if not isinstance(expected, str):
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline cas needs a string "
+                                   "expected value"}
+        msg["expected"] = expected
+    return msg, None
+
+
+def pipeline(node_addr: tuple[str, int], ops: list,
+             timeout: float = 12.0, depth: int = 50) -> list[dict]:
+    """Send many writes pipelined over one connection.
+
+    One ``set`` / ``del`` / ``cas`` op per dict (see
+    ``Session.pipeline`` for the shapes): the ops go out in
+    batches of ``depth`` on a single persistent socket and the
+    replies come back aligned by position. Each op carries a
+    dedup id from a fresh one-shot session, so a re-send after a
+    redirect or a lost reply cannot apply twice — but the session
+    is discarded when the call returns, so a retry of the whole
+    call later is a new session and its writes are new writes.
+    An empty list sends nothing and returns an empty list.
+    """
+    if not ops:
+        return []
+    with Session(node_addr, pool_size=0) as session:
+        return session.pipeline(ops, depth=depth, timeout=timeout)
+
+
 def request_many(node_addr: tuple[str, int], msgs: list[dict],
                  timeout: float = 12.0, depth: int = 50) -> list[dict]:
     """Send many idempotent requests pipelined over one connection.
@@ -407,9 +560,13 @@ def request_many(node_addr: tuple[str, int], msgs: list[dict],
     that position, and the caller decides whether to retry it — the
     connection is gone by then, so a retry starts fresh.
 
-    Only for idempotent messages (reads): a batch re-sent after a
-    redirect or a lost reply repeats every message in it, so a write
-    without a dedup session id could apply twice.
+    Only for idempotent messages: reads, and writes that carry a
+    dedup session id (``client_id`` + ``request_id``) — a batch
+    re-sent after a redirect or a lost reply repeats every message
+    in it, so a write without a dedup id could apply twice, while
+    one with an id returns the first attempt's result instead.
+    ``Session.pipeline`` assigns one id per op and retries lost
+    replies with the same ids for exactly this reason.
     """
     if not msgs:
         return []
@@ -641,6 +798,19 @@ def main(argv: list[str] | None = None) -> int:
                              "twice")
     p_mset.add_argument("--request-id", default=None,
                         help="id of this write within the client session")
+    p_pipe = sub.add_parser(
+        "pipeline",
+        help="send many writes pipelined over one connection: "
+             "reads JSON ops (one per line) from stdin — "
+             '{"op": "set", "key": k, "value": v}, '
+             '{"op": "del", "key": k}, or '
+             '{"op": "cas", "key": k, "expected": e, "value": v} '
+             "— and prints one JSON response per line, in order")
+    p_pipe.add_argument("--client-id", default=None,
+                        help="session id for at-most-once writes: ops "
+                             "retried with the same client id and "
+                             "request ids return the first attempt's "
+                             "result instead of writing twice")
     p_get = sub.add_parser("get")
     p_get.add_argument("key")
     p_get.add_argument("--client-id", default=None,
@@ -775,6 +945,27 @@ def main(argv: list[str] | None = None) -> int:
         else:
             for line in _format_membership_status(resp):
                 print(line)
+        return 0
+    if op == "pipeline":
+        # Many writes pipelined over one connection: one JSON op
+        # per stdin line, one JSON response per stdout line, in
+        # order. A line that is not JSON, or not an object, is
+        # passed through as-is — Session.pipeline rejects it
+        # client-side and its position comes back an error
+        # response, so a bad line never aborts the batch.
+        ops = []
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ops.append(json.loads(line))
+            except ValueError:
+                ops.append(line)
+        with Session((host, int(port)),
+                     client_id=args.client_id) as session:
+            for resp in session.pipeline(ops):
+                print(json.dumps(resp))
         return 0
     msg: dict = {"type": "client", "op": op}
     if op in ("set", "get", "del", "cas"):
