@@ -86,6 +86,12 @@ MAX_MSET_PAIRS = 1000
 # key order: no repeats, no gaps, as long as the state does not
 # change between pages.
 MAX_KEYS_SCAN = 1000
+# Largest TTL a ``set`` may carry, in log entries. A TTL is a
+# distance in the log (see KVStore._expiry), so the cap bounds how
+# far ahead one key's deadline can sit — 1,000,000 entries is far
+# past any live cluster's log between snapshots, so it only rejects
+# nonsense, never a real use.
+TTL_MAX_ENTRIES = 1_000_000
 # Leader lease for reads (Raft dissertation §6.4): how long a majority
 # ack stays fresh. Must be shorter than ELECTION_TIMEOUT_MIN (150ms):
 # a follower that acked at time T heard from the leader no later than
@@ -215,7 +221,11 @@ class RaftNode:
         node_id: this node's id, e.g. "node1".
         peers:   {peer_id: (host, port)} for every *other* node in the cluster.
         data_dir: directory holding meta.json + log.jsonl for this node.
-        state_machine: object with an ``apply(command: dict)`` method.
+        state_machine: object with an ``apply(command: dict,
+        index: int | None)`` method, an ``expire_up_to(index)``
+        method returning the keys expired at that log index, an
+        ``expiries()`` method returning the live deadlines, and a
+        ``load(state, expiry)`` method for snapshots.
         snapshot_threshold: compact the log once it holds more than this
             many post-snapshot entries (see SNAPSHOT_THRESHOLD).
         snapshot_chunk_size: at most this many characters of serialized
@@ -533,7 +543,8 @@ class RaftNode:
                 snap = json.load(f)
             self.snapshot_index = int(snap.get("last_included_index", 0))
             self.snapshot_term = int(snap.get("last_included_term", 0))
-            self.sm.load(snap.get("state") or {})
+            self.sm.load(snap.get("state") or {},
+                         snap.get("expiry") or {})
             # The dedup table for entries the snapshot covers: without
             # it a retry of a compacted-away write would append a
             # duplicate. The result is always ok once committed for
@@ -703,6 +714,13 @@ class RaftNode:
             "last_included_index": self.snapshot_index,
             "last_included_term": self.snapshot_term,
             "state": self.sm.items(),
+            # The live TTL deadlines as of the snapshot index, so a
+            # node that installs this snapshot keeps expiring keys
+            # on schedule instead of holding them forever. Keys
+            # whose deadline the snapshot already passed were
+            # purged when those entries applied, so every deadline
+            # here is still in the future.
+            "expiry": self.sm.expiries(),
             "config": self._config_list(),
             # C-new while a joint transition is in flight: a snapshot
             # taken mid-transition carries it, so a follower that
@@ -1285,6 +1303,18 @@ class RaftNode:
         while self.last_applied < self.commit_index:
             self.last_applied += 1
             entry = self.log[self.last_applied - self.snapshot_index - 1]
+            # Expiry runs before the entry applies, for every entry
+            # type: the log advancing is what moves TTL time, so a
+            # key whose deadline this entry reaches is gone before
+            # the entry's own effect lands — and a noop or config
+            # entry advances the clock exactly like a write. The
+            # expiry fires a ``del`` watch event per key, at this
+            # entry's index, so a watcher sees the key vanish
+            # exactly when it vanishes, in log order with the other
+            # events from this apply.
+            for key in self.sm.expire_up_to(self.last_applied):
+                self.watch.notify(key, None, "del",
+                                  index=self.last_applied)
             # Membership commands are Raft state, not key-value data:
             # they update the config (and the address book) instead of
             # the state machine. A "noop" entry (appended by a new
@@ -1304,8 +1334,10 @@ class RaftNode:
                 # while this node is the leader, by log index for the
                 # waiter that submitted the entry (see
                 # _flush_write_batch). Set/del return None: their
-                # outcome is always ok.
-                result = self.sm.apply(entry["command"])
+                # outcome is always ok. The index rides along so a
+                # ``set`` with a TTL can record its deadline
+                # (index + ttl_entries) deterministically.
+                result = self.sm.apply(entry["command"], self.last_applied)
                 self._record_dedup(entry["command"], result,
                                    self.last_applied, entry["term"])
                 # Watches fire on committed changes only, in log
@@ -1729,7 +1761,8 @@ class RaftNode:
             return self._install_snapshot_payload(
                 last_included_index, last_included_term,
                 msg.get("data") or {}, msg.get("config"),
-                msg.get("dedup"), msg.get("joint_new"))
+                msg.get("dedup"), msg.get("joint_new"),
+                msg.get("expiry"))
 
     def _on_snapshot_chunk(self, msg: dict, last_included_index: int,
                            last_included_term: int) -> dict:
@@ -1792,12 +1825,14 @@ class RaftNode:
         return self._install_snapshot_payload(
             last_included_index, last_included_term,
             payload.get("data") or {}, payload.get("config"),
-            payload.get("dedup"), payload.get("joint_new"))
+            payload.get("dedup"), payload.get("joint_new"),
+            payload.get("expiry"))
 
     def _install_snapshot_payload(self, last_included_index: int,
                                   last_included_term: int, data: dict,
                                   config, dedup,
-                                  joint_new=None) -> dict:
+                                  joint_new=None,
+                                  expiry=None) -> dict:
         """Install a fully received snapshot (lock held).
 
         The follower replaces its state machine with the snapshot's
@@ -1829,7 +1864,7 @@ class RaftNode:
                 self.log = []
             self.snapshot_index = last_included_index
             self.snapshot_term = last_included_term
-            self.sm.load(data)
+            self.sm.load(data, expiry or {})
             # The snapshot covers committed entries, so it covers
             # committed config changes too: adopt the config it was
             # written with (snapshots from before membership changes
@@ -2073,6 +2108,20 @@ class RaftNode:
         command = {"op": op, "key": key}
         if op == "set":
             command["value"] = msg.get("value")
+            # A TTL, in log entries: the key lives until the log
+            # reaches this entry's index + ttl_entries, then it is
+            # purged on every node at the same log position (see
+            # KVStore). Validated here, on the leader, before the
+            # command is ever logged — a bad TTL is a client error,
+            # not a log entry.
+            ttl = msg.get("ttl_entries")
+            if ttl is not None:
+                if (not isinstance(ttl, int) or isinstance(ttl, bool)
+                        or ttl < 1 or ttl > TTL_MAX_ENTRIES):
+                    return {"type": "client_response", "status": "error",
+                            "error": "ttl_entries must be an integer "
+                                     f"between 1 and {TTL_MAX_ENTRIES}"}
+                command["ttl_entries"] = ttl
         if op == "cas":
             # A conditional write: set key to value only if its current
             # value equals expected. The comparison happens at apply
@@ -3297,6 +3346,9 @@ class RaftNode:
                 # follower that installs this snapshot resumes in
                 # joint phase instead of forgetting the change.
                 "joint_new": self._joint_list(),
+                # The live TTL deadlines as of the snapshot index,
+                # so the follower keeps expiring keys on schedule.
+                "expiry": self.sm.expiries(),
                 # The dedup table for the covered prefix, so the
                 # follower adopts it (see _on_install_snapshot) and a
                 # retry of a compacted-away write still dedups there.

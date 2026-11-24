@@ -151,6 +151,34 @@ logic and the failure handling, not the key-value API on top.
   which matters over a real network RTT, not on loopback.
   `scripts/bench.py --pipelined-writes` runs the phase
   (`--pipeline-depth` sets the batch size).
+- **TTL / key expiry** — since v0.36.0 a `set` may carry
+  `ttl_entries` (`Session.set(k, v, ttl_entries=N)`, `set k v
+  --ttl-entries N` on the CLI, or `"ttl_entries": N` in a
+  pipelined set op): the key's deadline is the log index of
+  its own entry + N, and every node purges the key before
+  applying the entry at that index — so the key vanishes on
+  every replica at exactly the same log position, with no wall
+  clock anywhere. The unit is deliberately log entries, not
+  seconds: replicas can never disagree about whether a key is
+  alive, which a wall-clock TTL (clocks skew, apply times
+  differ) could never promise. The honest limit is the unit
+  itself — on a quiet cluster a key can live arbitrarily long
+  in wall-clock time, and on a busy cluster it can expire
+  quickly; the TTL is a distance in the log, not a duration.
+  A plain `set` without a TTL clears the key's deadline (like
+  Redis, a fresh SET drops the old TTL), as do `mset` and
+  `del`; a successful CAS keeps it, since it is a conditional
+  update of the value, not a fresh set. Expiry fires a `del`
+  watch event at the index of the entry whose apply purged
+  the key, so a watcher sees the key vanish exactly when it
+  vanishes, and the deadlines ride in snapshots, so a node
+  that installs one keeps expiring keys on schedule instead
+  of holding them forever. A TTL must be an integer from 1 to
+  1,000,000 (`TTL_MAX_ENTRIES`); a bad value is a client
+  error and appends no log entry. Not yet covered: `mset`
+  takes no TTL — a batch carries no single deadline — and
+  there is no `expire`/`ttl` query to read a key's remaining
+  entries back.
 - **Key enumeration** — since v0.31.0 one `keys` RPC lists the
   store's keys (`client.keys(prefix, limit, start_after)`,
   `Session.keys(prefix, limit, start_after)`, `keys --prefix p
@@ -465,7 +493,7 @@ make test
 # or: python3 -m unittest discover -s tests -v
 ```
 
-217 tests, plus a smoke test for the benchmark script, all passing:
+244 tests, plus a smoke test for the benchmark script, all passing:
 
 | Test | What it proves |
 |---|---|
@@ -651,6 +679,23 @@ make test
 | `test_index_prefix_cursor_and_limit_compose` | Prefix, cursor, and limit compose on the index: no leaks across prefixes, cursor is an exclusive bound |
 | `test_index_cas_does_not_disturb_it` | A CAS — successful, failed, or on a missing key — never adds or removes an index entry |
 | `test_index_survives_load` | Loading snapshot state rebuilds the index, and writes after a load keep maintaining it |
+| `test_store_records_deadline_at_apply_index` | A set with ttl_entries at index 10 is alive at 14 and gone at 15 — deadline is index + ttl, purged before the deadline entry applies |
+| `test_store_plain_set_clears_deadline` | A set without a TTL drops the key's deadline, so the key outlives the position it would have expired at |
+| `test_store_cas_keeps_deadline` | A successful CAS updates the value but keeps the deadline |
+| `test_store_mset_and_del_clear_deadline` | An mset pair and a delete both drop the key's deadline, like a plain set |
+| `test_store_ttl_without_index_raises` | A TTL with no log position to anchor it raises instead of recording a deadline nobody could agree on |
+| `test_store_load_restores_expiry` | A snapshot load restores the deadlines with the data, and a load with no expiry (an old snapshot) expires nothing |
+| `test_set_with_ttl_expires_at_deadline` | A key with ttl 3 reads for two more entries and is gone once the third lands, on the leader and every follower |
+| `test_plain_set_clears_deadline_on_cluster` | Re-setting a key without a TTL clears its deadline while a sibling key with the same TTL still expires |
+| `test_cas_on_expired_key_is_missing` | A CAS after the deadline fails as missing_key — the purge runs before the CAS entry applies |
+| `test_expired_key_leaves_sorted_scan` | An expired key disappears from the keys scan — the purge removes it from the sorted index too |
+| `test_expiry_fires_del_watch_event` | A watch on a TTL key fires a del event with value None at the index of the entry whose apply purged it |
+| `test_ttl_survives_leader_change` | A key's deadline survives killing the leader: the new leader expires it at the same log position |
+| `test_ttl_survives_snapshot_and_restart` | A deadline survives log compaction and a restart — the snapshot carries the expiry map |
+| `test_ttl_rejects_bad_values` | A TTL of 0, negative, non-integer, boolean, or past the cap is a client error and appends no log entry |
+| `test_session_set_with_ttl` | Session.set takes ttl_entries, and read-your-writes still works before and after expiry |
+| `test_pipeline_set_with_ttl` | A pipelined set may carry ttl_entries; a malformed TTL is an error in its position and the ops around it still run |
+| `test_ttl_cli` | The `set --ttl-entries N` CLI writes the key with a deadline, and a bad TTL is rejected instead of writing |
 
 Tests use real nodes (real TCP, real threads, real disk) on localhost —
 no mocks of the consensus path.
@@ -1569,3 +1614,36 @@ entries left in `log.jsonl` are dropped by their index on reload.
   watermark advancing, 120 ops split by depth, a fake server
   swallowing a batch and the retry reusing the same request
   ids, and the CLI end to end.
+- ~~TTL / key expiry in log-index units~~ — done in v0.36.0,
+  Nov 23, 2026: a `set` may carry `ttl_entries`, and the key's
+  deadline is its entry's log index + the TTL — every node
+  purges the key before applying the entry at that index, so
+  the key vanishes on every replica at exactly the same log
+  position, with no wall clock anywhere (`KVStore._expiry`,
+  `expire_up_to` called from `_apply_committed` before every
+  entry type, since the log advancing is what moves TTL time).
+  A plain `set` clears the deadline, as do `mset` and `del`;
+  a successful CAS keeps it. The deadline rides in the
+  snapshot (`snapshot.json` and the InstallSnapshot payload
+  both carry an `expiry` map, loaded with the state, so a
+  node that installs one keeps expiring on schedule), and
+  expiry fires a `del` watch event at the purging entry's
+  index. The client exposes it as `Session.set(k, v,
+  ttl_entries=N)`, `set k v --ttl-entries N` on the CLI, and
+  `"ttl_entries"` in a pipelined set op; the leader validates
+  it (an integer 1..1,000,000, `TTL_MAX_ENTRIES`) before the
+  command is ever logged. Documented honestly: the unit is log
+  entries, not seconds — on a quiet cluster a key can live
+  arbitrarily long in wall-clock time, and on a busy cluster
+  it can expire quickly — and `mset` takes no TTL, and there
+  is no `expire`/`ttl` query to read a key's remaining entries
+  back. `tests/test_ttl.py` proves it: store-level deadline
+  arithmetic, plain set / mset / del clearing the deadline,
+  CAS keeping it, a TTL with no log index raising, snapshot
+  load restoring the deadlines, expiry at the exact deadline
+  on leader and followers, CAS on an expired key failing as
+  missing_key, the expired key leaving the sorted scan, the
+  `del` watch event at the purging index, the deadline
+  surviving a leader kill and a snapshot + restart, bad TTLs
+  rejected with no log entry appended, and the session,
+  pipeline, and CLI paths end to end.

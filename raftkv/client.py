@@ -130,9 +130,19 @@ class Session:
             self.last_write_term = int(resp.get("term") or 0)
         return resp
 
-    def set(self, key: str, value: str) -> dict:
-        return self._write({"type": "client", "op": "set",
-                            "key": key, "value": value})
+    def set(self, key: str, value: str,
+            ttl_entries: int | None = None) -> dict:
+        """Write one key. With ``ttl_entries`` (a positive number
+        of log entries) the key expires when the log reaches this
+        entry's index + ``ttl_entries`` — a distance in the log,
+        not a duration in seconds, so every node agrees on when
+        the key goes (see KVStore). Without it the write clears
+        any deadline the key had."""
+        msg: dict = {"type": "client", "op": "set",
+                     "key": key, "value": value}
+        if ttl_entries is not None:
+            msg["ttl_entries"] = ttl_entries
+        return self._write(msg)
 
     def mset(self, pairs: list) -> dict:
         """Write many keys with one ``mset`` RPC: the whole batch
@@ -158,6 +168,7 @@ class Session:
         ``ops`` is a list of write operations, one dict each:
 
             {"op": "set", "key": k, "value": v}
+            {"op": "set", "key": k, "value": v, "ttl_entries": n}
             {"op": "del", "key": k}
             {"op": "cas", "key": k, "expected": e, "value": v}
 
@@ -517,6 +528,18 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
                           "error": f"pipeline {name} needs a string "
                                    "value"}
         msg["value"] = value
+    if name == "set" and op.get("ttl_entries") is not None:
+        # A TTL rides along with a pipelined set, validated here
+        # so a malformed one never goes on the wire: an integer
+        # number of log entries, 1..1,000,000, the same bounds
+        # the server enforces.
+        ttl = op.get("ttl_entries")
+        if (not isinstance(ttl, int) or isinstance(ttl, bool)
+                or ttl < 1 or ttl > 1_000_000):
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline set ttl_entries must be "
+                                   "an integer between 1 and 1000000"}
+        msg["ttl_entries"] = ttl
     if name == "cas":
         expected = op.get("expected")
         if not isinstance(expected, str):
@@ -777,6 +800,11 @@ def main(argv: list[str] | None = None) -> int:
     p_set = sub.add_parser("set")
     p_set.add_argument("key")
     p_set.add_argument("value")
+    p_set.add_argument("--ttl-entries", type=int, default=None,
+                       help="expire the key after this many further "
+                            "log entries: the key lives until the log "
+                            "reaches this entry's index + ttl-entries "
+                            "(a distance in the log, not seconds)")
     p_set.add_argument("--client-id", default=None,
                        help="session id for at-most-once writes: a retry "
                             "with the same client id + request id returns "
@@ -991,6 +1019,8 @@ def main(argv: list[str] | None = None) -> int:
         msg["server_id"] = args.server_id
     if op == "set":
         msg["value"] = args.value
+        if args.ttl_entries is not None:
+            msg["ttl_entries"] = args.ttl_entries
     if op == "cas":
         msg["expected"] = args.expected
         msg["value"] = args.value
