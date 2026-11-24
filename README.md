@@ -166,9 +166,9 @@ logic and the failure handling, not the key-value API on top.
   in wall-clock time, and on a busy cluster it can expire
   quickly; the TTL is a distance in the log, not a duration.
   A plain `set` without a TTL clears the key's deadline (like
-  Redis, a fresh SET drops the old TTL), as do `mset` and
-  `del`; a successful CAS keeps it, since it is a conditional
-  update of the value, not a fresh set. Expiry fires a `del`
+  Redis, a fresh SET drops the old TTL), as do an `mset`
+  without a TTL and `del`; a successful CAS keeps it, since it
+  is a conditional update of the value, not a fresh set. Expiry fires a `del`
   watch event at the index of the entry whose apply purged
   the key, so a watcher sees the key vanish exactly when it
   vanishes, and the deadlines ride in snapshots, so a node
@@ -187,8 +187,16 @@ logic and the failure handling, not the key-value API on top.
   the committed state as of the read index it names — a
   session query sees its own write's deadline, a stale
   query is served from a follower lease like any stale
-  read. Not yet covered: `mset` takes no TTL — a batch
-  carries no single deadline. Since v0.38.0 a deadline can
+  read. Since v0.39.0 an `mset` may carry a TTL too
+  (`Session.mset(pairs, ttl_entries=N)`,
+  `client.mset(addr, pairs, ttl_entries=N)`,
+  `mset k1 v1 k2 v2 ... --ttl-entries N` on the CLI): one
+  deadline — this entry's index + N — for every pair in the
+  batch, so the whole batch expires together at one log
+  position, purged by the same path with the same `del` watch
+  event per key, and the deadlines ride snapshots like any
+  other. A plain `mset` without a TTL still clears every
+  pair's deadline, like a plain set. Since v0.38.0 a deadline can
   also be set on a key that already exists: `expire key N`
   (`Session.expire(k, N)`, `client.expire(addr, k, N)`,
   `expire key N` on the CLI) sets the key's deadline to this
@@ -1668,8 +1676,8 @@ entries left in `log.jsonl` are dropped by their index on reload.
   position, with no wall clock anywhere (`KVStore._expiry`,
   `expire_up_to` called from `_apply_committed` before every
   entry type, since the log advancing is what moves TTL time).
-  A plain `set` clears the deadline, as do `mset` and `del`;
-  a successful CAS keeps it. The deadline rides in the
+  A plain `set` clears the deadline, as do an `mset` without
+  a TTL and `del`; a successful CAS keeps it. The deadline rides in the
   snapshot (`snapshot.json` and the InstallSnapshot payload
   both carry an `expiry` map, loaded with the state, so a
   node that installs one keeps expiring on schedule), and
@@ -1681,9 +1689,9 @@ entries left in `log.jsonl` are dropped by their index on reload.
   command is ever logged. Documented honestly: the unit is log
   entries, not seconds — on a quiet cluster a key can live
   arbitrarily long in wall-clock time, and on a busy cluster
-  it can expire quickly — and `mset` takes no TTL, and there
-  is no `expire`/`ttl` query to read a key's remaining entries
-  back. `tests/test_ttl.py` proves it: store-level deadline
+  it can expire quickly — and `mset` takes no TTL yet (that
+  came in v0.39.0), and there is no `expire`/`ttl` query to
+  read a key's remaining entries back. `tests/test_ttl.py` proves it: store-level deadline
   arithmetic, plain set / mset / del clearing the deadline,
   CAS keeping it, a TTL with no log index raising, snapshot
   load restoring the deadlines, expiry at the exact deadline
@@ -1693,3 +1701,33 @@ entries left in `log.jsonl` are dropped by their index on reload.
   surviving a leader kill and a snapshot + restart, bad TTLs
   rejected with no log entry appended, and the session,
   pipeline, and CLI paths end to end.
+- ~~mset TTL~~ — done in v0.39.0, Nov 24, 2026: an `mset` may
+  carry `ttl_entries`, and every pair in the batch gets the
+  same deadline — the entry's log index + the TTL — so the
+  whole batch expires together at one log position
+  (`KVStore.apply` records `index + ttl` in `_expiry` for
+  every pair; a TTL with no log index raises, like a single
+  set's). The deadline rides the same purge path as any other
+  TTL: `expire_up_to` drops every pair before the entry at
+  the deadline applies, on every node, firing one `del` watch
+  event per key at the purging entry's index, and the
+  deadlines ride snapshots with the rest of `_expiry`, so a
+  node that installs one keeps expiring the batch on schedule.
+  A plain `mset` without a TTL still clears every pair's
+  deadline, like a plain set. `_on_mset` validates the TTL on
+  the leader (an integer 1..1,000,000, `TTL_MAX_ENTRIES`)
+  before the command is ever logged, so a bad TTL is a client
+  error and the batch is never written. The client exposes it
+  as `Session.mset(pairs, ttl_entries=N)`, `client.mset(addr,
+  pairs, ttl_entries=N)`, and `mset k1 v1 k2 v2 ...
+  --ttl-entries N` on the CLI. `tests/test_mset.py` proves
+  it: store-level deadline arithmetic for the whole batch, a
+  TTL with no log index raising, a plain mset clearing the
+  deadlines, expiry of the whole batch at the deadline on
+  leader and followers with a `ttl` query counting it down,
+  one `del` watch event per pair at the deadline index, the
+  deadlines surviving a snapshot + restart, bad TTLs rejected
+  with no log entry appended, and the session and CLI paths
+  end to end. The roadmap's only open item is group commit
+  (fsync batching) — the next run takes that, or proposes the
+  next real thing if it is done.

@@ -160,22 +160,30 @@ class Session:
         return self._write({"type": "client", "op": "expire",
                             "key": key, "ttl_entries": entries})
 
-    def mset(self, pairs: list) -> dict:
+    def mset(self, pairs: list,
+             ttl_entries: int | None = None) -> dict:
         """Write many keys with one ``mset`` RPC: the whole batch
         appends as a single log entry and applies atomically, so a
         read after it commits sees every pair. It carries a session
         request id like ``set`` — a retry returns the first
         attempt's result instead of appending a second entry — and
         the response's index advances the write watermark exactly
-        as a single write does. An empty batch is a client error —
-        the server rejects it — so this returns the error response
-        instead of sending it."""
+        as a single write does. With ``ttl_entries`` the batch
+        carries one deadline for every pair — this entry's index
+        + the TTL — so the whole batch expires together at one log
+        position, exactly like a single ``set`` with a TTL;
+        without it every pair loses any deadline it had. An empty
+        batch is a client error — the server rejects it — so this
+        returns the error response instead of sending it."""
         if not pairs:
             return {"type": "client_response", "status": "error",
                     "error": "mset takes a list of 1-1000 "
                              "[key, value] pairs"}
-        return self._write({"type": "client", "op": "mset",
-                            "pairs": [[k, v] for k, v in pairs]})
+        msg: dict = {"type": "client", "op": "mset",
+                     "pairs": [[k, v] for k, v in pairs]}
+        if ttl_entries is not None:
+            msg["ttl_entries"] = ttl_entries
+        return self._write(msg)
 
     def pipeline(self, ops: list, depth: int = 50,
                  timeout: float = 12.0) -> list[dict]:
@@ -757,6 +765,7 @@ def expire(node_addr: tuple[str, int], key: str, entries: int,
 
 
 def mset(node_addr: tuple[str, int], pairs: list,
+         ttl_entries: int | None = None,
          timeout: float = 12.0) -> dict:
     """Write many keys with one ``mset`` RPC, following leader
     redirects like ``request``.
@@ -764,7 +773,11 @@ def mset(node_addr: tuple[str, int], pairs: list,
     One request appends a single log entry carrying the whole
     batch, so the batch applies atomically at one log position —
     the single-request equivalent of many ``set`` calls, without a
-    round trip and an fsync per key. The reply is the plain write
+    round trip and an fsync per key. With ``ttl_entries`` the batch
+    carries one deadline for every pair — this entry's index + the
+    TTL — so the whole batch expires together at one log position,
+    exactly like a single ``set`` with a TTL; without it every
+    pair loses any deadline it had. The reply is the plain write
     response (``status`` ``ok`` with the entry's ``index`` /
     ``term``); an empty batch never goes on the wire and returns
     the server's error shape instead."""
@@ -772,9 +785,11 @@ def mset(node_addr: tuple[str, int], pairs: list,
         return {"type": "client_response", "status": "error",
                 "error": "mset takes a list of 1-1000 [key, value] "
                          "pairs"}
-    return request(node_addr, {"type": "client", "op": "mset",
-                               "pairs": [[k, v] for k, v in pairs]},
-                   timeout=timeout)
+    msg: dict = {"type": "client", "op": "mset",
+                 "pairs": [[k, v] for k, v in pairs]}
+    if ttl_entries is not None:
+        msg["ttl_entries"] = ttl_entries
+    return request(node_addr, msg, timeout=timeout)
 
 
 def keys(node_addr: tuple[str, int], prefix: str = "",
@@ -899,6 +914,12 @@ def main(argv: list[str] | None = None) -> int:
              "so the batch applies atomically")
     p_mset.add_argument("pairs", nargs="+",
                         help="alternating keys and values: k1 v1 k2 v2 ...")
+    p_mset.add_argument("--ttl-entries", type=int, default=None,
+                        help="expire every key in the batch after this "
+                             "many further log entries: the deadline is "
+                             "this entry's index + ttl-entries, so the "
+                             "whole batch expires together (a distance "
+                             "in the log, not seconds)")
     p_mset.add_argument("--client-id", default=None,
                         help="session id for at-most-once writes: a retry "
                              "with the same client id + request id returns "
@@ -1124,6 +1145,9 @@ def main(argv: list[str] | None = None) -> int:
         msg["server_id"] = args.server_id
     if op == "set":
         msg["value"] = args.value
+        if args.ttl_entries is not None:
+            msg["ttl_entries"] = args.ttl_entries
+    if op == "mset":
         if args.ttl_entries is not None:
             msg["ttl_entries"] = args.ttl_entries
     if op == "cas":

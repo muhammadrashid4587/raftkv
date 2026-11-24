@@ -68,10 +68,14 @@ class KVStore:
         index raises; callers that apply commands outside a log
         (unit tests, mostly) pass no TTL. A plain ``set`` without
         a TTL clears any deadline the key had — like Redis, a
-        fresh SET drops the old TTL — and so do ``mset`` and
-        ``del``. A successful CAS keeps the key's deadline: it
-        is a conditional update of the value, not a fresh set,
-        so it must not resurrect a key that is about to expire.
+        fresh SET drops the old TTL — and so do an ``mset``
+        without a TTL and ``del``. An ``mset`` carrying
+        ``ttl_entries`` sets the same deadline (its entry's
+        index + the TTL) on every pair it touches, so the whole
+        batch expires together. A successful CAS keeps the key's
+        deadline: it is a conditional update of the value, not a
+        fresh set, so it must not resurrect a key that is about
+        to expire.
 
         Returns a result dict for commands whose outcome depends on the
         state at apply time — currently "cas" and "expire" — and None
@@ -104,14 +108,30 @@ class KVStore:
             # prefix. A duplicate key inside the batch keeps the
             # last value, like successive sets. The sorted index
             # is maintained per pair, exactly as for a single set.
-            # No TTL on an mset (a batch carries no single
-            # deadline), so every pair it touches loses any
-            # deadline it had, exactly like a plain set.
+            # With ``ttl_entries`` the batch carries one deadline
+            # for every pair it touches — the entry's index + the
+            # TTL — so the whole batch expires together at one log
+            # position, purged by the same ``expire_up_to`` path
+            # (and the same ``del`` watch event) as a single set's
+            # TTL, and the deadlines ride snapshots with the rest
+            # of ``_expiry``. Without a TTL every pair it touches
+            # loses any deadline it had, exactly like a plain set.
+            # A TTL with no log position is meaningless, like for
+            # a single set, so it raises instead of recording a
+            # deadline nobody could agree on.
+            ttl = command.get("ttl_entries")
+            if ttl is not None and index is None:
+                raise ValueError(
+                    "ttl_entries needs the log index of the "
+                    "entry being applied")
             for key, value in command["pairs"]:
                 if key not in self._data:
                     bisect.insort(self._keys, key)
                 self._data[key] = value
-                self._expiry.pop(key, None)
+                if ttl is not None:
+                    self._expiry[key] = index + ttl
+                else:
+                    self._expiry.pop(key, None)
             return None
         elif op == "del":
             key = command["key"]

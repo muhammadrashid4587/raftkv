@@ -1996,7 +1996,14 @@ class RaftNode:
         appending a second entry, and a session's watermark
         advances to this entry exactly as for a single write. The
         batch is capped at MAX_MSET_PAIRS so one frame — and one
-        log entry — stays bounded."""
+        log entry — stays bounded. With ``ttl_entries`` the batch
+        carries one deadline for every pair — this entry's index
+        + the TTL — so the whole batch expires together at one
+        log position, exactly like a single ``set`` with a TTL;
+        without it every pair loses any deadline it had, like a
+        plain set. The TTL is validated here, on the leader,
+        before the command is ever logged, with the same bounds
+        as a single set's (an integer 1..TTL_MAX_ENTRIES)."""
         pairs = msg.get("pairs")
         if (not isinstance(pairs, list) or not pairs
                 or len(pairs) > MAX_MSET_PAIRS
@@ -2008,6 +2015,14 @@ class RaftNode:
                              f"{MAX_MSET_PAIRS} [key, value] pairs"}
         command: dict = {"op": "mset",
                          "pairs": [[k, v] for k, v in pairs]}
+        ttl = msg.get("ttl_entries")
+        if ttl is not None:
+            if (not isinstance(ttl, int) or isinstance(ttl, bool)
+                    or ttl < 1 or ttl > TTL_MAX_ENTRIES):
+                return {"type": "client_response", "status": "error",
+                        "error": "ttl_entries must be an integer "
+                                 f"between 1 and {TTL_MAX_ENTRIES}"}
+            command["ttl_entries"] = ttl
         for field in ("client_id", "request_id"):
             if msg.get(field):
                 command[field] = msg[field]
