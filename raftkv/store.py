@@ -163,7 +163,8 @@ class KVStore:
         # same idea: ``_wall_expiry[key]`` is the absolute Unix
         # time (``time.time()`` seconds) at which the key stops
         # existing, fixed once by the leader when the ``setex``
-        # entry was logged and stored in the entry itself — or
+        # entry was logged — or when a ``set`` carried EX / PX —
+        # and stored in the entry itself — or
         # when an ``expireat`` / ``pexpireat`` entry fixed one
         # on a key that already exists — so every replica
         # applies the same deadline, and replaying the log or
@@ -203,10 +204,14 @@ class KVStore:
         (see ``expire_up_to``). A TTL without a log position is
         meaningless, so a ``set`` with ``ttl_entries`` and no
         index raises; callers that apply commands outside a log
-        (unit tests, mostly) pass no TTL. A plain ``set`` without
-        a TTL clears any deadline the key had — like Redis, a
-        fresh SET drops the old TTL — and so do an ``mset``
-        without a TTL and ``del``. A ``set`` carrying NX or XX is
+        (unit tests, mostly) pass no TTL. A ``set`` carrying a
+        ``wall_deadline`` — SET ... EX / PX, fixed by the leader
+        at log time — records a wall-clock deadline instead, and
+        drops any log-entry deadline, so a key still holds at
+        most one kind of TTL. A plain ``set`` without a TTL clears
+        any deadline the key had — like Redis, a fresh SET drops
+        the old TTL — and so do an ``mset`` without a TTL and
+        ``del``. A ``set`` carrying NX or XX is
         conditional instead of unconditional: NX writes only
         when the key does not exist, XX only when it does, and
         a losing set writes nothing at all — the value and any
@@ -297,7 +302,17 @@ class KVStore:
                 bisect.insort(self._keys, key)
             self._data[key] = command["value"]
             ttl = command.get("ttl_entries")
-            if ttl is not None:
+            wall = command.get("wall_deadline")
+            if wall is not None:
+                # SET ... EX / PX: an inline wall-clock TTL — the
+                # leader fixed the absolute deadline at log time,
+                # so every replica applies the same one, like a
+                # setex. A fresh life on the log side too: any
+                # log-entry deadline the key had is dropped, so a
+                # key still holds at most one kind of TTL.
+                self._wall_expiry[key] = float(wall)
+                self._expiry.pop(key, None)
+            elif ttl is not None:
                 if index is None:
                     raise ValueError(
                         "ttl_entries needs the log index of the "

@@ -491,6 +491,38 @@ logic and the failure handling, not the key-value API on top.
   one getset already has: the old value is whatever the key
   held when the entry applied, so a concurrent write that
   lands first in the log is the old value you get back.
+- **SET with EX / PX** — since v0.52.0 `set key value [--ex
+  seconds | --px milliseconds]` (`Session.set(k, v, ex=n,
+  px=n)`, `set key value --ex n` / `--px n` on the CLI)
+  carries Redis's SET EX / PX options: an inline wall-clock
+  TTL on SET, instead of the separate `setex` op — the leader
+  fixes the absolute deadline at log time (now + seconds, now
+  + milliseconds / 1000), so every replica applies the same
+  deadline and the key dies when the wall clock reaches it,
+  enforced by the same three paths as a `setex` deadline: the
+  background sweep every 100ms, the purge before each log
+  entry applies, and the purge before serving a read. A
+  winning EX/PX set is a fresh life for the key: any
+  log-entry deadline it had is dropped, so a key still holds
+  at most one kind of TTL, and a plain `set` clears an EX/PX
+  deadline like any other wall deadline. EX and PX are
+  mutually exclusive, and neither rides with a log-entry TTL
+  or with KEEPTTL — Redis rejects all three combinations, and
+  the server rejects them as client errors that append no log
+  entry. It composes with NX / XX and with GET exactly like
+  the other flags: a losing conditional set writes nothing,
+  deadline included, and answers `old_value` None with GET.
+  The `ttl` query reports the deadline it sets, in `wall_ttl`
+  / `wall_deadline`, exactly like a `setex` deadline. It rides
+  the same write path as a single `set` — group-commit
+  batching, dedup (a retry with the same session id returns
+  the first attempt's result instead of setting twice, and the
+  deadline stays the first attempt's), the response's log index
+  advancing a session's watermark — and `{"op": "set", "key":
+  k, "value": v, "ex": n}` is a pipeline op too. The honest
+  limit is the same clock as `setex`: the deadline is
+  identical on every node, but each node enforces it against
+  its own clock.
 - **Bit operations** — since v0.46.0 `setbit key offset bit`
   (`Session.setbit(k, offset, bit)`, `client.setbit(addr, k,
   offset, bit)`, `setbit key offset bit` on the CLI) sets one
@@ -2622,8 +2654,57 @@ entries left in `log.jsonl` are dropped by their index on reload.
   losing retry returning the first attempt's old value,
   pipelined set ops with GET and a malformed GET in position,
   and the CLI end to end.
+- ~~SET with EX / PX~~ — done in v0.52.0,
+  Nov 24, 2026: `set key value [--ex seconds | --px
+  milliseconds]` carries Redis's SET EX / PX options — an
+  inline wall-clock TTL on SET, instead of the separate
+  `setex` op: the leader fixes the absolute deadline at log
+  time (now + seconds, now + milliseconds / 1000) and stores
+  it in the entry as `wall_deadline`, so every replica applies
+  the same deadline and the key dies by the same three
+  enforcements as a `setex` deadline — the background sweep
+  every 100ms, the purge before each log entry applies, and
+  the purge before serving a read — with a `del` watch event
+  from the sweep when it goes. A winning EX/PX set is a fresh
+  life for the key: any log-entry deadline it had is dropped,
+  so a key still holds at most one kind of TTL, and a plain
+  `set` clears an EX/PX deadline like any other wall deadline.
+  EX and PX are mutually exclusive, and neither rides with a
+  log-entry TTL or with KEEPTTL — all three are client errors
+  that append no log entry — and the values are bounded
+  (EX 1..1,000,000 seconds, PX 1..1,000,000,000
+  milliseconds, the same horizon in both units). It composes
+  with NX / XX and with GET exactly like the other flags: a
+  losing conditional set writes nothing, deadline included,
+  and answers `old_value` None with GET. The `ttl` query
+  reports the deadline it sets, in `wall_ttl` /
+  `wall_deadline`, exactly like a `setex` deadline. It rides
+  the same write path as a single `set` — group-commit
+  batching, dedup (a retry returns the first attempt's result
+  and the deadline stays the first attempt's), the response's
+  log index advancing a session's watermark — and `{"op":
+  "set", "key": k, "value": v, "ex": n}` is a pipeline op too.
+  `Session.set` (with `ex=` / `px=`) and `set` on the CLI
+  (`--ex` / `--px`, mutually exclusive) expose it.
+  `tests/test_set_ex_px.py` proves it: store-level EX
+  recording a wall deadline and dropping a log deadline, GET
+  with EX reporting the old value, a plain set clearing an EX
+  deadline, a losing NX and a losing XX with EX writing
+  nothing, and the expired key leaving the sorted scan;
+  replication to every node with the key readable then gone
+  past the deadline for EX and for PX, the TTL query
+  reporting the deadline, an EX set clearing a log deadline
+  on the cluster, invalid values and invalid combinations
+  rejected with no log entry, dedup of a retry returning the
+  first attempt's result with the first deadline kept, the
+  `del` watch event firing from the sweep, surviving a
+  snapshot + restart with the key still expiring at its
+  original deadline, session read-your-writes, pipelined set
+  ops with EX/PX and malformed ops in position, and the CLI
+  end to end.
   The roadmap is exhausted again, so the next real thing is
   a new roadmap item grounded in this project's purpose,
-  proposed by the next run — candidate: SET with EX / PX (an
-  inline wall-clock TTL on SET, Redis's EX seconds / PX
-  milliseconds, instead of the separate setex op).
+  proposed by the next run — candidate: SET with EXAT / PXAT
+  (an absolute wall-clock deadline inline on SET, Redis's
+  EXAT seconds / PXAT milliseconds, the absolute analogue
+  of EX / PX).

@@ -137,7 +137,8 @@ class Session:
     def set(self, key: str, value: str,
             ttl_entries: int | None = None,
             nx: bool = False, xx: bool = False,
-            keepttl: bool = False, get: bool = False) -> dict:
+            keepttl: bool = False, get: bool = False,
+            ex: int | None = None, px: int | None = None) -> dict:
         """Write one key. With ``ttl_entries`` (a positive number
         of log entries) the key expires when the log reaches this
         entry's index + ``ttl_entries`` — a distance in the log,
@@ -154,12 +155,18 @@ class Session:
         this write, None when it was absent — so one round trip
         swaps the value and reports what it replaced, Redis
         SET ... GET; a losing conditional set answers
-        ``old_value`` None. The outcome is decided at apply
-        time, at the entry's exact position in the log, like a
-        CAS: a retry with the same session id returns the first
-        attempt's result instead of writing twice. NX and XX
-        together, or KEEPTTL with a TTL, is a client error — the
-        server rejects it and appends no log entry."""
+        ``old_value`` None. With ``ex`` (seconds) or ``px``
+        (milliseconds) the write carries an inline wall-clock
+        TTL — Redis SET ... EX / PX: the leader fixes the
+        absolute deadline at log time, so every replica applies
+        the same one and the key dies when the wall clock reaches
+        it, like a ``setex`` written as a plain set. The outcome
+        is decided at apply time, at the entry's exact position
+        in the log, like a CAS: a retry with the same session id
+        returns the first attempt's result instead of writing
+        twice. NX and XX together, EX and PX together, EX/PX
+        with a log-entry TTL, or EX/PX with KEEPTTL, is a client
+        error — the server rejects it and appends no log entry."""
         msg: dict = {"type": "client", "op": "set",
                      "key": key, "value": value}
         if ttl_entries is not None:
@@ -172,6 +179,10 @@ class Session:
             msg["keepttl"] = True
         if get:
             msg["get"] = True
+        if ex is not None:
+            msg["ex"] = ex
+        if px is not None:
+            msg["px"] = px
         return self._write(msg)
 
     def setex(self, key: str, value: str, seconds: int) -> dict:
@@ -280,6 +291,8 @@ class Session:
             {"op": "set", "key": k, "value": v, "nx": True}
             {"op": "set", "key": k, "value": v, "xx": True}
             {"op": "set", "key": k, "value": v, "keepttl": True}
+            {"op": "set", "key": k, "value": v, "ex": n}
+            {"op": "set", "key": k, "value": v, "px": n}
             {"op": "del", "key": k}
             {"op": "cas", "key": k, "expected": e, "value": v}
             {"op": "incr", "key": k, "by": n}
@@ -1046,6 +1059,44 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
         for field in ("nx", "xx", "keepttl", "get"):
             if op.get(field):
                 msg[field] = True
+        # EX / PX ride along with a pipelined set, validated here
+        # so a malformed one never goes on the wire: an integer
+        # number of seconds / milliseconds, 1..1,000,000 /
+        # 1..1,000,000,000, never together, never with a
+        # log-entry TTL and never with KEEPTTL — the same shapes
+        # the server enforces.
+        ex = op.get("ex")
+        if (ex is not None
+                and (not isinstance(ex, int) or isinstance(ex, bool)
+                     or ex < 1 or ex > 1_000_000)):
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline set EX must be an "
+                                   "integer between 1 and 1000000"}
+        px = op.get("px")
+        if (px is not None
+                and (not isinstance(px, int) or isinstance(px, bool)
+                     or px < 1 or px > 1_000_000_000)):
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline set PX must be an "
+                                   "integer between 1 and 1000000000"}
+        if ex is not None and px is not None:
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline set EX and PX are "
+                                   "mutually exclusive"}
+        if ((ex is not None or px is not None)
+                and op.get("ttl_entries") is not None):
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline set EX/PX cannot be "
+                                   "combined with ttl_entries"}
+        if ((ex is not None or px is not None)
+                and op.get("keepttl")):
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline set EX/PX cannot be "
+                                   "combined with KEEPTTL"}
+        if ex is not None:
+            msg["ex"] = ex
+        if px is not None:
+            msg["px"] = px
     if name == "cas":
         expected = op.get("expected")
         if not isinstance(expected, str):
@@ -1826,6 +1877,17 @@ def main(argv: list[str] | None = None) -> int:
                             "this write (Redis SET GET): prints the old "
                             "value, or (nil) when the key was absent or "
                             "a conditional set lost")
+    g_ex = p_set.add_mutually_exclusive_group()
+    g_ex.add_argument("--ex", type=int, default=None,
+                      help="expire the key this many seconds after "
+                           "the write (Redis SET EX): the leader "
+                           "fixes the absolute deadline at log time, "
+                           "so every replica applies the same one")
+    g_ex.add_argument("--px", type=int, default=None,
+                      help="expire the key this many milliseconds "
+                           "after the write (Redis SET PX): the same "
+                           "wall-clock deadline as --ex, in "
+                           "milliseconds")
     p_set.add_argument("--client-id", default=None,
                        help="session id for at-most-once writes: a retry "
                             "with the same client id + request id returns "
@@ -2328,6 +2390,10 @@ def main(argv: list[str] | None = None) -> int:
             msg["keepttl"] = True
         if args.get:
             msg["get"] = True
+        if args.ex is not None:
+            msg["ex"] = args.ex
+        if args.px is not None:
+            msg["px"] = args.px
     if op == "mset":
         if args.ttl_entries is not None:
             msg["ttl_entries"] = args.ttl_entries

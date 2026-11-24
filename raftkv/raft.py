@@ -99,6 +99,10 @@ TTL_MAX_ENTRIES = 1_000_000
 # only rejects nonsense, never a real use. The same scale as the
 # log-entry TTL cap, for the same reason.
 WALL_TTL_MAX_SECONDS = 1_000_000
+# Largest wall-clock TTL a ``set`` may carry with PX, in
+# milliseconds: the same 1,000,000-second span as the seconds cap,
+# so EX and PX reject the same nonsense at the same horizon.
+WALL_TTL_MAX_MS = 1_000_000_000
 # How often the background sweep checks for wall-clock deadlines
 # that have passed: a key dies at most this long after its
 # deadline even on a quiet cluster, with no log advance at all.
@@ -2660,6 +2664,57 @@ class RaftNode:
                 return {"type": "client_response", "status": "error",
                         "error": "set KEEPTTL cannot be combined "
                                  "with ttl_entries"}
+            # SET ... EX / PX: an inline wall-clock TTL, Redis's
+            # EX seconds / PX milliseconds — the same wall-clock
+            # deadline a ``setex`` carries, fixed here on the
+            # leader at log time (now + seconds, now +
+            # milliseconds / 1000) and stored in the command
+            # itself, so every replica applies the same deadline
+            # and a replay or a snapshot restores it exactly.
+            # EX and PX are mutually exclusive, and neither rides
+            # with a log-entry TTL or with KEEPTTL — Redis rejects
+            # all three combinations, since a set can name only
+            # one way for the key to die (or to keep the one it
+            # has). The values are validated here, on the leader,
+            # before the command is ever logged — a bad one is a
+            # client error, not a log entry.
+            ex = msg.get("ex")
+            if (ex is not None
+                    and (not isinstance(ex, int)
+                         or isinstance(ex, bool)
+                         or ex < 1 or ex > WALL_TTL_MAX_SECONDS)):
+                return {"type": "client_response", "status": "error",
+                        "error": "set EX must be an integer "
+                                 "between 1 and "
+                                 f"{WALL_TTL_MAX_SECONDS}"}
+            px = msg.get("px")
+            if (px is not None
+                    and (not isinstance(px, int)
+                         or isinstance(px, bool)
+                         or px < 1 or px > WALL_TTL_MAX_MS)):
+                return {"type": "client_response", "status": "error",
+                        "error": "set PX must be an integer "
+                                 "between 1 and "
+                                 f"{WALL_TTL_MAX_MS}"}
+            if ex is not None and px is not None:
+                return {"type": "client_response", "status": "error",
+                        "error": "set EX and PX are mutually "
+                                 "exclusive"}
+            if ((ex is not None or px is not None)
+                    and msg.get("ttl_entries") is not None):
+                return {"type": "client_response", "status": "error",
+                        "error": "set EX/PX cannot be combined "
+                                 "with ttl_entries"}
+            if (ex is not None or px is not None) and msg.get("keepttl"):
+                return {"type": "client_response", "status": "error",
+                        "error": "set EX/PX cannot be combined "
+                                 "with KEEPTTL"}
+            if ex is not None:
+                command["ex"] = ex
+                command["wall_deadline"] = time.time() + ex
+            elif px is not None:
+                command["px"] = px
+                command["wall_deadline"] = time.time() + px / 1000.0
             for field in ("nx", "xx", "keepttl", "get"):
                 if msg.get(field):
                     command[field] = True
