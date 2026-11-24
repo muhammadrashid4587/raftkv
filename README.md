@@ -212,6 +212,26 @@ logic and the failure handling, not the key-value API on top.
   result instead of appending a second entry. An `expire`
   with no count, or a count outside 1 to 1,000,000, is a
   client error and appends nothing.
+- **Atomic counters** — since v0.40.0 `incr key [by]` (`Session.incr(k,
+  by=1)`, `client.incr(addr, k, by)`, `incr key [by]` on the CLI)
+  adds `by` (default 1, may be negative) to the key's integer value
+  and returns the new value as a string, Redis INCR/INCRBY: a
+  missing key counts as 0, so the first incr creates it. The outcome
+  is decided at apply time, at the entry's exact position in the log,
+  like a CAS — a non-integer value fails distinctly (`incr_failed`,
+  reason `not_an_integer`, with the current value in the reply) from
+  a result outside the signed 64-bit range (`overflow`), and a failed
+  incr writes nothing but still committed its entry, so a retry with
+  the same session id returns the first attempt's exact result
+  instead of incrementing twice. A successful incr keeps the key's
+  TTL deadline, like a CAS, and fires a `set` watch event with the
+  new value; a failed one fires nothing. It rides the same write path
+  as a single `set` — group-commit batching, dedup, the response's
+  log index advancing a session's watermark — and `{"op": "incr",
+  "key": k, "by": n}` is a pipeline op too. The honest limit is the
+  range itself: values are decimal strings, so a counter past
+  9,223,372,036,854,775,807 is an error, not a wrap, and there is no
+  `decr` spelling — a negative `by` is the decrement.
 - **Key enumeration** — since v0.31.0 one `keys` RPC lists the
   store's keys (`client.keys(prefix, limit, start_after)`,
   `Session.keys(prefix, limit, start_after)`, `keys --prefix p
@@ -526,7 +546,7 @@ make test
 # or: python3 -m unittest discover -s tests -v
 ```
 
-265 tests, plus a smoke test for the benchmark script, all passing:
+295 tests, plus a smoke test for the benchmark script, all passing:
 
 | Test | What it proves |
 |---|---|
@@ -613,6 +633,26 @@ make test
 | `test_cas_retry_with_same_session_id_returns_same_result` | Retried CAS returns the first attempt's result, one log entry |
 | `test_cas_failed_result_survives_snapshot_and_restart` | A failed CAS result survives compaction and a leader restart |
 | `test_cas_cli` | The `cas` CLI subcommand works end to end |
+| `test_incr_missing_key_creates_at_by` | Incr on a missing key creates it at `by` (default 1) |
+| `test_incr_adds_and_subtracts` | Incr adds, a negative `by` subtracts, `by` 0 is a no-op |
+| `test_incr_rejects_non_integer_value` | Incr on a non-integer value fails as not_an_integer and writes nothing |
+| `test_incr_rejects_loose_integer_spellings` | Whitespace, underscores, and decimals are not integers to incr |
+| `test_incr_rejects_out_of_range_value` | A value outside the signed 64-bit range is not an integer to incr |
+| `test_incr_rejects_overflow` | A result past the signed 64-bit bounds fails as overflow |
+| `test_incr_keeps_ttl_deadline` | A successful incr keeps the key's TTL deadline and the key still expires on schedule |
+| `test_incr_new_key_joins_sorted_index` | A key created by incr joins the sorted scan index |
+| `test_incr_succeeds_and_replicates` | Incr writes and replicates to every node, and reads back the new value |
+| `test_incr_on_non_integer_fails_and_writes_nothing` | A failed incr leaves the value unchanged on every node |
+| `test_incr_rejects_non_integer_by` | A non-integer `by` is a client error and appends nothing |
+| `test_incr_from_follower_redirects` | An incr sent to a follower is redirected to the leader and still applies |
+| `test_incr_retry_appends_once_and_returns_same_value` | A retried incr returns the first attempt's value and appends no second entry |
+| `test_failed_incr_retry_returns_same_failure` | A retried failed incr returns the same failure, one log entry |
+| `test_incr_continues_after_leader_change` | The counter keeps counting through a leader change |
+| `test_incr_fires_watch_event_with_new_value` | A successful incr fires a set watch event with the new value on leader and follower; a failed one fires nothing |
+| `test_incr_survives_snapshot_and_restart` | The counter survives log compaction and a leader restart |
+| `test_session_incr_is_read_your_writes` | A session incr advances the write watermark and the next read sees the new value |
+| `test_pipeline_incr_ops` | Pipelined incr ops reply in order, a malformed `by` is an error in position |
+| `test_incr_cli` | The `incr` CLI subcommand prints the new value and exits 1 on a failed incr |
 | `test_random_kill_restart_mid_write_loses_nothing` | Seeded chaos: 4 kill/restart cycles mid-write, every acked write survives on every node, all nodes converge to identical state, and the recorded read history is linearizable — now with CAS threads incrementing owned and shared counters through the same faults |
 | `test_stale_read_after_overwrite_is_flagged` | A read invoked after an overwrite completed but returning the old value fails the linearizability check |
 | `test_concurrent_read_may_see_old_or_new_value` | A read overlapping an overwrite may return either value |
@@ -1728,6 +1768,34 @@ entries left in `log.jsonl` are dropped by their index on reload.
   one `del` watch event per pair at the deadline index, the
   deadlines surviving a snapshot + restart, bad TTLs rejected
   with no log entry appended, and the session and CLI paths
-  end to end. The roadmap's only open item is group commit
-  (fsync batching) — the next run takes that, or proposes the
-  next real thing if it is done.
+  end to end.
+- ~~Atomic counter (incr/incrby)~~ — done in v0.40.0,
+  Nov 24, 2026: `incr key [by]` adds `by` (default 1) to the
+  key's integer value and returns the new value as a string —
+  a missing key counts as 0, a non-integer value fails as
+  `incr_failed` / `not_an_integer`, a result outside the
+  signed 64-bit range as `overflow`, both decided at apply
+  time like a CAS, so a retry with the same session id
+  returns the first attempt's exact result instead of
+  incrementing twice. A successful incr keeps the key's TTL
+  deadline, fires a `set` watch event with the new value, and
+  rides the same write path as a `set` (group-commit
+  batching, dedup, session watermark); `{"op": "incr"}` is a
+  pipeline op too. `Session.incr`, `client.incr`, and `incr
+  key [by]` on the CLI expose it. `tests/test_incr.py`
+  proves it: store-level creation, negative and zero deltas,
+  strict integer parsing (whitespace, underscores, and
+  decimals rejected), out-of-range values and overflow,
+  deadline kept across an incr and expiry still firing, the
+  new key joining the sorted index, replication to every
+  node, redirect from a follower, dedup of a successful and
+  a failed retry, continuing after a leader change, the
+  watch event on leader and follower with nothing fired on
+  failure, surviving a snapshot + restart, session
+  read-your-writes, pipelined incr ops with a malformed `by`
+  in position, and the CLI end to end. The roadmap is
+  exhausted again — group commit, the item the watermark
+  named as next, was already shipped in v0.7.0 (and made
+  configurable in v0.26.0), so the next real thing is a new
+  roadmap item grounded in this project's purpose, proposed
+  by the next run.

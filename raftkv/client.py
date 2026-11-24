@@ -125,7 +125,7 @@ class Session:
         # index and leave the watermark where it was: the write may
         # still have committed, and the next read must not claim a
         # watermark the client never saw acknowledged.
-        if (resp.get("status") in ("ok", "cas_failed")
+        if (resp.get("status") in ("ok", "cas_failed", "incr_failed")
                 and resp.get("index") is not None):
             self.last_write_index = int(resp["index"])
             self.last_write_term = int(resp.get("term") or 0)
@@ -195,6 +195,7 @@ class Session:
             {"op": "set", "key": k, "value": v, "ttl_entries": n}
             {"op": "del", "key": k}
             {"op": "cas", "key": k, "expected": e, "value": v}
+            {"op": "incr", "key": k, "by": n}
 
         The whole list goes out in batches of ``depth`` on a single
         persistent socket without waiting between requests, and the
@@ -269,7 +270,8 @@ class Session:
                     sent[j] = resp
             for j, resp in enumerate(sent):
                 replies[positions[j]] = resp
-                if (resp.get("status") in ("ok", "cas_failed")
+                if (resp.get("status")
+                        in ("ok", "cas_failed", "incr_failed")
                         and resp.get("index") is not None):
                     index = int(resp["index"])
                     if index > self.last_write_index:
@@ -286,6 +288,23 @@ class Session:
     def cas(self, key: str, expected: str, value: str) -> dict:
         return self._write({"type": "client", "op": "cas", "key": key,
                             "expected": expected, "value": value})
+
+    def incr(self, key: str, by: int = 1) -> dict:
+        """Atomically add ``by`` (default 1) to the key's integer
+        value, Redis INCR/INCRBY: a missing key counts as 0, so
+        the first incr creates it at ``by``. The outcome is decided
+        at apply time, at the entry's position in the log, so the
+        reply carries the new value as a string (``value``) — or
+        ``incr_failed`` with a reason (``not_an_integer`` when the
+        current value is not an integer, ``overflow`` when the
+        result would leave the signed 64-bit range) and the current
+        value. A failed incr still committed its entry, so its
+        index is a valid watermark, exactly like a failed CAS; a
+        retry with the same session id returns the first attempt's
+        result instead of incrementing twice, and a successful
+        incr keeps the key's TTL deadline, like a CAS."""
+        return self._write({"type": "client", "op": "incr", "key": key,
+                            "by": by})
 
     def get(self, key: str) -> dict:
         # The read carries the higher of the two watermarks — the
@@ -562,15 +581,17 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
     response) when the op is malformed — the error goes in the
     op's reply position and nothing goes on the wire for it.
     ``set`` needs a string key and value, ``del`` a string key,
-    ``cas`` a string key, expected, and value."""
+    ``cas`` a string key, expected, and value, ``incr`` a string
+    key and an integer ``by`` (default 1)."""
     if not isinstance(op, dict):
         return None, {"type": "client_response", "status": "error",
                       "error": "pipeline op must be an object with "
                                "op, key, and value fields"}
     name = op.get("op")
-    if name not in ("set", "del", "cas"):
+    if name not in ("set", "del", "cas", "incr"):
         return None, {"type": "client_response", "status": "error",
-                      "error": "pipeline op must be set, del, or cas"}
+                      "error": "pipeline op must be set, del, cas, "
+                               "or incr"}
     key = op.get("key")
     if not isinstance(key, str):
         return None, {"type": "client_response", "status": "error",
@@ -602,6 +623,16 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
                           "error": "pipeline cas needs a string "
                                    "expected value"}
         msg["expected"] = expected
+    if name == "incr":
+        # ``by`` rides along with a pipelined incr, validated here
+        # so a malformed one never goes on the wire: an integer,
+        # default 1 — the same shape the server enforces.
+        by = op.get("by", 1)
+        if not isinstance(by, int) or isinstance(by, bool):
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline incr by must be an "
+                                   "integer"}
+        msg["by"] = by
     return msg, None
 
 
@@ -609,7 +640,7 @@ def pipeline(node_addr: tuple[str, int], ops: list,
              timeout: float = 12.0, depth: int = 50) -> list[dict]:
     """Send many writes pipelined over one connection.
 
-    One ``set`` / ``del`` / ``cas`` op per dict (see
+    One ``set`` / ``del`` / ``cas`` / ``incr`` op per dict (see
     ``Session.pipeline`` for the shapes): the ops go out in
     batches of ``depth`` on a single persistent socket and the
     replies come back aligned by position. Each op carries a
@@ -761,6 +792,25 @@ def expire(node_addr: tuple[str, int], key: str, entries: int,
     key is purged — and 0 when it does not, like Redis's EXPIRE)."""
     return request(node_addr, {"type": "client", "op": "expire",
                                "key": key, "ttl_entries": entries},
+                   timeout=timeout)
+
+
+def incr(node_addr: tuple[str, int], key: str, by: int = 1,
+         timeout: float = 12.0) -> dict:
+    """Atomically add ``by`` (default 1) to the key's integer value,
+    following leader redirects like ``request``.
+
+    One request appends the incr entry, so the new value is decided
+    at the entry's position in the log — the single-request
+    equivalent of a read-modify-write, without the race. The reply
+    is the plain incr response (``status`` ``ok`` with the new
+    value as a string, or ``incr_failed`` with a reason —
+    ``not_an_integer`` when the current value is not an integer,
+    ``overflow`` when the result would leave the signed 64-bit
+    range — and the current value). A missing key counts as 0, so
+    the first incr creates it at ``by``."""
+    return request(node_addr, {"type": "client", "op": "incr",
+                               "key": key, "by": by},
                    timeout=timeout)
 
 
@@ -1032,6 +1082,21 @@ def main(argv: list[str] | None = None) -> int:
                             "twice")
     p_cas.add_argument("--request-id", default=None,
                        help="id of this write within the client session")
+    p_incr = sub.add_parser(
+        "incr",
+        help="atomically add BY (default 1) to the key's integer value "
+             "and print the new value; a missing key counts as 0, a "
+             "non-integer value or a 64-bit overflow fails")
+    p_incr.add_argument("key")
+    p_incr.add_argument("by", nargs="?", type=int, default=1,
+                        help="amount to add (default 1, may be negative)")
+    p_incr.add_argument("--client-id", default=None,
+                        help="session id for at-most-once writes: a retry "
+                             "with the same client id + request id returns "
+                             "the first attempt's result instead of writing "
+                             "twice")
+    p_incr.add_argument("--request-id", default=None,
+                        help="id of this write within the client session")
     p_add = sub.add_parser("add-server",
                            help="add a server to the cluster (Raft §6)")
     p_add.add_argument("server_id")
@@ -1122,7 +1187,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(resp))
         return 0
     msg: dict = {"type": "client", "op": op}
-    if op in ("set", "get", "del", "cas", "ttl", "expire"):
+    if op in ("set", "get", "del", "cas", "ttl", "expire", "incr"):
         msg["key"] = args.key
     elif op == "mset":
         if len(args.pairs) % 2:
@@ -1155,7 +1220,10 @@ def main(argv: list[str] | None = None) -> int:
         msg["value"] = args.value
     if op == "expire":
         msg["ttl_entries"] = args.entries
-    if op in ("set", "del", "cas", "mset", "expire") and args.request_id:
+    if op == "incr":
+        msg["by"] = args.by
+    if op in ("set", "del", "cas", "mset", "expire", "incr") \
+            and args.request_id:
         # A request id without an explicit client id still dedups
         # within the default "cli" session; the same id retried from
         # another session is a different write.
@@ -1188,6 +1256,8 @@ def main(argv: list[str] | None = None) -> int:
             print(resp.get("ttl"))
         elif op == "expire":
             print(resp.get("expire"))
+        elif op == "incr":
+            print(resp.get("value"))
         elif op == "mget":
             print(json.dumps(resp.get("values")))
         elif op == "keys":

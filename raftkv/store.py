@@ -10,6 +10,23 @@ pure function of (current state, command).
 
 import bisect
 
+# Signed 64-bit bounds, the range Redis's INCR/INCRBY works in: a
+# value outside it is not an integer Redis can count, and a result
+# outside it is an overflow, not a bigger number.
+_INT64_MIN = -(2 ** 63)
+_INT64_MAX = 2 ** 63 - 1
+
+
+def _is_integer_string(s: str) -> bool:
+    """Whether ``s`` is a Redis-style integer: an optional sign
+    followed by digits only. ``int()`` alone is too lenient — it
+    accepts whitespace and underscores ("1_0", " 1"), which Redis
+    rejects — so the shape is checked first and ``int()`` only
+    parses what already looks like an integer."""
+    if s.startswith(("+", "-")):
+        s = s[1:]
+    return bool(s) and s.isdigit()
+
 
 class KVStore:
     def __init__(self) -> None:
@@ -73,16 +90,16 @@ class KVStore:
         ``ttl_entries`` sets the same deadline (its entry's
         index + the TTL) on every pair it touches, so the whole
         batch expires together. A successful CAS keeps the key's
-        deadline: it is a conditional update of the value, not a
-        fresh set, so it must not resurrect a key that is about
-        to expire.
+        deadline, and so does a successful incr: both are updates
+        of the value, not fresh sets, so neither must resurrect a
+        key that is about to expire.
 
         Returns a result dict for commands whose outcome depends on the
-        state at apply time — currently "cas" and "expire" — and None
-        for set/del, whose outcome is always ok. The result is what
-        the leader hands back to the waiting client and what the dedup
-        table caches for retries, so it must be a pure function of
-        (state before, command): every node applying the same log
+        state at apply time — currently "cas", "expire", and "incr" —
+        and None for set/del, whose outcome is always ok. The result is
+        what the leader hands back to the waiting client and what the
+        dedup table caches for retries, so it must be a pure function
+        of (state before, command): every node applying the same log
         computes the same result.
         """
         op = command.get("op")
@@ -192,6 +209,55 @@ class KVStore:
             self._data[key] = command["value"]
             return {"type": "client_response", "status": "ok",
                     "cas": "success"}
+        elif op == "incr":
+            # Atomic counter increment, Redis INCR/INCRBY: add
+            # ``by`` (default 1) to the key's current value, which
+            # must be a base-10 integer string — a missing key
+            # counts as 0, so the first incr creates it at ``by`` —
+            # and the result must fit a signed 64-bit integer, or
+            # the increment errors instead of wrapping. The outcome
+            # is decided here, at this exact point in the log, so
+            # every node computes the same result and a retry with
+            # the same session id returns the first attempt's
+            # outcome from the dedup table instead of incrementing
+            # twice. A failed incr writes nothing at all, like a
+            # failed CAS, but it still committed its entry — the
+            # failure is the entry's result, not a client error.
+            # A successful incr keeps the key's deadline, like a
+            # CAS: it is an update of the value, not a fresh set,
+            # so it must not resurrect a key that is about to
+            # expire. A new key joins the sorted index, like a set
+            # of a new key; the value is stored as its decimal
+            # string, so a later get reads back exactly what incr
+            # returned.
+            key = command["key"]
+            by = command.get("by", 1)
+            current = self._data.get(key)
+            if current is None:
+                current_int = 0
+            elif (not _is_integer_string(current)
+                    or not _INT64_MIN <= int(current) <= _INT64_MAX):
+                return {"type": "client_response",
+                        "status": "incr_failed",
+                        "reason": "not_an_integer",
+                        "current": current,
+                        "error": f"incr failed: value of {key!r} is "
+                                 "not an integer"}
+            else:
+                current_int = int(current)
+            new = current_int + by
+            if not _INT64_MIN <= new <= _INT64_MAX:
+                return {"type": "client_response",
+                        "status": "incr_failed",
+                        "reason": "overflow",
+                        "current": current,
+                        "error": "incr failed: increment would "
+                                 "overflow"}
+            if key not in self._data:
+                bisect.insort(self._keys, key)
+            self._data[key] = str(new)
+            return {"type": "client_response", "status": "ok",
+                    "value": str(new)}
         else:
             raise ValueError(f"unknown command op: {op!r}")
 

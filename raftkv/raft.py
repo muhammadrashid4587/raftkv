@@ -1327,9 +1327,10 @@ class RaftNode:
             elif op == "noop":
                 pass
             else:
-                # The apply result matters for CAS and expire: their
-                # outcome is decided here, at this exact point in the
-                # log, so the result is recorded in the dedup table
+                # The apply result matters for CAS, expire, and incr:
+                # their outcome is decided here, at this exact point
+                # in the log, so the result is recorded in the dedup
+                # table
                 # (a retry gets the first attempt's outcome, not a
                 # re-execution) and, while this node is the leader,
                 # by log index for the waiter that submitted the entry
@@ -1364,7 +1365,15 @@ class RaftNode:
                     self.watch.notify(entry["command"]["key"],
                                       entry["command"]["value"], "set",
                                       index=self.last_applied)
-                if (op in ("cas", "expire") and result is not None
+                elif (op == "incr" and result is not None
+                        and result.get("status") == "ok"):
+                    # A successful incr fires like a set, with the
+                    # new value: a failed incr wrote nothing, so it
+                    # fires nothing, like a failed CAS.
+                    self.watch.notify(entry["command"]["key"],
+                                      result["value"], "set",
+                                      index=self.last_applied)
+                if (op in ("cas", "expire", "incr") and result is not None
                         and self.role == "leader"):
                     # Record the outcome only when a local waiter is
                     # waiting on it: the waiter is the only consumer,
@@ -1374,9 +1383,9 @@ class RaftNode:
                     # would sit in _apply_results forever. A write
                     # without a session id has no dedup key, so it
                     # always records: its waiter is identified by
-                    # index alone. CAS and expire are the ops whose
-                    # apply returns a result — a set/del returns None
-                    # and has nothing to record.
+                    # index alone. CAS, expire, and incr are the ops
+                    # whose apply returns a result — a set/del
+                    # returns None and has nothing to record.
                     key = _dedup_key(entry["command"])
                     if key is None or key in self._dedup_inflight:
                         self._apply_results[self.last_applied] = result
@@ -1410,9 +1419,10 @@ class RaftNode:
         """Record an applied client write in the dedup table. Lock held.
         The cached result is what a retry with the same session id gets
         back instead of a second log entry. For set/del the result is
-        always ok once committed; for CAS and expire it is the
+        always ok once committed; for CAS, expire, and incr it is the
         apply-time outcome (success, mismatch, or missing key for a
-        CAS; 1 or 0 for an expire), so a retry returns the first
+        CAS; 1 or 0 for an expire; the new value, or not_an_integer
+        / overflow for an incr), so a retry returns the first
         attempt's exact result. The result also carries the log
         index and term of the entry that produced it: a retried write
         reports the same index as the first attempt, and a client
@@ -2100,10 +2110,11 @@ class RaftNode:
                         "error": "this node was removed from the cluster"}
             return self._on_mset(msg)
         key = msg.get("key")
-        if op not in ("set", "get", "del", "cas", "ttl", "expire") \
+        if op not in ("set", "get", "del", "cas", "ttl", "expire",
+                      "incr") \
                 or key is None:
             return {"type": "client_response", "status": "error",
-                    "error": "op must be set/get/del/cas/ttl/expire "
+                    "error": "op must be set/get/del/cas/ttl/expire/incr "
                              "with a key"}
         if self._is_removed():
             return {"type": "client_response", "status": "error",
@@ -2180,6 +2191,19 @@ class RaftNode:
                         "error": "cas requires value"}
             command["expected"] = msg["expected"]
             command["value"] = msg["value"]
+        if op == "incr":
+            # An atomic counter increment: add ``by`` (default 1)
+            # to the key's integer value, decided at apply time
+            # like a CAS — a missing key counts as 0, a
+            # non-integer value and a 64-bit overflow fail there,
+            # not here. Validated here only for shape: ``by`` must
+            # be an integer (a bool is not one), so a malformed
+            # incr is a client error and appends no log entry.
+            by = msg.get("by", 1)
+            if not isinstance(by, int) or isinstance(by, bool):
+                return {"type": "client_response", "status": "error",
+                        "error": "incr by must be an integer"}
+            command["by"] = by
         # Client session id, when the client sent one: it rides in the
         # log entry so every node records the same dedup key on apply.
         for field in ("client_id", "request_id"):
