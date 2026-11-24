@@ -130,7 +130,7 @@ class Session:
                 in ("ok", "cas_failed", "incr_failed",
                     "incrbyfloat_failed", "append_failed",
                     "setrange_failed", "setbit_failed",
-                    "pfadd_failed")
+                    "pfadd_failed", "hset_failed")
                 and resp.get("index") is not None):
             self.last_write_index = int(resp["index"])
             self.last_write_term = int(resp.get("term") or 0)
@@ -326,6 +326,7 @@ class Session:
             {"op": "setrange", "key": k, "offset": n, "value": v}
             {"op": "setbit", "key": k, "offset": n, "bit": b}
             {"op": "pfadd", "key": k, "elements": [e1, e2, ...]}
+            {"op": "hset", "key": k, "pairs": [[f1, v1], [f2, v2]]}
             {"op": "setex", "key": k, "value": v, "seconds": n}
             {"op": "expireat", "key": k, "timestamp": t}
             {"op": "pexpireat", "key": k, "timestamp_ms": t}
@@ -407,7 +408,8 @@ class Session:
                         in ("ok", "cas_failed", "incr_failed",
                             "incrbyfloat_failed",
                             "append_failed", "setrange_failed",
-                            "setbit_failed", "pfadd_failed")
+                            "setbit_failed", "pfadd_failed",
+                            "hset_failed")
                         and resp.get("index") is not None):
                     index = int(resp["index"])
                     if index > self.last_write_index:
@@ -743,6 +745,55 @@ class Session:
                 self.last_read_term = int(resp.get("read_term") or 0)
         return resp
 
+    def hset(self, key: str, fields: dict[str, str]) -> dict:
+        """Set ``fields`` — a dict of field to value — in the hash
+        at ``key``, Redis HSET: a missing key is created as an
+        empty hash, and the reply carries ``hset`` — the number of
+        fields that did not exist before (a field overwritten with
+        a new value is not counted). The outcome is decided at
+        apply time, at the entry's position in the log, so a retry
+        with the same session id returns the first attempt's count
+        instead of setting twice, and a successful hset keeps the
+        key's TTL deadline, like a CAS. A plain string value fails
+        with ``hset_failed`` and reason ``wrongtype`` instead of
+        writing. A successful hset advances the write watermark
+        from the reply's index, like any other write — and so
+        does a failed one, since it still committed its entry."""
+        return self._write({"type": "client", "op": "hset",
+                            "key": key,
+                            "pairs": [[f, v]
+                                      for f, v in fields.items()]})
+
+    def hget(self, key: str, field: str) -> dict:
+        """Ask for the value of ``field`` in the hash at ``key``,
+        Redis HGET: None when the key does not exist or the field
+        is not set, and a client error — not a field — when the key
+        holds a plain string. It rides the same ReadIndex path as
+        ``get``, so it carries the same session watermark and
+        advances the read watermark from the reply's
+        ``read_index`` exactly the same way: a field query after
+        your own write sees the field that write set, and a later
+        read never goes backwards past it."""
+        if self.last_read_index > self.last_write_index:
+            min_index = self.last_read_index
+            term = self.last_read_term
+        else:
+            min_index = self.last_write_index
+            term = self.last_write_term
+        msg: dict = {"type": "client", "op": "hget", "key": key,
+                     "field": field,
+                     "client_id": self.client_id,
+                     "min_commit_index": min_index,
+                     "session_term": term}
+        resp = request(self.node_addr, msg, pool=self._pooled)
+        if (resp.get("status") == "ok"
+                and resp.get("read_index") is not None):
+            read_index = int(resp["read_index"])
+            if read_index > self.last_read_index:
+                self.last_read_index = read_index
+                self.last_read_term = int(resp.get("read_term") or 0)
+        return resp
+
     def get(self, key: str) -> dict:
         # The read carries the higher of the two watermarks — the
         # last acknowledged write, or the newest state a previous
@@ -1033,7 +1084,9 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
     string key, an integer ``offset`` and a string value,
     ``setbit`` a string key, an integer ``offset`` and a bit
     that is 0 or 1, ``pfadd`` a string key and a non-empty list
-    of at most 1000 string elements, ``setex`` a string key and
+    of at most 1000 string elements, ``hset`` a string key and a
+    non-empty list of at most 1000 [field, value] string pairs,
+    ``setex`` a string key and
     value plus an integer ``seconds`` from 1 to 1000000 — the
     wall-clock TTL, whose absolute deadline the leader fixes at
     log time — ``expireat`` a string key and a positive integer
@@ -1047,12 +1100,12 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
     if name not in ("set", "del", "cas", "incr", "incrbyfloat",
                     "setnx", "getset",
                     "append", "getdel", "getex", "setrange", "setbit",
-                    "pfadd", "setex", "expireat", "pexpireat"):
+                    "pfadd", "hset", "setex", "expireat", "pexpireat"):
         return None, {"type": "client_response", "status": "error",
                       "error": "pipeline op must be set, del, cas, "
                                "incr, incrbyfloat, setnx, getset, append, "
                                "getdel, getex, setrange, setbit, "
-                               "pfadd, setex, expireat, or pexpireat"}
+                               "pfadd, hset, setex, expireat, or pexpireat"}
     key = op.get("key")
     if not isinstance(key, str):
         return None, {"type": "client_response", "status": "error",
@@ -1261,6 +1314,26 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
                           "error": "pipeline pfadd elements must be "
                                    "a list of 1 to 1000 strings"}
         msg["elements"] = list(elements)
+    if name == "hset":
+        # ``pairs`` rides along with a pipelined hset, validated
+        # here so a malformed one never goes on the wire: a
+        # non-empty list of at most 1000 [field, value] string
+        # pairs — the same shape the server enforces (the server
+        # also caps it, so a huge list is still a client error
+        # there, not a log entry).
+        pairs = op.get("pairs")
+        if (not isinstance(pairs, list) or not pairs
+                or len(pairs) > 1000
+                or any(not isinstance(p, (list, tuple))
+                       or len(p) != 2
+                       or not isinstance(p[0], str)
+                       or not isinstance(p[1], str)
+                       for p in pairs)):
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline hset pairs must be a "
+                                   "list of 1 to 1000 [field, value] "
+                                   "string pairs"}
+        msg["pairs"] = [[f, v] for f, v in pairs]
     if name == "setex":
         # ``seconds`` rides along with a pipelined setex,
         # validated here so a malformed one never goes on the
@@ -1841,6 +1914,44 @@ def pfcount(node_addr: tuple[str, int], key: str,
                                "key": key}, timeout=timeout)
 
 
+def hset(node_addr: tuple[str, int], key: str,
+         fields: dict[str, str], timeout: float = 12.0) -> dict:
+    """Set ``fields`` — a dict of field to value — in the hash at
+    ``key``, following leader redirects like ``request`` — Redis
+    HSET.
+
+    One request appends the hset entry, so the count it returns is
+    decided at the entry's position in the log: the reply is the
+    plain hset response (``status`` ``ok`` with ``hset`` — the
+    number of fields that did not exist before — or
+    ``hset_failed`` with reason ``wrongtype`` when the current
+    value is a plain string). A missing key is created as an empty
+    hash; at most 1000 pairs per call. A successful hset keeps the
+    key's TTL deadline, like a CAS."""
+    return request(node_addr, {"type": "client", "op": "hset",
+                               "key": key,
+                               "pairs": [[f, v]
+                                         for f, v in fields.items()]},
+                   timeout=timeout)
+
+
+def hget(node_addr: tuple[str, int], key: str, field: str,
+         timeout: float = 12.0) -> dict:
+    """Ask for the value of ``field`` in the hash at ``key``,
+    following leader redirects like ``request`` — Redis HGET.
+
+    One request serves the field through the leader's ReadIndex
+    path, so it reflects the committed state as of one read index,
+    exactly as linearizable as a ``get``. The reply is the plain
+    hget response (``status`` ``ok`` with ``value`` — the field's
+    value, None when the key does not exist or the field is not
+    set — plus the ``read_index`` / ``read_term`` it was measured
+    at). A plain string value is a client error, not a field."""
+    return request(node_addr, {"type": "client", "op": "hget",
+                               "key": key, "field": field},
+                   timeout=timeout)
+
+
 def mset(node_addr: tuple[str, int], pairs: list,
          ttl_entries: int | None = None,
          timeout: float = 12.0) -> dict:
@@ -2408,6 +2519,28 @@ def main(argv: list[str] | None = None) -> int:
         help="print the HyperLogLog cardinality estimate at key; "
              "0 when the key does not exist")
     p_pfcount.add_argument("key")
+    p_hset = sub.add_parser(
+        "hset",
+        help="set fields in the hash at key and print the number of "
+             "fields that did not exist before; a missing key is "
+             "created as an empty hash")
+    p_hset.add_argument("key")
+    p_hset.add_argument("pairs", nargs="+",
+                        help="field value pairs: f1 v1 f2 v2 ... "
+                             "(at most 1000 pairs)")
+    p_hset.add_argument("--client-id", default=None,
+                        help="session id for at-most-once writes: a retry "
+                             "with the same client id + request id returns "
+                             "the first attempt's result instead of writing "
+                             "twice")
+    p_hset.add_argument("--request-id", default=None,
+                        help="id of this write within the client session")
+    p_hget = sub.add_parser(
+        "hget",
+        help="print the value of field in the hash at key (or (nil) "
+             "when the key does not exist or the field is not set)")
+    p_hget.add_argument("key")
+    p_hget.add_argument("field")
     p_add = sub.add_parser("add-server",
                            help="add a server to the cluster (Raft §6)")
     p_add.add_argument("server_id")
@@ -2502,7 +2635,8 @@ def main(argv: list[str] | None = None) -> int:
               "incrbyfloat",
               "setnx", "getset", "append", "strlen", "getdel",
               "getex", "getrange", "setrange", "setbit", "getbit",
-              "pfadd", "pfcount", "setex", "expireat", "pexpireat"):
+              "pfadd", "pfcount", "hset", "hget", "setex", "expireat",
+              "pexpireat"):
         msg["key"] = args.key
     elif op == "mset":
         if len(args.pairs) % 2:
@@ -2592,10 +2726,19 @@ def main(argv: list[str] | None = None) -> int:
         msg["offset"] = args.offset
     if op == "pfadd":
         msg["elements"] = args.elements
+    if op == "hset":
+        if len(args.pairs) % 2:
+            parser.error("hset takes alternating fields and values: "
+                         "f1 v1 f2 v2 ...")
+        msg["pairs"] = [[args.pairs[i], args.pairs[i + 1]]
+                        for i in range(0, len(args.pairs), 2)]
+    if op == "hget":
+        msg["field"] = args.field
     if op in ("set", "del", "cas", "mset", "expire", "incr",
               "incrbyfloat", "setnx",
               "getset", "append", "getdel", "getex", "setrange",
-              "setbit", "pfadd", "setex", "expireat", "pexpireat") \
+              "setbit", "pfadd", "hset", "setex", "expireat",
+              "pexpireat") \
             and args.request_id:
         # A request id without an explicit client id still dedups
         # within the default "cli" session; the same id retried from
@@ -2664,6 +2807,11 @@ def main(argv: list[str] | None = None) -> int:
             print(resp.get("pfadd"))
         elif op == "pfcount":
             print(resp.get("estimate"))
+        elif op == "hset":
+            print(resp.get("hset"))
+        elif op == "hget":
+            value = resp.get("value")
+            print(value if value is not None else "(nil)")
         elif op == "mget":
             print(json.dumps(resp.get("values")))
         elif op == "keys":

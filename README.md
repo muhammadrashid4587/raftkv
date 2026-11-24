@@ -666,6 +666,41 @@ logic and the failure handling, not the key-value API on top.
   and by ~0.8% (one standard error) at large ones — and each HLL
   key costs ~16 KiB of registers however few elements it holds, so
   an HLL is the wrong shape for counting ten things exactly.
+- **Hashes** — since v0.55.0 `hset key field value [field value ...]`
+  (`Session.hset(k, fields)`, `client.hset(addr, k, fields)`,
+  `hset key f1 v1 f2 v2 ...` on the CLI) sets fields in the hash
+  at the key and answers with the number of fields that did not
+  exist before — Redis HSET — and `hget key field`
+  (`Session.hget(k, field)`, `client.hget(addr, k, field)`,
+  `hget key field` on the CLI) answers the value of one field,
+  None when the key does not exist or the field is not set —
+  Redis HGET. A missing key is created as an empty hash, and a
+  field overwritten with a new value is not counted, so the count
+  is the number of fields the call added; a field repeated in one
+  call counts once, at its last value. The fields ride in the
+  store as a JSON object with a marker prefix, like the HLL
+  blob — the JSON is dumped with sorted keys and no spaces, so
+  the encoding is a pure function of the fields and every node
+  applying the same log computes the same bytes — and the hash
+  survives snapshots and replay exactly like any other value. The
+  outcome is decided at apply time, at the entry's exact position
+  in the log, like a CAS: a retry with the same session id returns
+  the first attempt's count instead of setting twice. A key
+  holding a plain string fails an hset with `hset_failed` and
+  reason `wrongtype` instead of writing, and an hget on one is a
+  client error, not a field. A successful hset keeps the key's
+  TTL deadline, like a CAS, and fires a `set` watch event with the
+  new value; a failed one fires nothing. An hget rides the same
+  ReadIndex path as a `get`, so it carries the same session
+  watermark and is exactly as linearizable. At most 1000 pairs
+  per hset, like a pfadd batch, so one entry never carries an
+  unbounded list. `{"op": "hset", "key": k, "pairs": [[f, v],
+  ...]}` is a pipeline op too. The honest limit is the encoding
+  itself: a plain `get` on a hash key returns the encoded blob,
+  not a field, and the string ops see the blob as a plain string,
+  exactly as they see an HLL blob — and there is no HDEL or
+  HGETALL yet, so fields can only be added or overwritten, never
+  removed or listed except one at a time.
 - **Key enumeration** — since v0.31.0 one `keys` RPC lists the
   store's keys (`client.keys(prefix, limit, start_after)`,
   `Session.keys(prefix, limit, start_after)`, `keys --prefix p
@@ -2867,6 +2902,50 @@ entries left in `log.jsonl` are dropped by their index on reload.
   failure, surviving a snapshot + restart, session
   read-your-writes, pipelined incrbyfloat ops with a malformed
   op in position, and the CLI end to end.
+- ~~Hashes (HSET / HGET)~~ — done in v0.55.0,
+  Nov 24, 2026: `hset key field value [field value ...]` sets
+  fields in the hash at the key and answers with the number of
+  fields that did not exist before — Redis HSET — and `hget key
+  field` answers the value of one field, None when the key or
+  the field is missing — Redis HGET. A missing key is created
+  as an empty hash; a field overwritten with a new value is not
+  counted, and a field repeated in one call counts once, at its
+  last value. The fields ride in the store as a JSON object
+  with a marker prefix, like the HLL blob — dumped with sorted
+  keys and no spaces, so every node computes the same bytes —
+  and the hash survives snapshots and replay like any other
+  value. The outcome is decided at apply time, at the entry's
+  exact position in the log, like a CAS, so a retry with the
+  same session id returns the first attempt's count instead of
+  setting twice. A key holding a plain string fails an hset
+  with `hset_failed` and reason `wrongtype`, and an hget on
+  one is a client error; a successful hset keeps the key's TTL
+  deadline, like a CAS, and fires a `set` watch event with the
+  new value, while a failed one fires nothing. An hget rides
+  the same ReadIndex path as a `get`, so it is exactly as
+  linearizable. At most 1000 pairs per hset, like a pfadd
+  batch. `Session.hset` / `Session.hget`,
+  `client.hset` / `client.hget`, and `hset` / `hget` on the
+  CLI expose them, and `{"op": "hset", "key": k, "pairs": [[f,
+  v], ...]}` is a pipeline op too.
+  `tests/test_hash.py` proves them: store-level creation and
+  counting, overwrites not counted, a repeated field counting
+  once, missing key and missing field answering None, a plain
+  string failing wrongtype with nothing written, an hget on a
+  plain string raising, malformed pairs raising, the TTL
+  deadline kept (set from expire), a new key joining the sorted
+  scan, and a hash surviving a snapshot load; replication to
+  every node, a missing key and field answering None on the
+  cluster, a plain string failing with nothing written, an
+  hget on a plain string a client error, bad pairs rejected
+  with no log entry, a follower redirect, dedup of a retry
+  returning the first attempt's count and of a failed retry
+  returning the first failure, continuing after a leader
+  change, the `set` watch event firing with the new value and
+  nothing firing on failure, surviving a snapshot + restart
+  with the hash still readable, session read-your-writes,
+  pipelined hset ops with a malformed op in position, and the
+  CLI end to end.
   The roadmap is exhausted again, so the next real thing is
   a new roadmap item grounded in this project's purpose,
   proposed by the next run.

@@ -10,6 +10,7 @@ pure function of (current state, command).
 
 import bisect
 import hashlib
+import json
 import math
 import re
 
@@ -42,6 +43,57 @@ HLL_PRECISION = 14
 HLL_REGISTERS = 1 << HLL_PRECISION
 HLL_PREFIX = "\x00raftkv-hll\x00"
 HLL_VALUE_LENGTH = len(HLL_PREFIX) + HLL_REGISTERS
+
+# Hashes (HSET / HGET), Redis-style field-value maps. A hash rides in
+# _data as a JSON object with a marker prefix, the same trick the HLL
+# uses — one string in the same keyspace every other value lives in,
+# so snapshots, the sorted index, TTL expiry, and `get` all treat a
+# hash key like any other key — with the prefix so an HSET / HGET can
+# tell a hash apart from a plain string and answer WRONGTYPE on the
+# latter instead of parsing bytes as fields. The JSON is dumped with
+# sorted keys and no spaces, so the encoding is a pure function of
+# the fields: every node applying the same log computes the same
+# bytes, and a replay after restart rebuilds the identical blob. A
+# plain string can only pass as a hash by being hand-built with the
+# exact prefix and a valid JSON object of string fields — the same
+# class of collision the HLL marker has — so HSET / HGET trust the
+# shape. The honest limit is the encoding itself: a plain `get` on
+# a hash key returns the encoded blob, not a field, and the string
+# ops (append, setrange, strlen) see the blob as a plain string,
+# exactly as they see an HLL blob.
+HASH_PREFIX = "\x00raftkv-hash\x00"
+
+
+def is_hash(value) -> bool:
+    """Whether ``value`` is a hash blob: a string carrying the
+    marker prefix and a JSON object of string fields behind it. A
+    plain string can only pass this by being hand-built to the exact
+    shape — the same class of collision the HLL check has — so an
+    HSET / HGET trusts the shape."""
+    if not isinstance(value, str) or not value.startswith(HASH_PREFIX):
+        return False
+    try:
+        fields = json.loads(value[len(HASH_PREFIX):])
+    except (ValueError, TypeError):
+        return False
+    return (isinstance(fields, dict)
+            and all(isinstance(f, str) and isinstance(v, str)
+                    for f, v in fields.items()))
+
+
+def _hash_fields(value: str) -> dict[str, str]:
+    """The field map behind a hash blob. Only called on values
+    ``is_hash`` already accepted, so the JSON is a dict of strings
+    and the parse cannot fail."""
+    return json.loads(value[len(HASH_PREFIX):])
+
+
+def _hash_value(fields: dict[str, str]) -> str:
+    """A field map as a stored blob: the marker prefix plus the
+    fields as JSON, keys sorted and no spaces, so the same fields
+    always encode to the same bytes on every node."""
+    return HASH_PREFIX + json.dumps(fields, sort_keys=True,
+                                    separators=(",", ":"))
 
 
 def _is_integer_string(s: str) -> bool:
@@ -267,8 +319,8 @@ class KVStore:
         index + the TTL) on every pair it touches, so the whole
         batch expires together. A successful CAS keeps the key's
         deadline, and so does a successful incr, an incrbyfloat,
-        and a getset:
-        all three are updates of the value, not fresh sets, so
+        a getset, and an hset:
+        all four are updates of the value, not fresh sets, so
         none must resurrect a key that is about to expire. A
         ``setex`` carries an absolute wall-clock deadline
         (``wall_deadline``, fixed by the leader before the entry
@@ -280,7 +332,7 @@ class KVStore:
         Returns a result dict for commands whose outcome depends on the
         state at apply time — currently "set", "cas", "expire", "expireat",
         "pexpireat", "incr", "incrbyfloat", "setnx", "getset", "append", "getdel",
-        "setrange", "getex", "setbit", and "pfadd" —
+        "setrange", "getex", "setbit", "pfadd", and "hset" —
         and None for del, whose outcome is always ok. The result is
         what the leader hands back to the waiting client and what the
         dedup table caches for retries, so it must be a pure function
@@ -993,6 +1045,68 @@ class KVStore:
             return {"type": "client_response", "status": "ok",
                     "pfadd": 1 if changed else 0,
                     "estimate": hll_estimate(registers)}
+        elif op == "hset":
+            # Set fields in a hash, Redis HSET: each pair writes
+            # one field, and the reply carries ``hset`` — the
+            # number of fields that did not exist before, the
+            # count Redis answers with (a field overwritten with
+            # a new value is not counted, and a repeated field in
+            # one call counts once, at its last value). The
+            # outcome is decided here, at this exact point in
+            # the log, so a retry with the same session id
+            # returns the first attempt's count from the dedup
+            # table instead of setting twice. A missing key is
+            # created as an empty hash; a key holding a plain
+            # string fails with WRONGTYPE, like a pfadd on a
+            # plain string — an hset must not parse bytes as
+            # fields. A failed hset writes nothing at all, like
+            # a failed incr. A successful hset keeps the key's
+            # deadline, like a CAS or a pfadd: it is an update
+            # of the value, not a fresh set, so it must not
+            # resurrect a key that is about to expire. A new key
+            # joins the sorted index, like a set of a new key.
+            # The fields ride in _data as a JSON blob with the
+            # hash marker prefix, so they survive snapshots and
+            # replay exactly like any other value — and the
+            # stored blob is a pure function of the fields, so
+            # every node computes the same bytes. The pairs were
+            # validated on the leader before the entry was
+            # logged (a non-empty list of at most HSET_MAX_PAIRS
+            # string pairs), so by apply time they are
+            # well-formed — a hand-built log entry with bad
+            # pairs still raises rather than silently writing
+            # nonsense.
+            key = command["key"]
+            pairs = command.get("pairs")
+            if (not isinstance(pairs, list) or not pairs
+                    or any(not isinstance(p, (list, tuple))
+                           or len(p) != 2
+                           or not isinstance(p[0], str)
+                           or not isinstance(p[1], str)
+                           for p in pairs)):
+                raise ValueError(
+                    "hset pairs must be a non-empty list of "
+                    "[field, value] string pairs")
+            current = self._data.get(key)
+            if current is not None and not is_hash(current):
+                return {"type": "client_response",
+                        "status": "hset_failed",
+                        "reason": "wrongtype",
+                        "current": current,
+                        "error": "hset failed: value of "
+                                 f"{key!r} is not a hash"}
+            fields = (_hash_fields(current)
+                      if current is not None else {})
+            added = 0
+            for field, value in pairs:
+                if field not in fields:
+                    added += 1
+                fields[field] = value
+            if key not in self._data:
+                bisect.insort(self._keys, key)
+            self._data[key] = _hash_value(fields)
+            return {"type": "client_response", "status": "ok",
+                    "hset": added}
         elif op == "setrange":
             # Overwrite part of a string value, Redis SETRANGE:
             # starting at ``offset``, replace as many characters
@@ -1204,6 +1318,21 @@ class KVStore:
                 f"pfcount failed: value of {key!r} is not a "
                 "hyperloglog")
         return hll_estimate(_hll_registers(value))
+
+    def hget(self, key: str, field: str) -> str | None:
+        """The value of ``field`` in the hash at ``key`` — None
+        when the key does not exist or the field is not set,
+        Redis HGET. Raises TypeError when the value is a plain
+        string: an HGET reads a hash, not bytes, so a string key
+        is WRONGTYPE, like a pfcount on a plain string. Pure
+        read: no log entry, no state change."""
+        value = self._data.get(key)
+        if value is None:
+            return None
+        if not is_hash(value):
+            raise TypeError(
+                f"hget failed: value of {key!r} is not a hash")
+        return _hash_fields(value).get(field)
 
     def getbit(self, key: str, offset: int) -> int:
         """The bit at ``offset`` in the string value at ``key``,

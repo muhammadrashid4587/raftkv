@@ -137,6 +137,15 @@ SETBIT_MAX_OFFSET = 1_000_000
 # never a real use — the same scale as the TTL cap above, for the
 # same reason.
 PFADD_MAX_ELEMENTS = 1000
+# Largest number of field-value pairs one ``hset`` may carry. The
+# pairs ride in one log entry and one frame, so an unbounded list
+# would let one entry grow without limit (and replicate that growth
+# to every node). 1,000 pairs is far past a real use of one HSET
+# call — a client setting more splits the batch, like an mget client
+# splits a batch past 1000 keys — so it only rejects nonsense,
+# never a real use — the same scale as the pfadd cap above, for the
+# same reason.
+HSET_MAX_PAIRS = 1000
 # Leader lease for reads (Raft dissertation §6.4): how long a majority
 # ack stays fresh. Must be shorter than ELECTION_TIMEOUT_MIN (150ms):
 # a follower that acked at time T heard from the leader no later than
@@ -1416,7 +1425,7 @@ class RaftNode:
                 # The apply result matters for set, CAS, expire,
                 # expireat, pexpireat, incr, incrbyfloat, setnx,
                 # getset, append, getdel, setrange, getex, setbit,
-                # and pfadd:
+                # pfadd, and hset:
                 # their outcome is decided here, at this exact point
                 # in the log, so the result is recorded in the dedup
                 # table
@@ -1576,11 +1585,21 @@ class RaftNode:
                                       self.sm.get(entry["command"]["key"]),
                                       "set",
                                       index=self.last_applied)
+                elif (op == "hset" and result is not None
+                        and result.get("status") == "ok"):
+                    # A successful hset fires like a set, with the
+                    # new (hash blob) value: a failed hset wrote
+                    # nothing, so it fires nothing, like a failed
+                    # pfadd.
+                    self.watch.notify(entry["command"]["key"],
+                                      self.sm.get(entry["command"]["key"]),
+                                      "set",
+                                      index=self.last_applied)
                 if (op in ("set", "cas", "expire", "expireat",
                            "pexpireat",
                            "incr", "incrbyfloat", "setnx", "getset",
                            "append", "getdel", "setrange", "getex",
-                           "setbit", "pfadd")
+                           "setbit", "pfadd", "hset")
                         and result is not None
                         and self.role == "leader"):
                     # Record the outcome only when a local waiter is
@@ -1593,7 +1612,7 @@ class RaftNode:
                     # always records: its waiter is identified by
                     # index alone. Set, CAS, expire, expireat, pexpireat,
                     # incr, incrbyfloat, setnx, getset, append,
-                    # getdel, setrange, getex, setbit, and pfadd are
+                    # getdel, setrange, getex, setbit, pfadd, and hset are
                     # the ops whose apply returns a result — a del
                     # returns None and has nothing to record.
                     key = _dedup_key(entry["command"])
@@ -1633,7 +1652,8 @@ class RaftNode:
         the write happened (a set that lost on NX / XX answers 0);
         for CAS, expire, expireat,
         pexpireat, incr, incrbyfloat, setnx,
-        getset, append, getdel, setrange, getex, setbit, and pfadd
+        getset, append, getdel, setrange, getex, setbit, pfadd,
+        and hset
         it is the
         apply-time outcome (success, mismatch, or missing key for a
         CAS; 1 or 0 for an expire; 1 or 0 for an expireat /
@@ -1645,7 +1665,8 @@ class RaftNode:
         value and length, or wrongtype for a setrange; the value
         and 1 or 0, plus the deadline, for a getex; the old bit
         and the new value, or wrongtype for a setbit; 1 or 0 plus
-        the estimate, or wrongtype for a pfadd), so a
+        the estimate, or wrongtype for a pfadd; the count of
+        newly added fields, or wrongtype for an hset), so a
         retry returns the first
         attempt's exact result. The result also carries the log
         index and term of the entry that produced it: a retried write
@@ -2340,6 +2361,7 @@ class RaftNode:
                       "append", "strlen",
                       "getdel", "getrange", "setrange", "getex",
                       "setbit", "getbit", "pfadd", "pfcount",
+                      "hset", "hget",
                       "setex") \
                 or key is None:
             return {"type": "client_response", "status": "error",
@@ -2348,7 +2370,7 @@ class RaftNode:
                              "incr/incrbyfloat/setnx/getset/append/"
                              "strlen/getdel/"
                              "getrange/setrange/getex/setbit/getbit/"
-                             "pfadd/pfcount/setex "
+                             "pfadd/pfcount/hset/hget/setex "
                              "with a key"}
         if self._is_removed():
             return {"type": "client_response", "status": "error",
@@ -2446,6 +2468,31 @@ class RaftNode:
             if error is not None:
                 return error
             return self._serve_read(pfcount_key=key,
+                                    min_index=min_index,
+                                    session_term=session_term,
+                                    stale_ok=bool(msg.get("stale_ok")))
+        if op == "hget":
+            # One field of a hash: the value of ``field`` in the
+            # hash at this key — None when the key does not exist
+            # or the field is not set, Redis HGET. It rides the
+            # same ReadIndex/lease path as a ``get`` — one
+            # leadership confirmation, one apply wait — so the
+            # field reflects the committed state as of the read
+            # index it names, exactly as linearizable, and a
+            # session read carries the same watermark a get would.
+            # A string key is a client error, not a field: the
+            # payload carries its own "status": "error" (see
+            # _serve_read), like pfcount's wrongtype. The field
+            # must be a string — an empty one names a real field,
+            # like Redis — so only a non-string is rejected here.
+            field = msg.get("field")
+            if not isinstance(field, str):
+                return {"type": "client_response", "status": "error",
+                        "error": "hget field must be a string"}
+            min_index, session_term, error = self._parse_read_params(msg)
+            if error is not None:
+                return error
+            return self._serve_read(hget_key=key, hget_field=field,
                                     min_index=min_index,
                                     session_term=session_term,
                                     stale_ok=bool(msg.get("stale_ok")))
@@ -2577,6 +2624,27 @@ class RaftNode:
                                  "1 to "
                                  f"{PFADD_MAX_ELEMENTS} strings"}
             command["elements"] = list(elements)
+        if op == "hset":
+            # Set fields in a hash: the pairs must be a non-empty
+            # list of at most HSET_MAX_PAIRS [field, value] string
+            # pairs — an empty list names nothing to set, and a
+            # longer one would ride in one frame and one log entry
+            # without bound. Whether the key holds a hash (and how
+            # many fields are new) is decided at apply time, like
+            # a CAS, not here.
+            pairs = msg.get("pairs")
+            if (not isinstance(pairs, list) or not pairs
+                    or len(pairs) > HSET_MAX_PAIRS
+                    or any(not isinstance(p, (list, tuple))
+                           or len(p) != 2
+                           or not isinstance(p[0], str)
+                           or not isinstance(p[1], str)
+                           for p in pairs)):
+                return {"type": "client_response", "status": "error",
+                        "error": "hset pairs must be a list of 1 to "
+                                 f"{HSET_MAX_PAIRS} [field, value] "
+                                 "string pairs"}
+            command["pairs"] = [[f, v] for f, v in pairs]
         if op == "setex":
             # Set a key with a wall-clock TTL, Redis SETEX: the
             # value is required, like a set's — a setex with no
@@ -3492,6 +3560,8 @@ class RaftNode:
                     getbit_key: str | None = None,
                     getbit_offset: int | None = None,
                     pfcount_key: str | None = None,
+                    hget_key: str | None = None,
+                    hget_field: str | None = None,
                     scan_prefix: str | None = None,
                     scan_limit: int = MAX_KEYS_SCAN,
                     scan_start_after: str | None = None) -> dict:
@@ -3529,6 +3599,12 @@ class RaftNode:
         the same way, so it is exactly as linearizable as a
         ``get``; a plain string value is a client error, not an
         estimate.
+        ``hget_key`` serves one field of a hash instead — the value
+        of ``hget_field`` in the hash at that key, None for a
+        missing key or a missing field, Redis HGET — read off the
+        applied state machine the same way, so it is exactly as
+        linearizable as a ``get``; a plain string value is a client
+        error, not a field.
         ``scan_prefix`` serves a key enumeration instead — every key
         in the applied state machine starting with the prefix,
         sorted, at most ``scan_limit`` of them, with ``truncated``
@@ -3543,7 +3619,7 @@ class RaftNode:
         appear in a later page if it sorts ahead of the cursor.
         Everything else — the lease fast path, the pending-read wait,
         the fallback, the redirect on leadership loss — is identical
-        for all eight shapes, so a scan or a TTL query is exactly as
+        for all nine shapes, so a scan or a TTL query is exactly as
         linearizable as a single ``get``.
 
         A stale read (``stale_ok``) is the one exception to the
@@ -3691,6 +3767,18 @@ class RaftNode:
                 # overriding the "ok" in the response literal.
                 try:
                     return {"estimate": self.sm.pfcount(pfcount_key)}
+                except TypeError as e:
+                    return {"status": "error", "error": str(e)}
+            if hget_key is not None:
+                # One field of a hash: the value of the field at
+                # this key — None for a missing key or a missing
+                # field, Redis HGET — with the same wrongtype
+                # rule as pfcount: a plain string value is a
+                # client error, not a field, carried the same
+                # way, overriding the "ok" in the response
+                # literal.
+                try:
+                    return {"value": self.sm.hget(hget_key, hget_field)}
                 except TypeError as e:
                     return {"status": "error", "error": str(e)}
             if keys is not None:
