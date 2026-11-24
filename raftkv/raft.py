@@ -2694,9 +2694,12 @@ class RaftNode:
             in sorted order capped at the scan limit, resumed past
             ``scan_start_after`` when one is given."""
             if scan_prefix is not None:
-                matching = self.sm.keys(scan_prefix, scan_start_after)
-                page = matching[:scan_limit]
-                truncated = len(matching) > scan_limit
+                # One page off the state machine's sorted index:
+                # bisect to the cursor, then walk at most the page
+                # — O(page + log n), no sort of the whole keyspace.
+                page, truncated = self.sm.keys(scan_prefix,
+                                               scan_start_after,
+                                               scan_limit)
                 return {"keys": page,
                         "truncated": truncated,
                         "next_start_after": page[-1] if truncated

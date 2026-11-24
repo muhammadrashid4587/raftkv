@@ -8,10 +8,25 @@ re-applies its committed prefix after a restart, so ``apply`` must be a
 pure function of (current state, command).
 """
 
+import bisect
+
 
 class KVStore:
     def __init__(self) -> None:
         self._data: dict[str, str] = {}
+        # Sorted index of the store's keys, maintained on every
+        # write: a ``set`` of a new key inserts it in sorted order
+        # (bisect finds the position in O(log n)); a ``del``
+        # removes it; a ``set`` of a key already present and a CAS
+        # touch no index entry, since the key is already there.
+        # A scan then seeks to its cursor with bisect and walks
+        # forward, so one page costs O(page + log n) instead of
+        # sorting the whole matching keyspace per page. The index
+        # is derived state, exactly like ``_data``: replaying the
+        # log rebuilds it entry by entry, and ``load`` rebuilds it
+        # from the snapshot state, so every node holding the same
+        # log computes the same index.
+        self._keys: list[str] = []
 
     # Sentinel for "key absent": distinct from any value a client can
     # store, so a CAS against a missing key is distinguishable from a
@@ -32,10 +47,18 @@ class KVStore:
         """
         op = command.get("op")
         if op == "set":
-            self._data[command["key"]] = command["value"]
+            key = command["key"]
+            if key not in self._data:
+                bisect.insort(self._keys, key)
+            self._data[key] = command["value"]
             return None
         elif op == "del":
-            self._data.pop(command["key"], None)
+            key = command["key"]
+            if key in self._data:
+                del self._data[key]
+                idx = bisect.bisect_left(self._keys, key)
+                if idx < len(self._keys) and self._keys[idx] == key:
+                    del self._keys[idx]
             return None
         elif op == "cas":
             key = command["key"]
@@ -50,6 +73,9 @@ class KVStore:
                         "reason": "mismatch", "current": current,
                         "error": f"cas failed: expected {expected!r} but "
                                  f"current value is {current!r}"}
+            # A successful CAS writes a key that already exists, so
+            # the sorted index is untouched; a failed or missing-key
+            # CAS writes nothing at all.
             self._data[key] = command["value"]
             return {"type": "client_response", "status": "ok",
                     "cas": "success"}
@@ -59,29 +85,61 @@ class KVStore:
     def get(self, key: str) -> str | None:
         return self._data.get(key)
 
-    def keys(self, prefix: str = "", start_after: str | None = None) -> list[str]:
-        """Every key in the store, sorted, optionally restricted to
-        keys starting with ``prefix`` and to keys strictly after
-        ``start_after``. Sorted so a scan's answer is deterministic
-        — the same state always enumerates in the same order, which
-        is what makes a paged scan (limit + resume from the last key
+    def keys(self, prefix: str = "", start_after: str | None = None,
+             limit: int = 1000) -> tuple[list[str], bool]:
+        """One page of the store's keys, sorted, optionally
+        restricted to keys starting with ``prefix`` and to keys
+        strictly after ``start_after``. Returns ``(page,
+        truncated)``: at most ``limit`` keys, and True when more
+        matched. Sorted so a scan's answer is deterministic — the
+        same state always enumerates in the same order, which is
+        what makes a paged scan (limit + resume from the last key
         returned) well-defined: ``start_after`` is an exclusive
         lower bound on the sorted key order, so resuming with the
-        last key of one page starts the next page exactly after it,
-        with no repeats and no gaps, as long as the state does not
-        change between pages. Pure read: no log entry, no state
-        change."""
-        matching = (k for k in self._data if k.startswith(prefix)) \
-            if prefix else iter(self._data)
+        last key of one page starts the next page exactly after
+        it, with no repeats and no gaps, as long as the state
+        does not change between pages. Pure read: no log entry,
+        no state change.
+
+        The page is read off the sorted index, not sorted fresh:
+        bisect seeks to the later of the prefix start and the
+        cursor (both O(log n)), then the walk takes at most
+        ``limit`` + 1 keys — one extra to learn whether more
+        matched — stopping at the first key outside the prefix,
+        since keys under one prefix are contiguous in sorted
+        order. A page therefore costs O(page + log n), not a
+        sort of the whole matching keyspace. Honest cost: the
+        index is a plain Python list, so the bisect is O(log n)
+        but inserting or removing a key shifts the tail of the
+        list — O(n) memmove on a write of a new key or a delete
+        of an existing one — and the index holds one pointer per
+        key on top of the dict."""
+        start = 0
+        if prefix:
+            start = bisect.bisect_left(self._keys, prefix)
         if start_after is not None:
-            matching = (k for k in matching if k > start_after)
-        return sorted(matching)
+            start = max(start, bisect.bisect_right(self._keys,
+                                                    start_after))
+        page: list[str] = []
+        i = start
+        while i < len(self._keys) and len(page) <= limit:
+            key = self._keys[i]
+            if prefix and not key.startswith(prefix):
+                break
+            page.append(key)
+            i += 1
+        truncated = len(page) > limit
+        return page[:limit], truncated
 
     def load(self, state: dict[str, str]) -> None:
         """Replace the whole state with ``state`` (used when installing
         a snapshot: the snapshot *is* the state as of its last included
-        index, so anything the store held before is discarded)."""
+        index, so anything the store held before is discarded). The
+        sorted index is rebuilt from the snapshot state, so a node
+        that installs a snapshot scans exactly like one that
+        replayed the log to the same state."""
         self._data = dict(state)
+        self._keys = sorted(state)
 
     def items(self) -> dict[str, str]:
         return dict(self._data)

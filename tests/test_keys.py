@@ -10,9 +10,10 @@ real threads, real disk) on localhost, like the rest of the suite.
 import time
 import unittest
 
-from harness import Cluster, client_request
+from harness import Cluster, client_request, wait_for_key
 from raftkv.client import Session, keys
 from raftkv.raft import MAX_KEYS_SCAN
+from raftkv.store import KVStore
 
 
 def _write_keys(addr, keys_values) -> None:
@@ -374,6 +375,95 @@ class TestKeys(unittest.TestCase):
         finally:
             cluster.stop_all()
 
+    def test_keys_pages_large_keyspace(self):
+        """Paging through 120 keys ten at a time returns every key
+        in sorted order with no repeats and no gaps, and
+        ``keys_all`` walks the same keyspace in 12 pages — the
+        index serves each page off a bisect seek, not a fresh
+        sort of the whole keyspace."""
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            expected = [f"k{i:03d}" for i in range(120)]
+            _write_keys(addr, [(k, "v") for k in expected])
+            seen: list[str] = []
+            cursor: str | None = None
+            for _ in range(20):
+                resp = keys(addr, limit=10, start_after=cursor)
+                self.assertEqual(resp.get("status"), "ok", resp)
+                seen.extend(resp.get("keys") or [])
+                if not resp.get("truncated"):
+                    break
+                cursor = resp.get("next_start_after")
+            else:
+                self.fail("paging did not terminate")
+            self.assertEqual(seen, expected)
+            resp = keys(addr, limit=10)
+            self.assertTrue(resp.get("truncated"))
+            self.assertEqual(resp.get("next_start_after"), "k009")
+            with Session(addr) as session:
+                resp = session.keys_all(limit=10)
+                self.assertEqual(resp.get("keys"), expected)
+                self.assertEqual(resp.get("pages"), 12)
+        finally:
+            cluster.stop_all()
+
+    def test_keys_index_survives_snapshot_and_restart(self):
+        """A follower restarted after the cluster snapshotted
+        (threshold 10, 25 keys written) reloads its snapshot and
+        replays the suffix, rebuilding the sorted index — a stale
+        scan served from that follower's own state machine pages
+        the whole keyspace in order, so the scan proves the
+        rebuilt index, not just the leader's."""
+        cluster = Cluster(3, snapshot_threshold=10)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            expected = [f"k{i:03d}" for i in range(25)]
+            _write_keys(addr, [(k, "v") for k in expected])
+            follower = next(n for n in cluster.nodes.values()
+                            if n is not leader)
+            cluster.stop_node(follower.id)
+            node = cluster.restart_node(follower.id)
+            self.assertTrue(wait_for_key(node, "k024", "v"),
+                            "restarted follower did not re-apply")
+            # The restarted follower serves the scan itself only
+            # while its leader lease is fresh; poll until it does
+            # and the page is right, so a redirect to the leader
+            # cannot mask a broken index on this node.
+            deadline = time.monotonic() + 5.0
+            resp = {}
+            while time.monotonic() < deadline:
+                resp = client_request(
+                    cluster.addrs[follower.id],
+                    {"type": "client", "op": "keys",
+                     "limit": 10, "stale_ok": True})
+                if (resp.get("lease") == "follower"
+                        and resp.get("keys") == expected[:10]
+                        and resp.get("truncated")):
+                    break
+                time.sleep(0.05)
+            self.assertEqual(resp.get("lease"), "follower", resp)
+            self.assertEqual(resp.get("keys"), expected[:10])
+            self.assertTrue(resp.get("truncated"))
+            self.assertEqual(resp.get("next_start_after"), "k009")
+            resp = client_request(
+                cluster.addrs[follower.id],
+                {"type": "client", "op": "keys", "limit": 10,
+                 "start_after": "k009", "stale_ok": True})
+            self.assertEqual(resp.get("keys"), expected[10:20], resp)
+            resp = client_request(
+                cluster.addrs[follower.id],
+                {"type": "client", "op": "keys", "limit": 10,
+                 "start_after": "k019", "stale_ok": True})
+            self.assertEqual(resp.get("keys"), expected[20:], resp)
+            self.assertFalse(resp.get("truncated"))
+        finally:
+            cluster.stop_all()
+
     def test_keys_cli(self):
         """The ``keys`` CLI subcommand prints the keys as one JSON
         list, honoring --prefix and --limit."""
@@ -434,6 +524,145 @@ class TestKeys(unittest.TestCase):
             self.assertEqual(json.loads(out.stdout), ["c"])
         finally:
             cluster.stop_all()
+
+
+class TestSortedIndex(unittest.TestCase):
+    """The sorted index inside KVStore, on its own: no cluster,
+    no RPC — the apply path maintains it and ``keys`` reads
+    pages off it. Every test also checks the invariant the index
+    exists to keep: the index is exactly the store's keys,
+    sorted."""
+
+    def _check_invariant(self, store: KVStore) -> None:
+        self.assertEqual(store._keys, sorted(store._data))
+
+    def test_index_tracks_sets_deletes_and_rewrites(self):
+        """Sets insert in sorted order, overwriting a key adds no
+        second index entry, a delete removes its entry, and
+        re-setting a deleted key puts it back — the index always
+        equals the store's keys, sorted."""
+        store = KVStore()
+        store.apply({"op": "set", "key": "mango", "value": "1"})
+        store.apply({"op": "set", "key": "apple", "value": "2"})
+        store.apply({"op": "set", "key": "zebra", "value": "3"})
+        self._check_invariant(store)
+        store.apply({"op": "set", "key": "apple", "value": "9"})
+        self.assertEqual(store._keys, ["apple", "mango", "zebra"])
+        self._check_invariant(store)
+        store.apply({"op": "del", "key": "mango"})
+        self.assertEqual(store._keys, ["apple", "zebra"])
+        self._check_invariant(store)
+        store.apply({"op": "del", "key": "missing"})
+        self.assertEqual(store._keys, ["apple", "zebra"])
+        self._check_invariant(store)
+        store.apply({"op": "set", "key": "mango", "value": "4"})
+        self.assertEqual(store._keys, ["apple", "mango", "zebra"])
+        self._check_invariant(store)
+
+    def test_index_page_returns_only_the_page(self):
+        """A page returns at most ``limit`` keys plus the
+        truncated flag — the caller never receives the whole
+        matching keyspace, which is the point of the index: the
+        page is sought and walked, not sorted fresh."""
+        store = KVStore()
+        for i in range(50):
+            store.apply({"op": "set", "key": f"k{i:02d}",
+                         "value": "v"})
+        page, truncated = store.keys(limit=5)
+        self.assertEqual(page, ["k00", "k01", "k02", "k03", "k04"])
+        self.assertTrue(truncated)
+        page, truncated = store.keys(limit=50)
+        self.assertEqual(len(page), 50)
+        self.assertFalse(truncated)
+        page, truncated = store.keys(limit=100)
+        self.assertEqual(len(page), 50)
+        self.assertFalse(truncated)
+
+    def test_index_prefix_cursor_and_limit_compose(self):
+        """Prefix, cursor, and limit compose on the index: a page
+        under one prefix never leaks another's keys, the cursor
+        is an exclusive lower bound inside the prefix, and the
+        walk stops at the end of the prefix range."""
+        store = KVStore()
+        for k in ["user:1", "user:2", "user:10", "user:3",
+                  "order:1", "order:2"]:
+            store.apply({"op": "set", "key": k, "value": "v"})
+        page, truncated = store.keys(prefix="user:", limit=2)
+        self.assertEqual(page, ["user:1", "user:10"])
+        self.assertTrue(truncated)
+        page, truncated = store.keys(prefix="user:", limit=2,
+                                     start_after="user:10")
+        self.assertEqual(page, ["user:2", "user:3"])
+        self.assertFalse(truncated)
+        # A cursor past the prefix range is an empty page.
+        page, truncated = store.keys(prefix="user:",
+                                     start_after="user:3")
+        self.assertEqual(page, [])
+        self.assertFalse(truncated)
+        # A cursor from another prefix still bounds the sorted
+        # order: "order:2" sorts before every "user:" key, so it
+        # excludes nothing under "user:".
+        page, truncated = store.keys(prefix="user:",
+                                     start_after="order:2")
+        self.assertEqual(page, ["user:1", "user:10", "user:2",
+                                "user:3"])
+        self.assertFalse(truncated)
+        page, truncated = store.keys(prefix="order:",
+                                     start_after="order:1")
+        self.assertEqual(page, ["order:2"])
+        self.assertFalse(truncated)
+        # A cursor below the prefix still starts at the prefix.
+        page, truncated = store.keys(prefix="user:",
+                                     start_after="aaa")
+        self.assertEqual(page, ["user:1", "user:10", "user:2",
+                                "user:3"])
+        self.assertFalse(truncated)
+        self._check_invariant(store)
+
+    def test_index_cas_does_not_disturb_it(self):
+        """A CAS — successful, failed on mismatch, or failed on
+        a missing key — never adds or removes an index entry: a
+        successful CAS writes a key that is already indexed, and
+        the failures write nothing."""
+        store = KVStore()
+        store.apply({"op": "set", "key": "counter", "value": "41"})
+        store.apply({"op": "cas", "key": "counter", "expected": "41",
+                     "value": "42"})
+        self.assertEqual(store._keys, ["counter"])
+        self._check_invariant(store)
+        store.apply({"op": "cas", "key": "counter", "expected": "41",
+                     "value": "43"})
+        self.assertEqual(store._keys, ["counter"])
+        store.apply({"op": "cas", "key": "ghost", "expected": "x",
+                     "value": "y"})
+        self.assertEqual(store._keys, ["counter"])
+        self._check_invariant(store)
+
+    def test_index_survives_load(self):
+        """Loading snapshot state rebuilds the index from the
+        state itself, so a node that installs a snapshot scans
+        exactly like one that replayed the log to the same
+        state — including paging past a cursor under a prefix."""
+        store = KVStore()
+        store.apply({"op": "set", "key": "stale", "value": "1"})
+        store.load({"user:2": "b", "user:1": "a", "order:1": "c",
+                    "user:10": "d"})
+        self.assertEqual(store._keys, ["order:1", "user:1",
+                                       "user:10", "user:2"])
+        self._check_invariant(store)
+        page, truncated = store.keys(prefix="user:", limit=2)
+        self.assertEqual(page, ["user:1", "user:10"])
+        self.assertTrue(truncated)
+        page, truncated = store.keys(prefix="user:", limit=2,
+                                     start_after="user:10")
+        self.assertEqual(page, ["user:2"])
+        self.assertFalse(truncated)
+        # Writes after a load keep maintaining the rebuilt index.
+        store.apply({"op": "set", "key": "user:3", "value": "e"})
+        store.apply({"op": "del", "key": "order:1"})
+        self.assertEqual(store._keys, ["user:1", "user:10",
+                                       "user:2", "user:3"])
+        self._check_invariant(store)
 
 
 if __name__ == "__main__":

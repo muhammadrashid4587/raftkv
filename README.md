@@ -120,8 +120,23 @@ logic and the failure handling, not the key-value API on top.
   pages are individually linearizable, but the enumeration as a
   whole is not a snapshot — a key written or deleted between pages
   can be missed, or appear in a later page if it sorts ahead of
-  the cursor — and the server still sorts the whole matching
-  keyspace per page, so paging bounds the reply, not the work.
+  the cursor. Since v0.33.0 the state machine keeps a sorted
+  index of its keys (`KVStore._keys`, maintained with `bisect` on
+  write: a `set` of a new key inserts it in sorted order, a `del`
+  removes it), so a page seeks to its cursor with bisect and
+  walks at most one page past it — O(page + log n) instead of
+  sorting the whole matching keyspace per page. The index is
+  derived state, exactly like the dict: replaying the log
+  rebuilds it entry by entry and loading a snapshot rebuilds it
+  from the snapshot state, so every node holding the same log
+  computes the same index. Honest limit: the index is a plain
+  Python list, so the bisect is O(log n) but inserting or
+  removing a key shifts the tail of the list — a write of a new
+  key or a delete of an existing one pays an O(n) memmove — and
+  the index holds one pointer per key on top of the dict. A
+  balanced tree would remove the memmove, but it would need a
+  dependency or a hand-rolled tree for a store whose writes are
+  fsync-bound anyway, so the list is the right trade for now.
 - **Leader lease reads** — a leader that heard acks from a majority
   within the last 100ms (shorter than any follower's 150ms minimum
   election timeout, so no new leader can have been elected since)
@@ -397,7 +412,7 @@ make test
 # or: python3 -m unittest discover -s tests -v
 ```
 
-194 tests, plus a smoke test for the benchmark script, all passing:
+207 tests, plus a smoke test for the benchmark script, all passing:
 
 | Test | What it proves |
 |---|---|
@@ -566,6 +581,13 @@ make test
 | `test_session_keys_start_after_and_keys_all` | A session scan takes a cursor, and `keys_all` walks the whole keyspace in pages and returns every key plus the page count |
 | `test_keys_cli` | The `keys` CLI subcommand prints the keys as one JSON list, honoring --prefix and --limit |
 | `test_keys_cli_start_after` | The `keys` CLI subcommand honors --start-after, resuming past the given key, exclusive |
+| `test_keys_pages_large_keyspace` | Paging 120 keys ten at a time returns every key in sorted order, no repeats or gaps, and `keys_all` walks it in 12 pages |
+| `test_keys_index_survives_snapshot_and_restart` | A follower restarted after a snapshot serves a paged stale scan from its rebuilt sorted index |
+| `test_index_tracks_sets_deletes_and_rewrites` | The sorted index tracks sets, overwrites, deletes, and re-sets — always exactly the store's keys, sorted |
+| `test_index_page_returns_only_the_page` | A page returns at most `limit` keys plus the truncated flag, never the whole matching keyspace |
+| `test_index_prefix_cursor_and_limit_compose` | Prefix, cursor, and limit compose on the index: no leaks across prefixes, cursor is an exclusive bound |
+| `test_index_cas_does_not_disturb_it` | A CAS — successful, failed, or on a missing key — never adds or removes an index entry |
+| `test_index_survives_load` | Loading snapshot state rebuilds the index, and writes after a load keep maintaining it |
 
 Tests use real nodes (real TCP, real threads, real disk) on localhost —
 no mocks of the consensus path.
@@ -1372,14 +1394,36 @@ entries left in `log.jsonl` are dropped by their index on reload.
   or gaps, cursor with a prefix, cursor past the last key,
   one-key-at-a-time walk of the whole keyspace, bad cursors
   rejected server- and client-side, session paging and
-  `keys_all`, and the CLI `--start-after` end to end. The roadmap
-  is now exhausted — every item is done — so the next real thing
-  is a new one, grounded in this increment's honest limit: a
-  sorted index in the state machine. Paging bounds the reply, not
-  the work: every page still sorts the whole matching keyspace, so
-  a scan of a million-key store pays a million-key sort per page.
-  Keeping the keys in sorted order inside `KVStore` (a sorted
-  list maintained with `bisect` on write, or a balanced tree)
-  would make a page cost O(page + log n) instead of O(n log n),
-  with the write path paying the insert — measure the write-side
-  cost before committing to it.
+  `keys_all`, and the CLI `--start-after` end to end.
+- ~~Sorted index for key enumeration~~ — done in v0.33.0,
+  Nov 23, 2026: the state machine keeps its keys in sorted
+  order (`KVStore._keys`, a list maintained with `bisect` on
+  write), so a scan page seeks to its cursor and walks at most
+  one page past it — O(page + log n) instead of sorting the
+  whole matching keyspace per page. `KVStore.keys(prefix,
+  start_after, limit)` now returns `(page, truncated)` instead
+  of the full sorted list; `_serve_read` serves the page from
+  the same `_values()` payload builder as before, so the lease
+  fast path, the pending-read wait, the fallback, and the
+  redirect on leadership loss are all unchanged, and the reply
+  shape (`keys`, `truncated`, `next_start_after`) is identical
+  — no client or CLI change. The index is derived state:
+  replaying the log rebuilds it entry by entry and `load`
+  rebuilds it from snapshot state, so a restarted or
+  snapshot-installed node scans exactly like one that replayed.
+  Documented honestly: the index is a plain Python list, so a
+  write of a new key or a delete of an existing one pays an
+  O(n) memmove shifting the tail, and the index holds one
+  pointer per key on top of the dict — a balanced tree would
+  remove the memmove, but it would need a dependency or a
+  hand-rolled tree for a store whose writes are fsync-bound
+  anyway. `tests/test_keys.py` proves it: the index tracks
+  sets, overwrites, deletes, re-sets, and CAS without drifting
+  from the store's keys; prefix, cursor, and limit compose on
+  the index; a page returns only the page; the index survives
+  a snapshot load; paging 120 keys ten at a time returns every
+  key in order; and a follower restarted after a snapshot
+  serves a paged stale scan from its rebuilt index. The roadmap
+  is exhausted again — every item is done — so the next real
+  thing is a new roadmap item grounded in this project's
+  purpose, proposed by the next run.
