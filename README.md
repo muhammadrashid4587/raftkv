@@ -254,6 +254,26 @@ logic and the failure handling, not the key-value API on top.
   without releasing leaves the key held; pair it with `expire`
   for a lease, or use it only where a permanent claim is what
   you want.
+- **Get-and-set** — since v0.42.0 `getset key value`
+  (`Session.getset(k, v)`, `client.getset(addr, k, v)`, `getset key
+  value` on the CLI) atomically sets the key and answers with the
+  value it held before — `old_value`, None when the key did not
+  exist, which the getset creates — Redis GETSET. The old value is
+  decided at apply time, at the entry's exact position in the log,
+  like a CAS: a retry with the same session id returns the first
+  attempt's old value instead of setting twice, and a second getset
+  sees the first one's value as the old value — the atomic swap
+  Redis promises. A getset always writes, so it always fires a
+  `set` watch event with the new value, and it keeps the key's TTL
+  deadline, like a CAS. It rides the same write path as a single
+  `set` — group-commit batching, dedup, the response's log index
+  advancing a session's watermark — and `{"op": "getset", "key": k,
+  "value": v}` is a pipeline op too. A getset with no value is a
+  client error and appends nothing. The honest limit is the same
+  one every single-key read-modify-write has: the old value it
+  returns is the value at its log position, so a concurrent write
+  that commits first is the old value it sees — there is no way to
+  ask for the value "as of now" without going through the log.
 - **Key enumeration** — since v0.31.0 one `keys` RPC lists the
   store's keys (`client.keys(prefix, limit, start_after)`,
   `Session.keys(prefix, limit, start_after)`, `keys --prefix p
@@ -568,7 +588,7 @@ make test
 # or: python3 -m unittest discover -s tests -v
 ```
 
-311 tests, plus a smoke test for the benchmark script, all passing:
+327 tests, plus a smoke test for the benchmark script, all passing:
 
 | Test | What it proves |
 |---|---|
@@ -691,6 +711,22 @@ make test
 | `test_session_setnx_is_read_your_writes` | A session setnx advances the write watermark and the next read sees the value |
 | `test_pipeline_setnx_ops` | Pipelined setnx ops reply in order, a missing value is an error in position |
 | `test_setnx_cli` | The `setnx` CLI subcommand prints 1 on a set, 0 when the key exists |
+| `test_getset_on_missing_key_returns_none_and_sets` | Getset on a missing key answers None and creates it |
+| `test_getset_returns_old_value_and_replaces` | Getset returns the old value and replaces it |
+| `test_getset_after_delete_returns_none` | After a delete a getset answers None — the old value is live state, not history |
+| `test_getset_keeps_ttl_deadline` | A getset keeps the key's TTL deadline and the key still expires on schedule |
+| `test_getset_new_key_joins_sorted_index` | A key created by getset joins the sorted scan index |
+| `test_getset_succeeds_and_replicates` | Getset writes and replicates to every node, and reads back the new value |
+| `test_getset_returns_old_value_everywhere` | A getset on an existing key answers the old value on every node |
+| `test_getset_requires_value` | A getset with no value is a client error and appends nothing |
+| `test_getset_from_follower_redirects` | A getset sent to a follower is redirected to the leader and still applies |
+| `test_getset_retry_appends_once_and_returns_first_old_value` | A retried getset returns the first attempt's old value and appends no second entry, even after another getset moved the value |
+| `test_getset_continues_after_leader_change` | Getset keeps working through a leader change and the new leader sees the first getset's value as the old one |
+| `test_getset_fires_watch_event_with_new_value` | A getset fires a set watch event with the new value on leader and follower, on a missing key and an existing one |
+| `test_getset_survives_snapshot_and_restart` | The getset swap survives log compaction and a leader restart |
+| `test_session_getset_is_read_your_writes` | A session getset advances the write watermark and the next read sees the new value |
+| `test_pipeline_getset_ops` | Pipelined getset ops reply in order, a missing value is an error in position |
+| `test_getset_cli` | The `getset` CLI subcommand prints (nil) for a missing key, the old value otherwise |
 | `test_random_kill_restart_mid_write_loses_nothing` | Seeded chaos: 4 kill/restart cycles mid-write, every acked write survives on every node, all nodes converge to identical state, and the recorded read history is linearizable — now with CAS threads incrementing owned and shared counters through the same faults |
 | `test_stale_read_after_overwrite_is_flagged` | A read invoked after an overwrite completed but returning the old value fails the linearizability check |
 | `test_concurrent_read_may_see_old_or_new_value` | A read overlapping an overwrite may return either value |
@@ -1864,3 +1900,33 @@ entries left in `log.jsonl` are dropped by their index on reload.
   item grounded in this project's purpose, proposed by the
   next run — candidates: getset-style string ops, or a
   wall-clock TTL variant.
+- ~~Get-and-set (getset)~~ — done in v0.42.0,
+  Nov 24, 2026: `getset key value` atomically sets the key
+  and answers with the value it held before — `old_value`,
+  None when the key did not exist, which the getset creates
+  — Redis GETSET, decided at apply time like a CAS, so a
+  retry with the same session id returns the first attempt's
+  old value instead of setting twice, and a second getset
+  sees the first one's value as the old value — the atomic
+  swap Redis promises. A getset always writes, so it always
+  fires a `set` watch event with the new value, keeps the
+  key's TTL deadline like a CAS, and rides the same write
+  path as a `set` (group-commit batching, dedup, session
+  watermark); `{"op": "getset"}` is a pipeline op too.
+  `Session.getset`, `client.getset`, and `getset key value`
+  on the CLI expose it. `tests/test_getset.py` proves it:
+  store-level missing-key None and replace, answering None
+  after a delete, the TTL deadline kept across a getset and
+  expiry still firing, the new key joining the sorted index,
+  replication to every node, a missing value rejected with
+  no log entry, redirect from a follower, dedup of a retry
+  returning the first attempt's old value even after another
+  getset moved the value, continuing after a leader change,
+  the watch event on leader and follower with the new value
+  on a missing and an existing key, surviving a snapshot +
+  restart, session read-your-writes, pipelined getset ops
+  with a missing value in position, and the CLI end to end.
+  The roadmap is exhausted again, so the next real thing is
+  a new roadmap item grounded in this project's purpose,
+  proposed by the next run — candidates: a wall-clock TTL
+  variant, or more Redis string ops (append, strlen, getdel).

@@ -197,6 +197,7 @@ class Session:
             {"op": "cas", "key": k, "expected": e, "value": v}
             {"op": "incr", "key": k, "by": n}
             {"op": "setnx", "key": k, "value": v}
+            {"op": "getset", "key": k, "value": v}
 
         The whole list goes out in batches of ``depth`` on a single
         persistent socket without waiting between requests, and the
@@ -319,6 +320,23 @@ class Session:
         setnx advances the write watermark from the reply's
         index, like any other write."""
         return self._write({"type": "client", "op": "setnx", "key": key,
+                            "value": value})
+
+    def getset(self, key: str, value: str) -> dict:
+        """Atomically set the key and return its old value, Redis
+        GETSET: returns ``old_value`` — the value the key held
+        before this write, or None when the key did not exist —
+        and the key holds ``value`` after. The old value is
+        decided at apply time, at the entry's position in the log,
+        so a retry with the same session id returns the first
+        attempt's old value instead of setting twice, and a
+        second getset sees the first one's value as the old value
+        — the atomic swap Redis promises. A getset always writes,
+        even on a missing key, which it creates, and it keeps the
+        key's TTL deadline, like a CAS. A successful getset
+        advances the write watermark from the reply's index, like
+        any other write."""
+        return self._write({"type": "client", "op": "getset", "key": key,
                             "value": value})
 
     def get(self, key: str) -> dict:
@@ -598,22 +616,22 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
     ``set`` needs a string key and value, ``del`` a string key,
     ``cas`` a string key, expected, and value, ``incr`` a string
     key and an integer ``by`` (default 1), ``setnx`` a string key
-    and value."""
+    and value, ``getset`` a string key and value."""
     if not isinstance(op, dict):
         return None, {"type": "client_response", "status": "error",
                       "error": "pipeline op must be an object with "
                                "op, key, and value fields"}
     name = op.get("op")
-    if name not in ("set", "del", "cas", "incr", "setnx"):
+    if name not in ("set", "del", "cas", "incr", "setnx", "getset"):
         return None, {"type": "client_response", "status": "error",
                       "error": "pipeline op must be set, del, cas, "
-                               "incr, or setnx"}
+                               "incr, setnx, or getset"}
     key = op.get("key")
     if not isinstance(key, str):
         return None, {"type": "client_response", "status": "error",
                       "error": f"pipeline {name} needs a string key"}
     msg: dict = {"type": "client", "op": name, "key": key}
-    if name in ("set", "cas", "setnx"):
+    if name in ("set", "cas", "setnx", "getset"):
         value = op.get("value")
         if not isinstance(value, str):
             return None, {"type": "client_response", "status": "error",
@@ -656,7 +674,8 @@ def pipeline(node_addr: tuple[str, int], ops: list,
              timeout: float = 12.0, depth: int = 50) -> list[dict]:
     """Send many writes pipelined over one connection.
 
-    One ``set`` / ``del`` / ``cas`` / ``incr`` / ``setnx`` op per
+    One ``set`` / ``del`` / ``cas`` / ``incr`` / ``setnx`` /
+    ``getset`` op per
     dict (see
     ``Session.pipeline`` for the shapes): the ops go out in
     batches of ``depth`` on a single persistent socket and the
@@ -843,6 +862,23 @@ def setnx(node_addr: tuple[str, int], key: str, value: str,
     1 when the key was created and 0 when it already existed —
     and the existing value is left untouched)."""
     return request(node_addr, {"type": "client", "op": "setnx",
+                               "key": key, "value": value},
+                   timeout=timeout)
+
+
+def getset(node_addr: tuple[str, int], key: str, value: str,
+           timeout: float = 12.0) -> dict:
+    """Atomically set the key and return its old value, following
+    leader redirects like ``request`` — Redis GETSET.
+
+    One request appends the getset entry, so the old value is
+    decided at the entry's position in the log: the reply is the
+    plain getset response (``status`` ``ok`` with ``old_value``
+    — the value the key held before this write, or None when the
+    key did not exist — and the key holds ``value`` after). A
+    getset always writes, even on a missing key, which it
+    creates, and it keeps the key's TTL deadline, like a CAS."""
+    return request(node_addr, {"type": "client", "op": "getset",
                                "key": key, "value": value},
                    timeout=timeout)
 
@@ -1144,6 +1180,20 @@ def main(argv: list[str] | None = None) -> int:
                               "twice")
     p_setnx.add_argument("--request-id", default=None,
                          help="id of this write within the client session")
+    p_getset = sub.add_parser(
+        "getset",
+        help="atomically set the key and print its old value "
+             "(or (nil) when the key did not exist); the key holds "
+             "the new value after")
+    p_getset.add_argument("key")
+    p_getset.add_argument("value")
+    p_getset.add_argument("--client-id", default=None,
+                          help="session id for at-most-once writes: a retry "
+                               "with the same client id + request id returns "
+                               "the first attempt's result instead of writing "
+                               "twice")
+    p_getset.add_argument("--request-id", default=None,
+                          help="id of this write within the client session")
     p_add = sub.add_parser("add-server",
                            help="add a server to the cluster (Raft §6)")
     p_add.add_argument("server_id")
@@ -1235,7 +1285,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     msg: dict = {"type": "client", "op": op}
     if op in ("set", "get", "del", "cas", "ttl", "expire", "incr",
-              "setnx"):
+              "setnx", "getset"):
         msg["key"] = args.key
     elif op == "mset":
         if len(args.pairs) % 2:
@@ -1272,7 +1322,10 @@ def main(argv: list[str] | None = None) -> int:
         msg["by"] = args.by
     if op == "setnx":
         msg["value"] = args.value
-    if op in ("set", "del", "cas", "mset", "expire", "incr", "setnx") \
+    if op == "getset":
+        msg["value"] = args.value
+    if op in ("set", "del", "cas", "mset", "expire", "incr", "setnx",
+              "getset") \
             and args.request_id:
         # A request id without an explicit client id still dedups
         # within the default "cli" session; the same id retried from
@@ -1310,6 +1363,9 @@ def main(argv: list[str] | None = None) -> int:
             print(resp.get("value"))
         elif op == "setnx":
             print(resp.get("setnx"))
+        elif op == "getset":
+            old = resp.get("old_value")
+            print(old if old is not None else "(nil)")
         elif op == "mget":
             print(json.dumps(resp.get("values")))
         elif op == "keys":

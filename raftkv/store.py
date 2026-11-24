@@ -90,13 +90,13 @@ class KVStore:
         ``ttl_entries`` sets the same deadline (its entry's
         index + the TTL) on every pair it touches, so the whole
         batch expires together. A successful CAS keeps the key's
-        deadline, and so does a successful incr: both are updates
-        of the value, not fresh sets, so neither must resurrect a
-        key that is about to expire.
+        deadline, and so does a successful incr and a getset:
+        all three are updates of the value, not fresh sets, so
+        none must resurrect a key that is about to expire.
 
         Returns a result dict for commands whose outcome depends on the
-        state at apply time — currently "cas", "expire", "incr", and
-        "setnx" —
+        state at apply time — currently "cas", "expire", "incr",
+        "setnx", and "getset" —
         and None for set/del, whose outcome is always ok. The result is
         what the leader hands back to the waiting client and what the
         dedup table caches for retries, so it must be a pure function
@@ -284,6 +284,31 @@ class KVStore:
             self._expiry.pop(key, None)
             return {"type": "client_response", "status": "ok",
                     "setnx": 1}
+        elif op == "getset":
+            # Atomically set a key and return its old value, Redis
+            # GETSET: the old value is whatever the key held at
+            # this exact point in the log — None when the key was
+            # absent — and the new value is what the key holds
+            # after. The outcome is decided here, at apply time,
+            # like a CAS, so a retry with the same session id
+            # returns the first attempt's old value from the dedup
+            # table instead of setting twice (and a second getset
+            # with a different id sees the first one's value as
+            # the old value, which is exactly the atomic swap
+            # Redis promises). It always writes — even on a
+            # missing key, which it creates — so it always fires
+            # a set watch event. A key that already exists keeps
+            # its deadline, like a CAS or an incr: a getset is an
+            # update of the value, not a fresh set, so it must
+            # not resurrect a key that is about to expire. A new
+            # key joins the sorted index, like a set of a new key.
+            key = command["key"]
+            old = self._data.get(key)
+            if key not in self._data:
+                bisect.insort(self._keys, key)
+            self._data[key] = command["value"]
+            return {"type": "client_response", "status": "ok",
+                    "old_value": old}
         else:
             raise ValueError(f"unknown command op: {op!r}")
 
