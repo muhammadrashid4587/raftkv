@@ -163,9 +163,11 @@ class KVStore:
         # same idea: ``_wall_expiry[key]`` is the absolute Unix
         # time (``time.time()`` seconds) at which the key stops
         # existing, fixed once by the leader when the ``setex``
-        # entry was logged and stored in the entry itself — so
-        # every replica applies the same deadline, and replaying
-        # the log or installing a snapshot restores it exactly.
+        # entry was logged and stored in the entry itself — or
+        # when an ``expireat`` / ``pexpireat`` entry fixed one
+        # on a key that already exists — so every replica
+        # applies the same deadline, and replaying the log or
+        # installing a snapshot restores it exactly.
         # The leader's clock is the only one that matters for
         # the deadline; each node enforces it against its own
         # clock (a background sweep plus a purge before serving
@@ -219,9 +221,9 @@ class KVStore:
         plain ``set`` clears it just as it clears a log deadline.
 
         Returns a result dict for commands whose outcome depends on the
-        state at apply time — currently "cas", "expire", "incr",
-        "setnx", "getset", "append", "getdel", "setrange", "getex",
-        "setbit", and "pfadd" —
+        state at apply time — currently "cas", "expire", "expireat",
+        "pexpireat", "incr", "setnx", "getset", "append", "getdel",
+        "setrange", "getex", "setbit", and "pfadd" —
         and None for set/del, whose outcome is always ok. The result is
         what the leader hands back to the waiting client and what the
         dedup table caches for retries, so it must be a pure function
@@ -353,6 +355,53 @@ class KVStore:
             self._expiry[key] = deadline
             return {"type": "client_response", "status": "ok",
                     "expire": 1, "deadline": deadline}
+        elif op in ("expireat", "pexpireat"):
+            # Set an absolute wall-clock deadline on an existing
+            # key, Redis EXPIREAT / PEXPIREAT: the wall-clock
+            # analogue of ``expire`` — the value is untouched,
+            # only the deadline changes. The deadline is the
+            # absolute Unix time in ``wall_deadline`` (seconds; a
+            # PEXPIREAT millisecond timestamp was divided by
+            # 1000 by the leader before the entry was logged),
+            # fixed once by the leader, so every replica applies
+            # the same deadline and a replay or a snapshot
+            # restores it exactly. Like a ``setex`` it drops the
+            # log-entry deadline, so a key holds at most one kind
+            # of TTL. A missing key answers 0 and records
+            # nothing, like ``expire`` — the entry still
+            # committed, it just did not set a deadline. A
+            # deadline already past at log time (``delete_now``,
+            # set by the leader when it fixed the deadline)
+            # deletes the key outright instead of recording a
+            # deadline nobody could honour, like a ``getex``
+            # whose absolute deadline was already past — the
+            # reply is 1 with ``deleted`` set, so the apply path
+            # fires the ``del`` event for it. The deadline needs
+            # no log index — it is already absolute — so a
+            # command without one raises instead of recording a
+            # deadline nobody could agree on.
+            key = command["key"]
+            deadline = command.get("wall_deadline")
+            if deadline is None:
+                raise ValueError(
+                    "expireat needs a wall_deadline computed by "
+                    "the leader before the entry was logged")
+            if key not in self._data:
+                return {"type": "client_response", "status": "ok",
+                        op: 0}
+            if command.get("delete_now"):
+                del self._data[key]
+                idx = bisect.bisect_left(self._keys, key)
+                if idx < len(self._keys) and self._keys[idx] == key:
+                    del self._keys[idx]
+                self._expiry.pop(key, None)
+                self._wall_expiry.pop(key, None)
+                return {"type": "client_response", "status": "ok",
+                        op: 1, "deleted": True}
+            self._expiry.pop(key, None)
+            self._wall_expiry[key] = float(deadline)
+            return {"type": "client_response", "status": "ok",
+                    op: 1, "wall_deadline": float(deadline)}
         elif op == "cas":
             key = command["key"]
             expected = command["expected"]

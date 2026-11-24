@@ -181,6 +181,43 @@ class Session:
         return self._write({"type": "client", "op": "expire",
                             "key": key, "ttl_entries": entries})
 
+    def expireat(self, key: str, timestamp: int) -> dict:
+        """Set an absolute wall-clock deadline on a key that
+        already exists, Redis EXPIREAT: the key dies when the wall
+        clock reaches ``timestamp`` — Unix seconds, fixed by the
+        leader at log time, so every replica applies the same
+        deadline. The wall-clock analogue of ``expire``: the value
+        is untouched, only the deadline changes, and a log-entry
+        deadline the key had is dropped, so a key holds at most
+        one kind of TTL. Returns ``expireat`` 1 when the key
+        exists (the deadline is set, and the reply also carries
+        it) and 0 when it does not — like Redis, a missing key is
+        a no-op, not an error. A deadline already past deletes
+        the key outright and still answers 1, with ``deleted``
+        set. A write like ``expire``: it appends a log entry,
+        carries a session request id (a retry returns the first
+        attempt's result instead of setting the deadline twice),
+        and advances the write watermark from the reply's index."""
+        return self._write({"type": "client", "op": "expireat",
+                            "key": key, "timestamp": timestamp})
+
+    def pexpireat(self, key: str, timestamp_ms: int) -> dict:
+        """Set an absolute wall-clock deadline on a key that
+        already exists, Redis PEXPIREAT: the same as
+        ``expireat``, but ``timestamp_ms`` names the deadline in
+        Unix milliseconds — the leader divides by 1000 before the
+        entry is logged, so the deadline the replicas apply is
+        still an absolute Unix time in seconds. Returns
+        ``pexpireat`` 1 when the key exists (the reply also
+        carries ``wall_deadline``, the deadline in seconds) and 0
+        when it does not; a deadline already past deletes the key
+        outright and still answers 1, with ``deleted`` set. A
+        write like ``expireat``: it appends a log entry, carries
+        a session request id, and advances the write watermark
+        from the reply's index."""
+        return self._write({"type": "client", "op": "pexpireat",
+                            "key": key, "timestamp_ms": timestamp_ms})
+
     def mset(self, pairs: list,
              ttl_entries: int | None = None) -> dict:
         """Write many keys with one ``mset`` RPC: the whole batch
@@ -228,6 +265,8 @@ class Session:
             {"op": "setbit", "key": k, "offset": n, "bit": b}
             {"op": "pfadd", "key": k, "elements": [e1, e2, ...]}
             {"op": "setex", "key": k, "value": v, "seconds": n}
+            {"op": "expireat", "key": k, "timestamp": t}
+            {"op": "pexpireat", "key": k, "timestamp_ms": t}
 
         The whole list goes out in batches of ``depth`` on a single
         persistent socket without waiting between requests, and the
@@ -908,7 +947,9 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
     of at most 1000 string elements, ``setex`` a string key and
     value plus an integer ``seconds`` from 1 to 1000000 — the
     wall-clock TTL, whose absolute deadline the leader fixes at
-    log time."""
+    log time — ``expireat`` a string key and a positive integer
+    ``timestamp`` (Unix seconds), ``pexpireat`` a string key and
+    a positive integer ``timestamp_ms`` (Unix milliseconds)."""
     if not isinstance(op, dict):
         return None, {"type": "client_response", "status": "error",
                       "error": "pipeline op must be an object with "
@@ -916,12 +957,12 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
     name = op.get("op")
     if name not in ("set", "del", "cas", "incr", "setnx", "getset",
                     "append", "getdel", "getex", "setrange", "setbit",
-                    "pfadd", "setex"):
+                    "pfadd", "setex", "expireat", "pexpireat"):
         return None, {"type": "client_response", "status": "error",
                       "error": "pipeline op must be set, del, cas, "
                                "incr, setnx, getset, append, "
                                "getdel, getex, setrange, setbit, "
-                               "pfadd, or setex"}
+                               "pfadd, setex, expireat, or pexpireat"}
     key = op.get("key")
     if not isinstance(key, str):
         return None, {"type": "client_response", "status": "error",
@@ -1025,6 +1066,30 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
                           "error": "pipeline setex seconds must be "
                                    "an integer between 1 and 1000000"}
         msg["seconds"] = seconds
+    if name == "expireat":
+        # ``timestamp`` rides along with a pipelined expireat,
+        # validated here so a malformed one never goes on the
+        # wire: a positive integer number of Unix seconds — the
+        # same shape the server enforces.
+        ts = op.get("timestamp")
+        if (not isinstance(ts, int) or isinstance(ts, bool)
+                or ts < 1):
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline expireat timestamp "
+                                   "must be a positive integer"}
+        msg["timestamp"] = ts
+    if name == "pexpireat":
+        # ``timestamp_ms`` rides along with a pipelined
+        # pexpireat, validated here so a malformed one never
+        # goes on the wire: a positive integer number of Unix
+        # milliseconds — the same shape the server enforces.
+        ts = op.get("timestamp_ms")
+        if (not isinstance(ts, int) or isinstance(ts, bool)
+                or ts < 1):
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline pexpireat timestamp_ms "
+                                   "must be a positive integer"}
+        msg["timestamp_ms"] = ts
     if name == "getex":
         # At most one expiry option rides along with a pipelined
         # getex, validated here so a malformed one never goes on
@@ -1084,7 +1149,8 @@ def pipeline(node_addr: tuple[str, int], ops: list,
 
     One ``set`` / ``del`` / ``cas`` / ``incr`` / ``setnx`` /
     ``getset`` / ``append`` / ``getdel`` / ``getex`` / ``setrange`` /
-    ``setbit`` / ``pfadd`` / ``setex`` op per
+    ``setbit`` / ``pfadd`` / ``setex`` / ``expireat`` / ``pexpireat``
+    op per
     dict (see
     ``Session.pipeline`` for the shapes): the ops go out in
     batches of ``depth`` on a single persistent socket and the
@@ -1254,6 +1320,46 @@ def setex(node_addr: tuple[str, int], key: str, value: str,
     return request(node_addr, {"type": "client", "op": "setex",
                                "key": key, "value": value,
                                "seconds": seconds}, timeout=timeout)
+
+
+def expireat(node_addr: tuple[str, int], key: str, timestamp: int,
+             timeout: float = 12.0) -> dict:
+    """Set an absolute wall-clock deadline on an existing key,
+    following leader redirects like ``request``.
+
+    One request appends the expireat entry, so the deadline is the
+    absolute Unix time ``timestamp`` (seconds) — fixed by the
+    leader at log time, so every replica applies the same
+    deadline. The reply is the plain expireat response (``status``
+    ``ok`` with ``expireat`` 1 when the key exists — plus
+    ``wall_deadline``, the absolute Unix time at which the key is
+    purged — and 0 when it does not, like Redis's EXPIREAT). A
+    timestamp already past deletes the key outright and still
+    answers 1, with ``deleted`` set."""
+    return request(node_addr, {"type": "client", "op": "expireat",
+                               "key": key, "timestamp": timestamp},
+                   timeout=timeout)
+
+
+def pexpireat(node_addr: tuple[str, int], key: str,
+              timestamp_ms: int, timeout: float = 12.0) -> dict:
+    """Set an absolute wall-clock deadline on an existing key,
+    following leader redirects like ``request``.
+
+    One request appends the pexpireat entry, so the deadline is the
+    absolute Unix time ``timestamp_ms`` (milliseconds) — the leader
+    divides by 1000 before the entry is logged, so the deadline
+    the replicas apply is still an absolute Unix time in seconds.
+    The reply is the plain pexpireat response (``status`` ``ok``
+    with ``pexpireat`` 1 when the key exists — plus
+    ``wall_deadline``, the deadline in seconds — and 0 when it
+    does not, like Redis's PEXPIREAT). A timestamp already past
+    deletes the key outright and still answers 1, with ``deleted``
+    set."""
+    return request(node_addr, {"type": "client", "op": "pexpireat",
+                               "key": key,
+                               "timestamp_ms": timestamp_ms},
+                   timeout=timeout)
 
 
 def incr(node_addr: tuple[str, int], key: str, by: int = 1,
@@ -1755,6 +1861,46 @@ def main(argv: list[str] | None = None) -> int:
     p_setex.add_argument("--request-id", default=None,
                          help="id of this write within the client "
                               "session")
+    p_expireat = sub.add_parser(
+        "expireat",
+        help="set an absolute wall-clock deadline on an existing "
+             "key, Redis EXPIREAT: prints 1 when the key exists "
+             "(it dies when the wall clock reaches TIMESTAMP, "
+             "Unix seconds) and 0 when it does not; a timestamp "
+             "already past deletes the key outright and still "
+             "prints 1")
+    p_expireat.add_argument("key")
+    p_expireat.add_argument("timestamp", type=int,
+                            help="absolute Unix time in seconds at "
+                                 "which the key is purged")
+    p_expireat.add_argument("--client-id", default=None,
+                            help="session id for at-most-once writes: a "
+                                 "retry with the same client id + request "
+                                 "id returns the first attempt's result "
+                                 "instead of writing twice")
+    p_expireat.add_argument("--request-id", default=None,
+                            help="id of this write within the client "
+                                 "session")
+    p_pexpireat = sub.add_parser(
+        "pexpireat",
+        help="set an absolute wall-clock deadline on an existing "
+             "key, Redis PEXPIREAT: prints 1 when the key exists "
+             "(it dies when the wall clock reaches TIMESTAMP_MS, "
+             "Unix milliseconds) and 0 when it does not; a "
+             "timestamp already past deletes the key outright and "
+             "still prints 1")
+    p_pexpireat.add_argument("key")
+    p_pexpireat.add_argument("timestamp_ms", type=int,
+                             help="absolute Unix time in milliseconds "
+                                  "at which the key is purged")
+    p_pexpireat.add_argument("--client-id", default=None,
+                             help="session id for at-most-once writes: a "
+                                  "retry with the same client id + request "
+                                  "id returns the first attempt's result "
+                                  "instead of writing twice")
+    p_pexpireat.add_argument("--request-id", default=None,
+                             help="id of this write within the client "
+                                  "session")
     p_mget = sub.add_parser(
         "mget",
         help="read many keys with one request: prints the values as "
@@ -2074,7 +2220,7 @@ def main(argv: list[str] | None = None) -> int:
     if op in ("set", "get", "del", "cas", "ttl", "expire", "incr",
               "setnx", "getset", "append", "strlen", "getdel",
               "getex", "getrange", "setrange", "setbit", "getbit",
-              "pfadd", "pfcount", "setex"):
+              "pfadd", "pfcount", "setex", "expireat", "pexpireat"):
         msg["key"] = args.key
     elif op == "mset":
         if len(args.pairs) % 2:
@@ -2110,6 +2256,10 @@ def main(argv: list[str] | None = None) -> int:
     if op == "setex":
         msg["value"] = args.value
         msg["seconds"] = args.seconds
+    if op == "expireat":
+        msg["timestamp"] = args.timestamp
+    if op == "pexpireat":
+        msg["timestamp_ms"] = args.timestamp_ms
     if op == "incr":
         msg["by"] = args.by
     if op == "setnx":
@@ -2144,7 +2294,7 @@ def main(argv: list[str] | None = None) -> int:
         msg["elements"] = args.elements
     if op in ("set", "del", "cas", "mset", "expire", "incr", "setnx",
               "getset", "append", "getdel", "getex", "setrange",
-              "setbit", "pfadd", "setex") \
+              "setbit", "pfadd", "setex", "expireat", "pexpireat") \
             and args.request_id:
         # A request id without an explicit client id still dedups
         # within the default "cli" session; the same id retried from
@@ -2178,6 +2328,10 @@ def main(argv: list[str] | None = None) -> int:
             print(resp.get("ttl"))
         elif op == "expire":
             print(resp.get("expire"))
+        elif op == "expireat":
+            print(resp.get("expireat"))
+        elif op == "pexpireat":
+            print(resp.get("pexpireat"))
         elif op == "incr":
             print(resp.get("value"))
         elif op == "setnx":

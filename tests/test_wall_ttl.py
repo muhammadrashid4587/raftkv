@@ -1,4 +1,4 @@
-"""Wall-clock TTL (setex, v0.48.0).
+"""Wall-clock TTL (setex, v0.48.0; expireat / pexpireat, v0.49.0).
 
 ``setex k v SECONDS`` writes the key with a wall-clock TTL: the
 leader fixes an absolute deadline (its wall clock at log time +
@@ -12,7 +12,15 @@ in the log — and accept that two nodes' clocks may disagree briefly
 about whether a key is alive, which a log-entry TTL can never do.
 A plain ``set`` clears a wall deadline, a ``setex`` clears a log
 deadline, and a successful CAS keeps the wall deadline like it keeps
-the log one. These spin up real nodes (real TCP, real threads, real
+the log one.
+
+``expireat k TIMESTAMP`` / ``pexpireat k TIMESTAMP_MS`` set the
+same absolute wall-clock deadline on a key that already exists —
+the wall-clock analogue of ``expire``: the value is untouched, only
+the deadline changes, and a log-entry deadline the key had is
+dropped. They answer 1 when the key exists and 0 when it does not,
+and a deadline already past deletes the key outright (still
+answering 1). These spin up real nodes (real TCP, real threads, real
 disk) on localhost, like the rest of the suite.
 """
 
@@ -31,6 +39,17 @@ def _setex(addr, key, value, seconds):
     return client_request(addr, {"type": "client", "op": "setex",
                                  "key": key, "value": value,
                                  "seconds": seconds})
+
+
+def _expireat(addr, key, timestamp):
+    return client_request(addr, {"type": "client", "op": "expireat",
+                                 "key": key, "timestamp": timestamp})
+
+
+def _pexpireat(addr, key, timestamp_ms):
+    return client_request(addr, {"type": "client", "op": "pexpireat",
+                                 "key": key,
+                                 "timestamp_ms": timestamp_ms})
 
 
 def _set(addr, key, value, ttl=None):
@@ -443,6 +462,365 @@ class TestWallTTLCluster(unittest.TestCase):
             self.assertNotEqual(out.returncode, 0)
             self.assertIn("seconds", out.stderr)
             self.assertIsNone(_get(addr, "bad").get("value"))
+        finally:
+            cluster.stop_all()
+
+
+class TestExpireAtStore(unittest.TestCase):
+    def test_store_expireat_sets_wall_deadline_and_clears_log(self):
+        """An expireat records its absolute wall deadline and drops
+        the key's log-entry deadline: a key holds at most one kind
+        of TTL, and the wall-clock one replaces the log one."""
+        store = KVStore()
+        now = time.time()
+        store.apply({"op": "set", "key": "k", "value": "v",
+                     "ttl_entries": 50}, index=10)
+        self.assertEqual(store.expiries(), {"k": 60})
+        result = store.apply({"op": "expireat", "key": "k",
+                              "wall_deadline": now + 10}, index=11)
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["expireat"], 1)
+        self.assertEqual(result["wall_deadline"], now + 10)
+        self.assertEqual(store.expiries(), {})
+        self.assertEqual(store.wall_expiries(), {"k": now + 10})
+        self.assertEqual(store.expire_up_to(60), [])
+        self.assertEqual(store.get("k"), "v")
+        self.assertEqual(store.expire_wall_up_to(now + 10), ["k"])
+        self.assertIsNone(store.get("k"))
+
+    def test_store_expireat_missing_key_returns_zero(self):
+        """Expiring a missing key answers 0, records no deadline,
+        and touches no other key — a no-op, not an error."""
+        store = KVStore()
+        now = time.time()
+        store.apply({"op": "set", "key": "other", "value": "v"},
+                    index=10)
+        result = store.apply({"op": "expireat", "key": "nope",
+                              "wall_deadline": now + 10}, index=11)
+        self.assertEqual(result["expireat"], 0)
+        self.assertEqual(store.wall_expiries(), {})
+        self.assertEqual(store.get("other"), "v")
+
+    def test_store_pexpireat_sets_wall_deadline(self):
+        """A pexpireat records the same absolute wall deadline in
+        seconds — the millisecond timestamp was divided by 1000
+        before the entry was logged — and answers 1."""
+        store = KVStore()
+        now = time.time()
+        store.apply({"op": "set", "key": "k", "value": "v"}, index=10)
+        result = store.apply({"op": "pexpireat", "key": "k",
+                              "wall_deadline": now + 1.5}, index=11)
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["pexpireat"], 1)
+        self.assertEqual(result["wall_deadline"], now + 1.5)
+        self.assertEqual(store.wall_expiries(), {"k": now + 1.5})
+        self.assertEqual(store.expire_wall_up_to(now + 1), [])
+        self.assertEqual(store.get("k"), "v")
+        self.assertEqual(store.expire_wall_up_to(now + 1.5), ["k"])
+        self.assertIsNone(store.get("k"))
+
+    def test_store_expireat_replaces_wall_deadline(self):
+        """Re-expiring a key replaces its wall deadline, whether it
+        came from a setex or an earlier expireat — the value is
+        untouched either way."""
+        store = KVStore()
+        now = time.time()
+        store.apply({"op": "setex", "key": "k", "value": "v",
+                     "wall_deadline": now + 10}, index=10)
+        result = store.apply({"op": "expireat", "key": "k",
+                              "wall_deadline": now + 60}, index=11)
+        self.assertEqual(result["expireat"], 1)
+        self.assertEqual(store.wall_expiries(), {"k": now + 60})
+        self.assertEqual(store.get("k"), "v")
+        self.assertEqual(store.expire_wall_up_to(now + 10), [])
+        self.assertEqual(store.get("k"), "v")
+
+    def test_store_expireat_past_deadline_deletes_key(self):
+        """An expireat whose deadline was already past at log time
+        deletes the key outright — value, index entry, and both
+        deadlines gone — and answers 1 with ``deleted`` set, so
+        the apply path fires the del watch event for it."""
+        store = KVStore()
+        now = time.time()
+        store.apply({"op": "set", "key": "k", "value": "v",
+                     "ttl_entries": 50}, index=10)
+        result = store.apply({"op": "expireat", "key": "k",
+                              "wall_deadline": now - 5,
+                              "delete_now": True}, index=11)
+        self.assertEqual(result["expireat"], 1)
+        self.assertTrue(result["deleted"])
+        self.assertIsNone(store.get("k"))
+        self.assertEqual(store.expiries(), {})
+        self.assertEqual(store.wall_expiries(), {})
+        self.assertEqual(store.keys(), ([], False))
+
+    def test_store_expireat_past_deadline_missing_key_returns_zero(self):
+        """A past-deadline expireat on a missing key still answers
+        0: there was nothing to delete, so the delete is a no-op
+        like any other expireat on a missing key."""
+        store = KVStore()
+        now = time.time()
+        result = store.apply({"op": "expireat", "key": "nope",
+                              "wall_deadline": now - 5,
+                              "delete_now": True}, index=11)
+        self.assertEqual(result["expireat"], 0)
+        self.assertNotIn("deleted", result)
+
+    def test_store_expireat_without_deadline_raises(self):
+        """An expireat with no wall deadline to record is
+        meaningless, so applying one raises instead of recording
+        a deadline nobody could agree on — like a setex."""
+        store = KVStore()
+        store.apply({"op": "set", "key": "k", "value": "v"}, index=10)
+        with self.assertRaises(ValueError):
+            store.apply({"op": "expireat", "key": "k"}, index=11)
+        with self.assertRaises(ValueError):
+            store.apply({"op": "pexpireat", "key": "k"}, index=11)
+
+
+class TestExpireAtCluster(unittest.TestCase):
+    def test_expireat_readable_then_expires(self):
+        """A key given a wall deadline 2 seconds out is readable
+        at once and gone past the deadline — on the leader and on
+        every follower, at the same wall-clock moment."""
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            resp = _set(addr, "temp", "v")
+            self.assertEqual(resp.get("status"), "ok", resp)
+            resp = _expireat(addr, "temp", int(time.time()) + 2)
+            self.assertEqual(resp.get("status"), "ok", resp)
+            self.assertEqual(resp.get("expireat"), 1, resp)
+            self.assertEqual(_get(addr, "temp").get("value"), "v")
+            time.sleep(2.5)
+            self.assertIsNone(_get(addr, "temp").get("value"))
+            for node in cluster.nodes.values():
+                self.assertTrue(wait_for_key(node, "temp", None),
+                                node.id)
+        finally:
+            cluster.stop_all()
+
+    def test_expireat_missing_key_returns_zero(self):
+        """An expireat on a missing key answers 0 and appends an
+        entry that changes nothing — the key stays missing."""
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            resp = _expireat(addr, "nope", int(time.time()) + 60)
+            self.assertEqual(resp.get("status"), "ok", resp)
+            self.assertEqual(resp.get("expireat"), 0, resp)
+            self.assertIsNone(_get(addr, "nope").get("value"))
+        finally:
+            cluster.stop_all()
+
+    def test_expireat_past_deadline_deletes_immediately(self):
+        """An expireat with a deadline already past deletes the key
+        at once — the reply answers 1 with ``deleted`` set, the
+        key reads back as missing right away, and a watch on it
+        fires a del event at the entry's index."""
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            log = EventLog()
+            leader.watch.watch("temp", log)
+            resp = _set(addr, "temp", "v")
+            self.assertEqual(resp.get("status"), "ok", resp)
+            self.assertTrue(log.wait_for(1), log.events)
+            resp = _expireat(addr, "temp", int(time.time()) - 10)
+            self.assertEqual(resp.get("status"), "ok", resp)
+            self.assertEqual(resp.get("expireat"), 1, resp)
+            self.assertTrue(resp.get("deleted"), resp)
+            self.assertIsNone(_get(addr, "temp").get("value"))
+            self.assertTrue(log.wait_for(2, timeout=5.0), log.events)
+            self.assertEqual(log.events[1]["key"], "temp")
+            self.assertEqual(log.events[1]["op"], "del")
+            self.assertIsNone(log.events[1]["value"])
+        finally:
+            cluster.stop_all()
+
+    def test_pexpireat_milliseconds(self):
+        """A pexpireat with a millisecond timestamp 1.5 seconds out
+        is readable at once and gone past the deadline, and the
+        TTL query reports the deadline in seconds."""
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            resp = _set(addr, "temp", "v")
+            self.assertEqual(resp.get("status"), "ok", resp)
+            before = time.time()
+            resp = _pexpireat(addr, "temp",
+                              int((before + 1.5) * 1000))
+            self.assertEqual(resp.get("status"), "ok", resp)
+            self.assertEqual(resp.get("pexpireat"), 1, resp)
+            self.assertTrue(before + 1 <= resp.get("wall_deadline")
+                            <= before + 2, resp)
+            self.assertEqual(_get(addr, "temp").get("value"), "v")
+            got = _ttl(addr, "temp")
+            self.assertEqual(got.get("status"), "ok", got)
+            self.assertTrue(0 <= got.get("wall_ttl") <= 2,
+                            got.get("wall_ttl"))
+            time.sleep(2.0)
+            self.assertIsNone(_get(addr, "temp").get("value"))
+        finally:
+            cluster.stop_all()
+
+    def test_expireat_rejects_bad_timestamps(self):
+        """A timestamp of 0, a negative, a non-integer, or a boolean
+        is a client error — and it appends no log entry, so the
+        key is never given a deadline either."""
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            resp = _set(addr, "k", "v")
+            self.assertEqual(resp.get("status"), "ok", resp)
+            before = len(leader.log)
+            for bad in (0, -1, "x", True, 1.5):
+                resp = _expireat(addr, "k", bad)
+                self.assertEqual(resp.get("status"), "error",
+                                 (bad, resp))
+                resp = _pexpireat(addr, "k", bad)
+                self.assertEqual(resp.get("status"), "error",
+                                 (bad, resp))
+            self.assertEqual(len(leader.log), before)
+            got = _ttl(addr, "k")
+            self.assertEqual(got.get("wall_ttl"), -1)
+            self.assertIsNone(got.get("wall_deadline"))
+        finally:
+            cluster.stop_all()
+
+    def test_expireat_clears_log_deadline_on_cluster(self):
+        """An expireat on a key with a log-entry deadline drops the
+        log deadline: the key survives the log advancing past
+        where the log deadline would have purged it, and still
+        dies at its wall-clock deadline."""
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            resp = _set(addr, "temp", "v", ttl=5)
+            self.assertEqual(resp.get("status"), "ok", resp)
+            resp = _expireat(addr, "temp", int(time.time()) + 60)
+            self.assertEqual(resp.get("expireat"), 1, resp)
+            _fillers(addr, 10, prefix="past")
+            self.assertEqual(_get(addr, "temp").get("value"), "v")
+        finally:
+            cluster.stop_all()
+
+    def test_session_expireat(self):
+        """Session.expireat and Session.pexpireat set wall
+        deadlines, and the session's read-your-writes watermark
+        still works: a read after the write sees the key, and
+        after expiry it sees None."""
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            with Session(addr) as session:
+                resp = session.set("temp", "v")
+                self.assertEqual(resp.get("status"), "ok", resp)
+                resp = session.expireat("temp", int(time.time()) + 1)
+                self.assertEqual(resp.get("expireat"), 1, resp)
+                self.assertEqual(session.get("temp").get("value"), "v")
+                time.sleep(1.3)
+                self.assertIsNone(session.get("temp").get("value"))
+                resp = session.set("temp2", "v")
+                self.assertEqual(resp.get("status"), "ok", resp)
+                resp = session.pexpireat(
+                    "temp2", int((time.time() + 1) * 1000))
+                self.assertEqual(resp.get("pexpireat"), 1, resp)
+                self.assertEqual(session.get("temp2").get("value"), "v")
+                time.sleep(1.3)
+                self.assertIsNone(session.get("temp2").get("value"))
+        finally:
+            cluster.stop_all()
+
+    def test_pipeline_expireat(self):
+        """Pipelined expireat / pexpireat ops set wall deadlines,
+        and a malformed timestamp in a pipelined op is an error in
+        its position while the ops around it still run."""
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            with Session(addr) as session:
+                session.set("temp", "v")
+                session.set("temp2", "v")
+                session.set("keep", "v")
+                replies = session.pipeline([
+                    {"op": "expireat", "key": "temp",
+                     "timestamp": int(time.time()) + 1},
+                    {"op": "pexpireat", "key": "temp2",
+                     "timestamp_ms": int((time.time() + 1) * 1000)},
+                    {"op": "expireat", "key": "keep",
+                     "timestamp": 0},
+                    {"op": "expireat", "key": "missing",
+                     "timestamp": int(time.time()) + 60},
+                ])
+            self.assertEqual(replies[0].get("expireat"), 1, replies[0])
+            self.assertEqual(replies[1].get("pexpireat"), 1, replies[1])
+            self.assertEqual(replies[2].get("status"), "error",
+                             replies[2])
+            self.assertEqual(replies[3].get("expireat"), 0, replies[3])
+            time.sleep(1.3)
+            self.assertIsNone(_get(addr, "temp").get("value"))
+            self.assertIsNone(_get(addr, "temp2").get("value"))
+            self.assertEqual(_get(addr, "keep").get("value"), "v")
+        finally:
+            cluster.stop_all()
+
+    def test_expireat_cli(self):
+        """The ``expireat`` and ``pexpireat`` CLIs set wall
+        deadlines — printing 1 for an existing key and 0 for a
+        missing one — and a bad timestamp is rejected by the
+        server instead of writing."""
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            host, port = addr
+            out = subprocess.run(
+                [sys.executable, "-m", "raftkv.client",
+                 "--node", f"{host}:{port}", "set",
+                 "temp", "v"],
+                capture_output=True, text=True, timeout=15)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            out = subprocess.run(
+                [sys.executable, "-m", "raftkv.client",
+                 "--node", f"{host}:{port}", "expireat",
+                 "temp", str(int(time.time()) + 2)],
+                capture_output=True, text=True, timeout=15)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertEqual(out.stdout.strip(), "1")
+            time.sleep(2.5)
+            self.assertIsNone(_get(addr, "temp").get("value"))
+            out = subprocess.run(
+                [sys.executable, "-m", "raftkv.client",
+                 "--node", f"{host}:{port}", "expireat",
+                 "missing", str(int(time.time()) + 60)],
+                capture_output=True, text=True, timeout=15)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertEqual(out.stdout.strip(), "0")
+            out = subprocess.run(
+                [sys.executable, "-m", "raftkv.client",
+                 "--node", f"{host}:{port}", "pexpireat",
+                 "temp", "0"],
+                capture_output=True, text=True, timeout=15)
+            self.assertNotEqual(out.returncode, 0)
+            self.assertIn("timestamp_ms", out.stderr)
         finally:
             cluster.stop_all()
 

@@ -409,6 +409,40 @@ logic and the failure handling, not the key-value API on top.
   enforces it against its own clock, so two nodes may disagree
   briefly about whether a key is alive — which is why this is
   opt-in, and the log-entry TTL stays the default.
+- **Absolute wall-clock expiry** — since v0.49.0 `expireat key
+  timestamp` (`Session.expireat(k, ts)`,
+  `client.expireat(addr, k, ts)`, `expireat key timestamp` on the
+  CLI) and `pexpireat key timestamp_ms` (`Session.pexpireat(k,
+  ts_ms)`, `client.pexpireat(addr, k, ts_ms)`, `pexpireat key
+  timestamp_ms` on the CLI) set an absolute wall-clock deadline
+  on a key that already exists — Redis EXPIREAT / PEXPIREAT, the
+  wall-clock analogue of `expire`: the value is untouched, only
+  the deadline changes, and a log-entry deadline the key had is
+  dropped, so a key holds at most one kind of TTL. They answer 1
+  when the key exists (the reply also carries `wall_deadline`,
+  the absolute Unix time in seconds) and 0 when it does not — a
+  missing key is a no-op, not an error — and a deadline already
+  past deletes the key outright, still answering 1 with
+  `deleted` set, and firing a `del` watch event like a `getex`
+  whose absolute deadline was already past. The deadline is
+  fixed by the leader at log time, so every replica applies the
+  same deadline and it rides snapshots like a `setex` deadline;
+  the key then dies by the same three enforcements — the
+  background sweep every 100ms, the purge before each log entry
+  applies, and the purge before serving a read. The timestamp
+  must be a positive integer — Unix seconds for `expireat`,
+  Unix milliseconds for `pexpireat` (the leader divides by 1000
+  before the entry is logged) — and a bad value is a client
+  error and appends no log entry. It rides the same write path
+  as an `expire` — group-commit batching, dedup, the response's
+  log index advancing a session's watermark — and `{"op":
+  "expireat", "key": k, "timestamp": t}` /
+  `{"op": "pexpireat", "key": k, "timestamp_ms": t}` are
+  pipeline ops too. The `ttl` query reports the deadline they
+  set, in `wall_ttl` / `wall_deadline`, exactly like a `setex`
+  deadline. The honest limit is the same clock as `setex`: the
+  deadline is identical on every node, but each node enforces
+  it against its own clock.
 - **Bit operations** — since v0.46.0 `setbit key offset bit`
   (`Session.setbit(k, offset, bit)`, `client.setbit(addr, k,
   offset, bit)`, `setbit key offset bit` on the CLI) sets one
@@ -1073,6 +1107,22 @@ make test
 | `test_session_setex` | Session.setex writes with a wall TTL, and read-your-writes still works before and after expiry |
 | `test_pipeline_setex` | A pipelined setex may carry seconds; a malformed value is an error in its position |
 | `test_setex_cli` | The `setex` CLI writes the key with a wall deadline, and a bad seconds value is rejected instead of writing |
+| `test_store_expireat_sets_wall_deadline_and_clears_log` | An expireat records its absolute wall deadline and drops the key's log-entry deadline |
+| `test_store_expireat_missing_key_returns_zero` | Expiring a missing key answers 0, records no deadline, and touches no other key |
+| `test_store_pexpireat_sets_wall_deadline` | A pexpireat records the same absolute wall deadline in seconds and answers 1 |
+| `test_store_expireat_replaces_wall_deadline` | Re-expiring a key replaces its wall deadline, whether it came from a setex or an earlier expireat |
+| `test_store_expireat_past_deadline_deletes_key` | An expireat whose deadline was already past deletes the key outright and answers 1 with `deleted` set |
+| `test_store_expireat_past_deadline_missing_key_returns_zero` | A past-deadline expireat on a missing key still answers 0 |
+| `test_store_expireat_without_deadline_raises` | An expireat / pexpireat with no wall deadline raises instead of recording one nobody could agree on |
+| `test_expireat_readable_then_expires` | A key given a wall deadline 2 seconds out is readable at once and gone past the deadline, on every node |
+| `test_expireat_missing_key_returns_zero` | An expireat on a missing key answers 0 and changes nothing |
+| `test_expireat_past_deadline_deletes_immediately` | A past-deadline expireat deletes the key at once, answers 1 with `deleted`, and fires a del watch event |
+| `test_pexpireat_milliseconds` | A pexpireat with a millisecond timestamp 1.5 seconds out is readable at once and gone past the deadline |
+| `test_expireat_rejects_bad_timestamps` | A timestamp of 0, negative, non-integer, or boolean is a client error and appends no log entry |
+| `test_expireat_clears_log_deadline_on_cluster` | An expireat drops the log deadline: the key survives the log advancing past it and still dies at its wall deadline |
+| `test_session_expireat` | Session.expireat / pexpireat set wall deadlines, and read-your-writes still works before and after expiry |
+| `test_pipeline_expireat` | Pipelined expireat / pexpireat ops set wall deadlines; a malformed timestamp is an error in its position |
+| `test_expireat_cli` | The `expireat` / `pexpireat` CLIs set wall deadlines, print 1 / 0, and a bad timestamp is rejected instead of writing |
 | `test_store_expire_sets_deadline_at_apply_index` | An expire at index 11 with 5 entries sets the deadline to 16 — alive at 15, gone at 16 |
 | `test_store_expire_missing_key_returns_zero` | Expiring a missing key answers 0, records no deadline, and touches no other key |
 | `test_store_expire_replaces_deadline` | Re-expiring replaces the deadline, whether it came from a set TTL or an earlier expire |
@@ -2388,8 +2438,45 @@ entries left in `log.jsonl` are dropped by their index on reload.
   its original deadline, the expired key leaving the sorted
   scan, session read-your-writes, pipelined setex ops with a bad
   seconds value in position, and the CLI end to end.
+- ~~Wall-clock `expireat` / `pexpireat`~~ — done in v0.49.0,
+  Nov 24, 2026: `expireat key timestamp` / `pexpireat key
+  timestamp_ms` set an absolute wall-clock deadline on a key
+  that already exists — Redis EXPIREAT / PEXPIREAT, the
+  wall-clock analogue of `expire`: the value is untouched, only
+  the deadline changes, and a log-entry deadline the key had is
+  dropped, so a key holds at most one kind of TTL. They answer 1
+  when the key exists (the reply also carries `wall_deadline`,
+  the absolute Unix time in seconds) and 0 when it does not, and
+  a deadline already past deletes the key outright, still
+  answering 1 with `deleted` set, and firing a `del` watch event.
+  The leader fixes the deadline at log time (milliseconds divided
+  by 1000 for `pexpireat`), so every replica applies the same
+  deadline and it rides snapshots; the key then dies by the same
+  three enforcements as a `setex` deadline — the background sweep,
+  the purge before each log entry applies, and the purge before
+  serving a read. A timestamp of 0, negative, non-integer, or
+  boolean is a client error and appends no log entry. It rides
+  the same write path as an `expire` (group-commit batching,
+  dedup, session watermark), and `{"op": "expireat"}` /
+  `{"op": "pexpireat"}` are pipeline ops too.
+  `Session.expireat` / `Session.pexpireat`,
+  `client.expireat` / `client.pexpireat`, and `expireat` /
+  `pexpireat` on the CLI expose them.
+  `tests/test_wall_ttl.py` proves them: store-level expireat
+  recording its absolute deadline and clearing the log deadline,
+  a missing key answering 0, a pexpireat recording the deadline
+  in seconds, re-expiring replacing the deadline, a past
+  deadline deleting the key outright (and still answering 0 on a
+  missing key), and a missing deadline raising; replication to
+  every node with the key readable then gone past the deadline,
+  a missing key answering 0, a past deadline deleting immediately
+  with the `del` watch event firing, a pexpireat in milliseconds
+  with the TTL query reporting the deadline, bad timestamps
+  rejected with no log entry, an expireat clearing the log
+  deadline on the cluster, session read-your-writes, pipelined
+  expireat / pexpireat ops with a bad timestamp in position, and
+  the CLI end to end.
   The roadmap is exhausted again, so the next real thing is
   a new roadmap item grounded in this project's purpose,
-  proposed by the next run — candidates: a wall-clock
-  `expireat` / `pexpireat` (set an absolute wall-clock deadline
-  on an existing key), or SET with NX / XX / KEEPTTL flags.
+  proposed by the next run — candidate: SET with NX / XX /
+  KEEPTTL flags.

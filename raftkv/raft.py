@@ -1408,9 +1408,10 @@ class RaftNode:
             elif op == "noop":
                 pass
             else:
-                # The apply result matters for CAS, expire, incr,
-                # setnx, getset, append, getdel, setrange, getex,
-                # setbit, and pfadd:
+                # The apply result matters for CAS, expire,
+                # expireat, pexpireat, incr, setnx, getset,
+                # append, getdel, setrange, getex, setbit, and
+                # pfadd:
                 # their outcome is decided here, at this exact point
                 # in the log, so the result is recorded in the dedup
                 # table
@@ -1514,6 +1515,17 @@ class RaftNode:
                     # read-with-side-effect, not a set.
                     self.watch.notify(entry["command"]["key"], None, "del",
                                       index=self.last_applied)
+                elif (op in ("expireat", "pexpireat")
+                        and result is not None
+                        and result.get("deleted")):
+                    # An expireat / pexpireat whose deadline was
+                    # already past deleted the key outright: it
+                    # fires like a del. Any other expireat
+                    # changed only the deadline, not the value,
+                    # so it fires nothing — a pure expiry change
+                    # is not a set, like a getex or an expire.
+                    self.watch.notify(entry["command"]["key"], None, "del",
+                                      index=self.last_applied)
                 elif (op == "setbit" and result is not None
                         and result.get("status") == "ok"):
                     # A successful setbit fires like a set, with
@@ -1534,7 +1546,8 @@ class RaftNode:
                                       self.sm.get(entry["command"]["key"]),
                                       "set",
                                       index=self.last_applied)
-                if (op in ("cas", "expire", "incr", "setnx", "getset",
+                if (op in ("cas", "expire", "expireat", "pexpireat",
+                           "incr", "setnx", "getset",
                            "append", "getdel", "setrange", "getex",
                            "setbit", "pfadd")
                         and result is not None
@@ -1547,9 +1560,9 @@ class RaftNode:
                     # would sit in _apply_results forever. A write
                     # without a session id has no dedup key, so it
                     # always records: its waiter is identified by
-                    # index alone. CAS, expire, incr, setnx, getset,
-                    # append, getdel, setrange, getex, setbit, and
-                    # pfadd are the ops
+                    # index alone. CAS, expire, expireat, pexpireat,
+                    # incr, setnx, getset, append, getdel, setrange,
+                    # getex, setbit, and pfadd are the ops
                     # whose apply returns a result — a set/del
                     # returns None and has nothing to record.
                     key = _dedup_key(entry["command"])
@@ -1585,11 +1598,13 @@ class RaftNode:
         """Record an applied client write in the dedup table. Lock held.
         The cached result is what a retry with the same session id gets
         back instead of a second log entry. For set/del the result is
-        always ok once committed; for CAS, expire, incr, setnx,
+        always ok once committed; for CAS, expire, expireat,
+        pexpireat, incr, setnx,
         getset, append, getdel, setrange, getex, setbit, and pfadd
         it is the
         apply-time outcome (success, mismatch, or missing key for a
-        CAS; 1 or 0 for an expire; the new value, or not_an_integer
+        CAS; 1 or 0 for an expire; 1 or 0 for an expireat /
+        pexpireat; the new value, or not_an_integer
         / overflow for an incr; 1 or 0 for a setnx; the old value
         for a getset; the new value and length, or wrongtype for
         an append; the old value and 1 or 0 for a getdel; the new
@@ -2286,6 +2301,7 @@ class RaftNode:
             return self._on_mset(msg)
         key = msg.get("key")
         if op not in ("set", "get", "del", "cas", "ttl", "expire",
+                      "expireat", "pexpireat",
                       "incr", "setnx", "getset", "append", "strlen",
                       "getdel", "getrange", "setrange", "getex",
                       "setbit", "getbit", "pfadd", "pfcount",
@@ -2293,6 +2309,7 @@ class RaftNode:
                 or key is None:
             return {"type": "client_response", "status": "error",
                     "error": "op must be set/get/del/cas/ttl/expire/"
+                             "expireat/pexpireat/"
                              "incr/setnx/getset/append/strlen/getdel/"
                              "getrange/setrange/getex/setbit/getbit/"
                              "pfadd/pfcount/setex "
@@ -2551,6 +2568,39 @@ class RaftNode:
                                  f"{WALL_TTL_MAX_SECONDS}"}
             command["seconds"] = seconds
             command["wall_deadline"] = time.time() + seconds
+        if op in ("expireat", "pexpireat"):
+            # Set an absolute wall-clock deadline on an existing
+            # key, Redis EXPIREAT / PEXPIREAT: the wall-clock
+            # analogue of ``expire`` — the value is untouched,
+            # only the deadline changes. ``expireat`` names the
+            # deadline as Unix seconds, ``pexpireat`` as Unix
+            # milliseconds; both must be positive integers, and
+            # the deadline the replicas apply is the absolute
+            # Unix time in seconds, fixed here on the leader
+            # before the command is ever logged — the same
+            # fix-at-log-time as a ``setex``, so every replica
+            # applies the same deadline and a replay or a
+            # snapshot restores it exactly. A deadline already
+            # past at log time deletes the key outright instead
+            # of recording a deadline nobody could honour, so
+            # the command carries ``delete_now`` and the store
+            # deletes it at apply time, like a ``getex`` whose
+            # absolute deadline was already past. Whether the
+            # key exists is decided at apply time, like an
+            # ``expire``, not here.
+            field = ("timestamp" if op == "expireat"
+                     else "timestamp_ms")
+            ts = msg.get(field)
+            if (not isinstance(ts, int) or isinstance(ts, bool)
+                    or ts < 1):
+                return {"type": "client_response", "status": "error",
+                        "error": f"{op} {field} must be a positive "
+                                 "integer"}
+            deadline = (float(ts) if op == "expireat"
+                        else ts / 1000.0)
+            command["wall_deadline"] = deadline
+            if deadline <= time.time():
+                command["delete_now"] = True
         if op in ("set", "expire"):
             # A TTL, in log entries: the key lives until the log
             # reaches this entry's index + ttl_entries, then it is
@@ -3161,7 +3211,8 @@ class RaftNode:
         # batch failed (so nothing was appended), and a retry arriving
         # after this point takes the _dedup path or appends fresh.
         # A waiter whose entry has an apply-time result (a CAS, an
-        # expire, or a getex) gets that result, not the shared ok: the outcome was
+        # expire, an expireat / pexpireat, or a getex) gets that
+        # result, not the shared ok: the outcome was
         # decided when the entry applied, and the waiter must learn it,
         # not just that the entry committed. Apply results for this
         # batch are pruned here, once every waiter has its own — and
