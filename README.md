@@ -175,10 +175,21 @@ logic and the failure handling, not the key-value API on top.
   that installs one keeps expiring keys on schedule instead
   of holding them forever. A TTL must be an integer from 1 to
   1,000,000 (`TTL_MAX_ENTRIES`); a bad value is a client
-  error and appends no log entry. Not yet covered: `mset`
-  takes no TTL — a batch carries no single deadline — and
-  there is no `expire`/`ttl` query to read a key's remaining
-  entries back.
+  error and appends no log entry. Since v0.37.0 a key's
+  remaining TTL is readable back: `ttl key`
+  (`Session.ttl(k)`, `client.ttl(addr, k)`, `ttl k` on the
+  CLI) returns the entries left until the key expires, in
+  Redis's convention — -2 the key does not exist, -1 it
+  exists with no deadline, otherwise the entries left —
+  plus `deadline`, the absolute log index at which the key
+  is purged (None without one). It rides the same
+  ReadIndex/lease path as a `get`, so the number reflects
+  the committed state as of the read index it names — a
+  session query sees its own write's deadline, a stale
+  query is served from a follower lease like any stale
+  read. Not yet covered: `mset` takes no TTL — a batch
+  carries no single deadline — and there is no `expire`
+  command to set a deadline on an existing key.
 - **Key enumeration** — since v0.31.0 one `keys` RPC lists the
   store's keys (`client.keys(prefix, limit, start_after)`,
   `Session.keys(prefix, limit, start_after)`, `keys --prefix p
@@ -683,8 +694,14 @@ make test
 | `test_store_plain_set_clears_deadline` | A set without a TTL drops the key's deadline, so the key outlives the position it would have expired at |
 | `test_store_cas_keeps_deadline` | A successful CAS updates the value but keeps the deadline |
 | `test_store_mset_and_del_clear_deadline` | An mset pair and a delete both drop the key's deadline, like a plain set |
+| `test_store_ttl_remaining` | `KVStore.ttl` answers -2 for a missing key, -1 with no deadline, otherwise the entries left plus the deadline itself |
 | `test_store_ttl_without_index_raises` | A TTL with no log position to anchor it raises instead of recording a deadline nobody could agree on |
 | `test_store_load_restores_expiry` | A snapshot load restores the deadlines with the data, and a load with no expiry (an old snapshot) expires nothing |
+| `test_ttl_query_counts_down` | A TTL query counts down 3, 2, 1 as the log advances, then answers -2 once the deadline entry lands |
+| `test_ttl_query_missing_and_no_deadline` | A missing key answers -2 and a key with no deadline answers -1 with no deadline |
+| `test_ttl_query_from_follower_redirects` | A TTL query sent to a follower is redirected to the leader and still answers correctly |
+| `test_session_ttl_is_read_your_writes` | A session TTL query sees its own write's deadline and counts down as the session writes fillers |
+| `test_ttl_query_cli` | The `ttl` CLI prints the remaining entries, and -2 for a missing key |
 | `test_set_with_ttl_expires_at_deadline` | A key with ttl 3 reads for two more entries and is gone once the third lands, on the leader and every follower |
 | `test_plain_set_clears_deadline_on_cluster` | Re-setting a key without a TTL clears its deadline while a sibling key with the same TTL still expires |
 | `test_cas_on_expired_key_is_missing` | A CAS after the deadline fails as missing_key — the purge runs before the CAS entry applies |

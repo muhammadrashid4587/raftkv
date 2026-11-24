@@ -173,6 +173,25 @@ class KVStore:
         instead of holding them forever."""
         return dict(self._expiry)
 
+    def ttl(self, key: str, index: int) -> tuple[int, int | None]:
+        """How many more log entries ``key`` has left, as of the
+        state applied up to ``index`` — Redis's TTL, in log
+        entries instead of seconds: -2 when the key does not
+        exist, -1 when it exists with no deadline, otherwise
+        ``deadline - index``. The second value is the deadline
+        itself — the absolute log index at which the key is
+        purged — or None without one. A key that exists with a
+        deadline always has at least one entry left: the purge
+        runs before the entry at the deadline applies, so a live
+        key can never sit at or past its own deadline. Pure
+        read: no log entry, no state change."""
+        if key not in self._data:
+            return -2, None
+        deadline = self._expiry.get(key)
+        if deadline is None:
+            return -1, None
+        return deadline - index, deadline
+
     def get(self, key: str) -> str | None:
         return self._data.get(key)
 

@@ -19,7 +19,7 @@ import time
 import unittest
 
 from harness import Cluster, client_request, wait_for_key
-from raftkv.client import Session, keys as keys_rpc
+from raftkv.client import Session, keys as keys_rpc, ttl as ttl_rpc
 from raftkv.store import KVStore
 
 
@@ -32,6 +32,10 @@ def _set(addr, key, value, ttl=None):
 
 def _get(addr, key):
     return client_request(addr, {"type": "client", "op": "get", "key": key})
+
+
+def _ttl(addr, key):
+    return client_request(addr, {"type": "client", "op": "ttl", "key": key})
 
 
 def _fillers(addr, n, prefix="pad"):
@@ -119,6 +123,23 @@ class TestTTLStore(unittest.TestCase):
         self.assertEqual(store.expire_up_to(15), [])
         self.assertEqual(store.get("a"), "2")
 
+    def test_store_ttl_remaining(self):
+        """``KVStore.ttl`` answers in Redis's convention: -2 for a
+        missing key, -1 for a key with no deadline, otherwise the
+        entries left until the deadline — plus the deadline
+        itself, or None without one."""
+        store = KVStore()
+        self.assertEqual(store.ttl("missing", 10), (-2, None))
+        store.apply({"op": "set", "key": "plain", "value": "v"},
+                    index=10)
+        self.assertEqual(store.ttl("plain", 10), (-1, None))
+        store.apply({"op": "set", "key": "k", "value": "v",
+                     "ttl_entries": 5}, index=10)
+        self.assertEqual(store.ttl("k", 10), (5, 15))
+        self.assertEqual(store.ttl("k", 14), (1, 15))
+        store.apply({"op": "set", "key": "k", "value": "v2"}, index=11)
+        self.assertEqual(store.ttl("k", 11), (-1, None))
+
     def test_store_ttl_without_index_raises(self):
         """A TTL with no log position to anchor it is meaningless,
         so applying one outside a log raises instead of recording
@@ -149,6 +170,129 @@ class TestTTLStore(unittest.TestCase):
 
 
 class TestTTLCluster(unittest.TestCase):
+    def test_ttl_query_counts_down(self):
+        """A TTL query counts down as the log advances — 3, 2, 1 —
+        and once the deadline entry lands the key is gone and the
+        query answers -2, on the leader and on every follower."""
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            resp = _set(addr, "temp", "v", ttl=3)
+            self.assertEqual(resp.get("status"), "ok", resp)
+            deadline = resp["index"] + 3
+            got = _ttl(addr, "temp")
+            self.assertEqual(got.get("status"), "ok", got)
+            self.assertEqual(got.get("ttl"), 3)
+            self.assertEqual(got.get("deadline"), deadline)
+            _fillers(addr, 1)
+            self.assertEqual(_ttl(addr, "temp").get("ttl"), 2)
+            _fillers(addr, 1)
+            self.assertEqual(_ttl(addr, "temp").get("ttl"), 1)
+            _fillers(addr, 1)
+            self.assertEqual(leader.last_applied, deadline)
+            got = _ttl(addr, "temp")
+            self.assertEqual(got.get("ttl"), -2)
+            self.assertIsNone(got.get("deadline"))
+            for node in cluster.nodes.values():
+                self.assertTrue(wait_for_key(node, "temp", None),
+                                node.id)
+        finally:
+            cluster.stop_all()
+
+    def test_ttl_query_missing_and_no_deadline(self):
+        """A missing key answers -2 and a key with no deadline
+        answers -1 with no deadline — the Redis convention, in
+        log entries instead of seconds."""
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            got = _ttl(addr, "nope")
+            self.assertEqual(got.get("status"), "ok", got)
+            self.assertEqual(got.get("ttl"), -2)
+            self.assertIsNone(got.get("deadline"))
+            resp = _set(addr, "plain", "v")
+            self.assertEqual(resp.get("status"), "ok", resp)
+            got = _ttl(addr, "plain")
+            self.assertEqual(got.get("ttl"), -1)
+            self.assertIsNone(got.get("deadline"))
+            self.assertEqual(got.get("read_index"),
+                             leader.last_applied)
+        finally:
+            cluster.stop_all()
+
+    def test_ttl_query_from_follower_redirects(self):
+        """A TTL query sent to a follower is redirected to the
+        leader and still answers correctly — the module-level
+        client follows the redirect like any other read."""
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            resp = _set(addr, "temp", "v", ttl=4)
+            self.assertEqual(resp.get("status"), "ok", resp)
+            follower = next(n for n in cluster.nodes.values()
+                            if n.id != leader.id)
+            got = ttl_rpc(cluster.addrs[follower.id], "temp")
+            self.assertEqual(got.get("status"), "ok", got)
+            self.assertEqual(got.get("ttl"), 4)
+            self.assertEqual(got.get("deadline"), resp["index"] + 4)
+        finally:
+            cluster.stop_all()
+
+    def test_session_ttl_is_read_your_writes(self):
+        """A session TTL query sees the deadline its own write set
+        and counts down as the session writes fillers — and once
+        the key expires the session read agrees it is gone."""
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            with Session(addr) as session:
+                resp = session.set("temp", "v", ttl_entries=2)
+                self.assertEqual(resp.get("status"), "ok", resp)
+                got = session.ttl("temp")
+                self.assertEqual(got.get("status"), "ok", got)
+                self.assertEqual(got.get("ttl"), 2)
+                session.set("pad0", "x")
+                self.assertEqual(session.ttl("temp").get("ttl"), 1)
+                session.set("pad1", "x")
+                self.assertEqual(session.ttl("temp").get("ttl"), -2)
+                self.assertIsNone(session.get("temp").get("value"))
+        finally:
+            cluster.stop_all()
+
+    def test_ttl_query_cli(self):
+        """The ``ttl`` CLI prints the remaining entries, and -2
+        for a missing key."""
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            host, port = addr
+            resp = _set(addr, "temp", "v", ttl=2)
+            self.assertEqual(resp.get("status"), "ok", resp)
+            out = subprocess.run(
+                [sys.executable, "-m", "raftkv.client",
+                 "--node", f"{host}:{port}", "ttl", "temp"],
+                capture_output=True, text=True, timeout=15)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertEqual(out.stdout.strip(), "2")
+            out = subprocess.run(
+                [sys.executable, "-m", "raftkv.client",
+                 "--node", f"{host}:{port}", "ttl", "nope"],
+                capture_output=True, text=True, timeout=15)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertEqual(out.stdout.strip(), "-2")
+        finally:
+            cluster.stop_all()
+
     def test_set_with_ttl_expires_at_deadline(self):
         """A key set with ttl 3 is readable for the next two
         entries and gone once the third lands — on the leader and

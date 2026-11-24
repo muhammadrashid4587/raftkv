@@ -2082,12 +2082,27 @@ class RaftNode:
                         "error": "this node was removed from the cluster"}
             return self._on_mset(msg)
         key = msg.get("key")
-        if op not in ("set", "get", "del", "cas") or key is None:
+        if op not in ("set", "get", "del", "cas", "ttl") or key is None:
             return {"type": "client_response", "status": "error",
-                    "error": "op must be set/get/del/cas with a key"}
+                    "error": "op must be set/get/del/cas/ttl with a key"}
         if self._is_removed():
             return {"type": "client_response", "status": "error",
                     "error": "this node was removed from the cluster"}
+        if op == "ttl":
+            # A TTL query: how many more log entries this key has
+            # left, in Redis's -2/-1 convention, plus the deadline
+            # itself. It rides the same ReadIndex/lease path as a
+            # ``get`` — one leadership confirmation, one apply
+            # wait — so the number reflects the committed state as
+            # of the read index it names, exactly as linearizable,
+            # and a session read carries the same watermark a get
+            # would.
+            min_index, session_term, error = self._parse_read_params(msg)
+            if error is not None:
+                return error
+            return self._serve_read(ttl_key=key, min_index=min_index,
+                                    session_term=session_term,
+                                    stale_ok=bool(msg.get("stale_ok")))
         if op == "get":
             # A read-your-writes session read carries the index (and
             # term) of the client's last acknowledged write; the
@@ -2703,6 +2718,7 @@ class RaftNode:
                     session_term: int | None = None,
                     keys: list[str] | None = None,
                     stale_ok: bool = False,
+                    ttl_key: str | None = None,
                     scan_prefix: str | None = None,
                     scan_limit: int = MAX_KEYS_SCAN,
                     scan_start_after: str | None = None) -> dict:
@@ -2711,22 +2727,27 @@ class RaftNode:
         ``key`` serves one key; ``keys`` serves a multi-get instead —
         the same leadership confirmation and apply wait for the whole
         batch, and the reply carries ``values`` aligned with
-        ``keys`` instead of ``value``. ``scan_prefix`` serves a key
-        enumeration instead — every key in the applied state machine
-        starting with the prefix, sorted, at most ``scan_limit`` of
-        them, with ``truncated`` when more matched — and the reply
-        carries ``keys`` plus the same ``read_index`` / ``read_term``.
-        ``scan_start_after`` resumes a scan past a cursor: only keys
-        strictly after it in sorted order are returned, so a client
-        pages by passing back the previous page's last key (or the
-        reply's ``next_start_after``). Each page is linearizable on
-        its own, but the enumeration as a whole is not a snapshot —
+        ``keys`` instead of ``value``. ``ttl_key`` serves a TTL
+        query instead — how many more log entries that key has
+        left, in Redis's -2/-1 convention, plus the deadline
+        itself — read off the applied state machine like any other
+        read, so it is exactly as linearizable as a ``get``.
+        ``scan_prefix`` serves a key enumeration instead — every key
+        in the applied state machine starting with the prefix,
+        sorted, at most ``scan_limit`` of them, with ``truncated``
+        when more matched — and the reply carries ``keys`` plus the
+        same ``read_index`` / ``read_term``. ``scan_start_after``
+        resumes a scan past a cursor: only keys strictly after it
+        in sorted order are returned, so a client pages by passing
+        back the previous page's last key (or the reply's
+        ``next_start_after``). Each page is linearizable on its
+        own, but the enumeration as a whole is not a snapshot —
         a key written or deleted between pages can be missed, or
         appear in a later page if it sorts ahead of the cursor.
         Everything else — the lease fast path, the pending-read wait,
         the fallback, the redirect on leadership loss — is identical
-        for all three shapes, so a scan is exactly as linearizable
-        as a single ``get``.
+        for all four shapes, so a scan or a TTL query is exactly as
+        linearizable as a single ``get``.
 
         A stale read (``stale_ok``) is the one exception to the
         leader-only rule: a follower holding a fresh leader lease
@@ -2801,6 +2822,15 @@ class RaftNode:
                         "truncated": truncated,
                         "next_start_after": page[-1] if truncated
                                             else None}
+            if ttl_key is not None:
+                # A TTL query: how many more log entries this key
+                # has left, in Redis's -2/-1 convention, plus the
+                # deadline itself — measured against the applied
+                # index this reply names, so the number and the
+                # read index agree with each other.
+                remaining, deadline = self.sm.ttl(ttl_key,
+                                                  self.last_applied)
+                return {"ttl": remaining, "deadline": deadline}
             if keys is not None:
                 return {"values": [self.sm.get(k) for k in keys]}
             return {"value": self.sm.get(key)}

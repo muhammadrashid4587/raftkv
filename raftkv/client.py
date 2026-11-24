@@ -8,6 +8,7 @@ Examples:
 
     python -m raftkv.client --node 127.0.0.1:5001 set mykey myvalue
     python -m raftkv.client --node 127.0.0.1:5001 get mykey
+    python -m raftkv.client --node 127.0.0.1:5001 ttl mykey
     python -m raftkv.client --node 127.0.0.1:5001 mget mykey otherkey
     python -m raftkv.client --node 127.0.0.1:5001 keys --prefix my
     python -m raftkv.client --node 127.0.0.1:5001 pipeline < ops.jsonl
@@ -284,6 +285,37 @@ class Session:
         # was served from a newer applied state raises the floor
         # for every read after it. A response without the fields
         # (an older server) leaves the watermark where it was.
+        if (resp.get("status") == "ok"
+                and resp.get("read_index") is not None):
+            read_index = int(resp["read_index"])
+            if read_index > self.last_read_index:
+                self.last_read_index = read_index
+                self.last_read_term = int(resp.get("read_term") or 0)
+        return resp
+
+    def ttl(self, key: str) -> dict:
+        """Ask how many more log entries ``key`` has left before it
+        expires: the reply carries ``ttl`` — the remaining entries
+        in Redis's convention (-2 the key does not exist, -1 it
+        exists with no deadline, otherwise the entries left) —
+        plus ``deadline``, the absolute log index at which the key
+        is purged (None without one). It rides the same ReadIndex
+        path as ``get``, so it carries the same session watermark
+        and advances the read watermark from the reply's
+        ``read_index`` exactly the same way: a TTL query after
+        your own write sees the deadline that write set, and a
+        later read never goes backwards past it."""
+        if self.last_read_index > self.last_write_index:
+            min_index = self.last_read_index
+            term = self.last_read_term
+        else:
+            min_index = self.last_write_index
+            term = self.last_write_term
+        msg: dict = {"type": "client", "op": "ttl", "key": key,
+                     "client_id": self.client_id,
+                     "min_commit_index": min_index,
+                     "session_term": term}
+        resp = request(self.node_addr, msg, pool=self._pooled)
         if (resp.get("status") == "ok"
                 and resp.get("read_index") is not None):
             read_index = int(resp["read_index"])
@@ -676,6 +708,23 @@ def mget(node_addr: tuple[str, int], keys: list[str],
                                "keys": list(keys)}, timeout=timeout)
 
 
+def ttl(node_addr: tuple[str, int], key: str,
+        timeout: float = 12.0) -> dict:
+    """Ask how many more log entries ``key`` has left before it
+    expires, following leader redirects like ``request``.
+
+    One request serves the query through the leader's ReadIndex
+    path, so the number reflects the committed state as of one
+    read index. The reply is the plain ``ttl`` response
+    (``status`` ``ok`` with ``ttl`` — the remaining entries in
+    Redis's convention: -2 the key does not exist, -1 it exists
+    with no deadline, otherwise the entries left — plus
+    ``deadline``, the absolute log index at which the key is
+    purged, or None without one)."""
+    return request(node_addr, {"type": "client", "op": "ttl",
+                               "key": key}, timeout=timeout)
+
+
 def mset(node_addr: tuple[str, int], pairs: list,
          timeout: float = 12.0) -> dict:
     """Write many keys with one ``mset`` RPC, following leader
@@ -865,6 +914,12 @@ def main(argv: list[str] | None = None) -> int:
                             "heartbeat behind the leader), no redirect "
                             "hop. Ignored when a session watermark is "
                             "given — that read still goes to the leader")
+    p_ttl = sub.add_parser(
+        "ttl",
+        help="how many more log entries until this key expires: "
+             "prints the remaining entries (-2 the key does not "
+             "exist, -1 it exists with no deadline)")
+    p_ttl.add_argument("key")
     p_mget = sub.add_parser(
         "mget",
         help="read many keys with one request: prints the values as "
@@ -996,7 +1051,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(resp))
         return 0
     msg: dict = {"type": "client", "op": op}
-    if op in ("set", "get", "del", "cas"):
+    if op in ("set", "get", "del", "cas", "ttl"):
         msg["key"] = args.key
     elif op == "mset":
         if len(args.pairs) % 2:
@@ -1053,6 +1108,8 @@ def main(argv: list[str] | None = None) -> int:
     if status == "ok":
         if op == "get":
             print(resp.get("value") if resp.get("value") is not None else "(nil)")
+        elif op == "ttl":
+            print(resp.get("ttl"))
         elif op == "mget":
             print(json.dumps(resp.get("values")))
         elif op == "keys":
