@@ -74,9 +74,9 @@ class KVStore:
         so it must not resurrect a key that is about to expire.
 
         Returns a result dict for commands whose outcome depends on the
-        state at apply time — currently only "cas" — and None for
-        set/del, whose outcome is always ok. The result is what the
-        leader hands back to the waiting client and what the dedup
+        state at apply time — currently "cas" and "expire" — and None
+        for set/del, whose outcome is always ok. The result is what
+        the leader hands back to the waiting client and what the dedup
         table caches for retries, so it must be a pure function of
         (state before, command): every node applying the same log
         computes the same result.
@@ -122,6 +122,37 @@ class KVStore:
                     del self._keys[idx]
             self._expiry.pop(key, None)
             return None
+        elif op == "expire":
+            # Set a deadline on an existing key: the key is purged
+            # when the log reaches ``index + ttl_entries``, exactly
+            # like a ``set`` that carried the same TTL — same units,
+            # same purge path (``expire_up_to`` runs before the entry
+            # at the deadline applies, on every node), same ``del``
+            # watch event when it goes. Unlike a set it does not
+            # touch the value, and unlike a set it is a no-op on a
+            # missing key: Redis's EXPIRE answers 0 there, so this
+            # returns ``expire: 0`` and records nothing instead of
+            # an error — the entry still committed (the outcome is
+            # decided at apply time, like a CAS), it just did not
+            # set a deadline. A key that already has a deadline gets
+            # it replaced; a key with none gets one. The deadline
+            # rides snapshots with the rest of ``_expiry``, so a
+            # node that installs one keeps expiring the key on
+            # schedule. Needs the log index, like a set with a TTL:
+            # applying one outside a log raises.
+            key = command["key"]
+            ttl = command.get("ttl_entries")
+            if index is None or ttl is None:
+                raise ValueError(
+                    "expire needs the log index of the entry being "
+                    "applied and a ttl_entries count")
+            if key not in self._data:
+                return {"type": "client_response", "status": "ok",
+                        "expire": 0}
+            deadline = index + ttl
+            self._expiry[key] = deadline
+            return {"type": "client_response", "status": "ok",
+                    "expire": 1, "deadline": deadline}
         elif op == "cas":
             key = command["key"]
             expected = command["expected"]

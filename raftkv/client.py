@@ -145,6 +145,21 @@ class Session:
             msg["ttl_entries"] = ttl_entries
         return self._write(msg)
 
+    def expire(self, key: str, entries: int) -> dict:
+        """Set a deadline on a key that already exists: the key is
+        purged when the log reaches this entry's index + ``entries``
+        — the same log-index units as a ``set`` with ``ttl_entries``,
+        so the deadline is deterministic across replicas. Returns
+        ``expire`` 1 when the key exists (the deadline is set, and
+        the reply also carries it) and 0 when it does not — like
+        Redis's EXPIRE, a missing key is a no-op, not an error. A
+        write like ``set``: it appends a log entry, carries a session
+        request id (a retry returns the first attempt's result
+        instead of setting the deadline twice), and advances the
+        write watermark from the reply's index."""
+        return self._write({"type": "client", "op": "expire",
+                            "key": key, "ttl_entries": entries})
+
     def mset(self, pairs: list) -> dict:
         """Write many keys with one ``mset`` RPC: the whole batch
         appends as a single log entry and applies atomically, so a
@@ -725,6 +740,22 @@ def ttl(node_addr: tuple[str, int], key: str,
                                "key": key}, timeout=timeout)
 
 
+def expire(node_addr: tuple[str, int], key: str, entries: int,
+           timeout: float = 12.0) -> dict:
+    """Set a deadline on an existing key, following leader redirects
+    like ``request``.
+
+    One request appends the expire entry, so the deadline is this
+    entry's log index + ``entries`` — the same log-index units as a
+    ``set`` with ``ttl_entries``. The reply is the plain expire
+    response (``status`` ``ok`` with ``expire`` 1 when the key
+    exists — plus ``deadline``, the absolute log index at which the
+    key is purged — and 0 when it does not, like Redis's EXPIRE)."""
+    return request(node_addr, {"type": "client", "op": "expire",
+                               "key": key, "ttl_entries": entries},
+                   timeout=timeout)
+
+
 def mset(node_addr: tuple[str, int], pairs: list,
          timeout: float = 12.0) -> dict:
     """Write many keys with one ``mset`` RPC, following leader
@@ -920,6 +951,25 @@ def main(argv: list[str] | None = None) -> int:
              "prints the remaining entries (-2 the key does not "
              "exist, -1 it exists with no deadline)")
     p_ttl.add_argument("key")
+    p_expire = sub.add_parser(
+        "expire",
+        help="set a deadline on an existing key: prints 1 when the "
+             "key exists (its deadline is now this entry's log "
+             "index + entries) and 0 when it does not, like Redis's "
+             "EXPIRE — a missing key is a no-op, not an error")
+    p_expire.add_argument("key")
+    p_expire.add_argument("entries", type=int,
+                          help="log entries until the key is purged: "
+                               "the deadline is this entry's log "
+                               "index + entries (1-1000000)")
+    p_expire.add_argument("--client-id", default=None,
+                          help="session id for at-most-once writes: a "
+                               "retry with the same client id + request "
+                               "id returns the first attempt's result "
+                               "instead of writing twice")
+    p_expire.add_argument("--request-id", default=None,
+                          help="id of this write within the client "
+                               "session")
     p_mget = sub.add_parser(
         "mget",
         help="read many keys with one request: prints the values as "
@@ -1051,7 +1101,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(resp))
         return 0
     msg: dict = {"type": "client", "op": op}
-    if op in ("set", "get", "del", "cas", "ttl"):
+    if op in ("set", "get", "del", "cas", "ttl", "expire"):
         msg["key"] = args.key
     elif op == "mset":
         if len(args.pairs) % 2:
@@ -1079,7 +1129,9 @@ def main(argv: list[str] | None = None) -> int:
     if op == "cas":
         msg["expected"] = args.expected
         msg["value"] = args.value
-    if op in ("set", "del", "cas", "mset") and args.request_id:
+    if op == "expire":
+        msg["ttl_entries"] = args.entries
+    if op in ("set", "del", "cas", "mset", "expire") and args.request_id:
         # A request id without an explicit client id still dedups
         # within the default "cli" session; the same id retried from
         # another session is a different write.
@@ -1110,6 +1162,8 @@ def main(argv: list[str] | None = None) -> int:
             print(resp.get("value") if resp.get("value") is not None else "(nil)")
         elif op == "ttl":
             print(resp.get("ttl"))
+        elif op == "expire":
+            print(resp.get("expire"))
         elif op == "mget":
             print(json.dumps(resp.get("values")))
         elif op == "keys":

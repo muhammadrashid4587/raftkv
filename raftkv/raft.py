@@ -1327,16 +1327,16 @@ class RaftNode:
             elif op == "noop":
                 pass
             else:
-                # The apply result matters for CAS: its outcome is
-                # decided here, at this exact point in the log, so the
-                # result is recorded in the dedup table (a retry gets
-                # the first attempt's outcome, not a re-execution) and,
-                # while this node is the leader, by log index for the
-                # waiter that submitted the entry (see
-                # _flush_write_batch). Set/del return None: their
+                # The apply result matters for CAS and expire: their
+                # outcome is decided here, at this exact point in the
+                # log, so the result is recorded in the dedup table
+                # (a retry gets the first attempt's outcome, not a
+                # re-execution) and, while this node is the leader,
+                # by log index for the waiter that submitted the entry
+                # (see _flush_write_batch). Set/del return None: their
                 # outcome is always ok. The index rides along so a
-                # ``set`` with a TTL can record its deadline
-                # (index + ttl_entries) deterministically.
+                # ``set`` with a TTL — or an ``expire`` — can record
+                # its deadline (index + ttl_entries) deterministically.
                 result = self.sm.apply(entry["command"], self.last_applied)
                 self._record_dedup(entry["command"], result,
                                    self.last_applied, entry["term"])
@@ -1364,7 +1364,7 @@ class RaftNode:
                     self.watch.notify(entry["command"]["key"],
                                       entry["command"]["value"], "set",
                                       index=self.last_applied)
-                if (op == "cas" and result is not None
+                if (op in ("cas", "expire") and result is not None
                         and self.role == "leader"):
                     # Record the outcome only when a local waiter is
                     # waiting on it: the waiter is the only consumer,
@@ -1374,7 +1374,9 @@ class RaftNode:
                     # would sit in _apply_results forever. A write
                     # without a session id has no dedup key, so it
                     # always records: its waiter is identified by
-                    # index alone.
+                    # index alone. CAS and expire are the ops whose
+                    # apply returns a result — a set/del returns None
+                    # and has nothing to record.
                     key = _dedup_key(entry["command"])
                     if key is None or key in self._dedup_inflight:
                         self._apply_results[self.last_applied] = result
@@ -1408,9 +1410,10 @@ class RaftNode:
         """Record an applied client write in the dedup table. Lock held.
         The cached result is what a retry with the same session id gets
         back instead of a second log entry. For set/del the result is
-        always ok once committed; for CAS it is the apply-time outcome
-        (success, mismatch, or missing key), so a retry returns the
-        first attempt's exact result. The result also carries the log
+        always ok once committed; for CAS and expire it is the
+        apply-time outcome (success, mismatch, or missing key for a
+        CAS; 1 or 0 for an expire), so a retry returns the first
+        attempt's exact result. The result also carries the log
         index and term of the entry that produced it: a retried write
         reports the same index as the first attempt, and a client
         session uses that index as its read-your-writes watermark —
@@ -2082,9 +2085,11 @@ class RaftNode:
                         "error": "this node was removed from the cluster"}
             return self._on_mset(msg)
         key = msg.get("key")
-        if op not in ("set", "get", "del", "cas", "ttl") or key is None:
+        if op not in ("set", "get", "del", "cas", "ttl", "expire") \
+                or key is None:
             return {"type": "client_response", "status": "error",
-                    "error": "op must be set/get/del/cas/ttl with a key"}
+                    "error": "op must be set/get/del/cas/ttl/expire "
+                             "with a key"}
         if self._is_removed():
             return {"type": "client_response", "status": "error",
                     "error": "this node was removed from the cluster"}
@@ -2123,12 +2128,18 @@ class RaftNode:
         command = {"op": op, "key": key}
         if op == "set":
             command["value"] = msg.get("value")
+        if op in ("set", "expire"):
             # A TTL, in log entries: the key lives until the log
             # reaches this entry's index + ttl_entries, then it is
             # purged on every node at the same log position (see
-            # KVStore). Validated here, on the leader, before the
-            # command is ever logged — a bad TTL is a client error,
-            # not a log entry.
+            # KVStore). For a ``set`` the TTL rides the write; for
+            # an ``expire`` it is the whole point — the deadline is
+            # set on the key that is already there. Validated here,
+            # on the leader, before the command is ever logged — a
+            # bad TTL is a client error, not a log entry. An
+            # ``expire`` with no TTL names no deadline at all, so
+            # it is rejected outright instead of appending an entry
+            # that could do nothing.
             ttl = msg.get("ttl_entries")
             if ttl is not None:
                 if (not isinstance(ttl, int) or isinstance(ttl, bool)
@@ -2137,6 +2148,9 @@ class RaftNode:
                             "error": "ttl_entries must be an integer "
                                      f"between 1 and {TTL_MAX_ENTRIES}"}
                 command["ttl_entries"] = ttl
+            elif op == "expire":
+                return {"type": "client_response", "status": "error",
+                        "error": "expire requires ttl_entries"}
         if op == "cas":
             # A conditional write: set key to value only if its current
             # value equals expected. The comparison happens at apply
@@ -2646,15 +2660,16 @@ class RaftNode:
         # dedup table already holds it via _apply_committed) or the
         # batch failed (so nothing was appended), and a retry arriving
         # after this point takes the _dedup path or appends fresh.
-        # A waiter whose entry has an apply-time result (a CAS) gets
-        # that result, not the shared ok: the outcome was decided when
-        # the entry applied, and the waiter must learn it, not just
-        # that the entry committed. Apply results for this batch are
-        # pruned here, once every waiter has its own — and only this
-        # batch's: batches flush concurrently, so pruning every
-        # result up to last_index could delete another batch's CAS
-        # outcome before its flusher read it, and that waiter would
-        # then get the shared "ok" for a CAS that actually failed.
+        # A waiter whose entry has an apply-time result (a CAS, or an
+        # expire) gets that result, not the shared ok: the outcome was
+        # decided when the entry applied, and the waiter must learn it,
+        # not just that the entry committed. Apply results for this
+        # batch are pruned here, once every waiter has its own — and
+        # only this batch's: batches flush concurrently, so pruning
+        # every result up to last_index could delete another batch's
+        # CAS outcome before its flusher read it, and that waiter
+        # would then get the shared "ok" for a CAS that actually
+        # failed.
         with self.lock:
             for w in batch:
                 own = (self._apply_results.get(w["index"])

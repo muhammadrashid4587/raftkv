@@ -188,8 +188,22 @@ logic and the failure handling, not the key-value API on top.
   session query sees its own write's deadline, a stale
   query is served from a follower lease like any stale
   read. Not yet covered: `mset` takes no TTL — a batch
-  carries no single deadline — and there is no `expire`
-  command to set a deadline on an existing key.
+  carries no single deadline. Since v0.38.0 a deadline can
+  also be set on a key that already exists: `expire key N`
+  (`Session.expire(k, N)`, `client.expire(addr, k, N)`,
+  `expire key N` on the CLI) sets the key's deadline to this
+  entry's log index + N — the same log-index units, the same
+  purge path, the same `del` watch event when it goes, and
+  the deadline rides snapshots like any other. Unlike a
+  `set` it does not touch the value; re-expiring replaces
+  the deadline. A missing key is a no-op, like Redis: the
+  reply answers `expire` 0 (1 when the key exists, plus the
+  `deadline` itself), and the entry still commits — the
+  outcome is decided at apply time, like a CAS, so a retry
+  with the same session id returns the first attempt's
+  result instead of appending a second entry. An `expire`
+  with no count, or a count outside 1 to 1,000,000, is a
+  client error and appends nothing.
 - **Key enumeration** — since v0.31.0 one `keys` RPC lists the
   store's keys (`client.keys(prefix, limit, start_after)`,
   `Session.keys(prefix, limit, start_after)`, `keys --prefix p
@@ -504,7 +518,7 @@ make test
 # or: python3 -m unittest discover -s tests -v
 ```
 
-244 tests, plus a smoke test for the benchmark script, all passing:
+265 tests, plus a smoke test for the benchmark script, all passing:
 
 | Test | What it proves |
 |---|---|
@@ -713,6 +727,21 @@ make test
 | `test_session_set_with_ttl` | Session.set takes ttl_entries, and read-your-writes still works before and after expiry |
 | `test_pipeline_set_with_ttl` | A pipelined set may carry ttl_entries; a malformed TTL is an error in its position and the ops around it still run |
 | `test_ttl_cli` | The `set --ttl-entries N` CLI writes the key with a deadline, and a bad TTL is rejected instead of writing |
+| `test_store_expire_sets_deadline_at_apply_index` | An expire at index 11 with 5 entries sets the deadline to 16 — alive at 15, gone at 16 |
+| `test_store_expire_missing_key_returns_zero` | Expiring a missing key answers 0, records no deadline, and touches no other key |
+| `test_store_expire_replaces_deadline` | Re-expiring replaces the deadline, whether it came from a set TTL or an earlier expire |
+| `test_store_expire_without_index_raises` | An expire with no log position to anchor it raises instead of recording a deadline |
+| `test_store_expire_after_deadline_is_missing` | A key whose deadline already passed is already gone when the expire entry applies, so it answers 0 |
+| `test_expire_sets_deadline_and_key_expires` | An expire of 3 answers 1 with the deadline, the TTL counts 3, 2, 1, and the key is gone at the deadline on every node |
+| `test_expire_missing_key_returns_zero` | Expiring a missing key answers 0 and still commits one log entry, like a failed CAS |
+| `test_expire_replaces_deadline` | A key set with a long TTL and re-expired short dies at the new deadline, not the old one |
+| `test_expire_from_follower_redirects` | An expire sent to a follower is redirected to the leader and still answers 1 with the right deadline |
+| `test_expire_fires_del_watch_event` | A watch fires nothing for the expire itself, then a del event at the index of the entry whose apply purged the key |
+| `test_expire_survives_snapshot_and_restart` | A deadline set by expire survives compaction and restart — the snapshot carries it |
+| `test_expire_rejects_bad_values` | An expire of 0, negative, non-integer, boolean, or past the cap is a client error and appends no log entry |
+| `test_expire_retry_with_same_request_id_appends_once` | A retried expire returns the first attempt's result and appends no second entry, so the deadline is not pushed out |
+| `test_session_expire_is_read_your_writes` | Session.expire sets the deadline, advances the watermark, and a read after it sees the key until it expires |
+| `test_expire_cli` | The `expire` CLI prints 1 for an existing key and 0 for a missing one, and a bad count is rejected |
 
 Tests use real nodes (real TCP, real threads, real disk) on localhost —
 no mocks of the consensus path.
