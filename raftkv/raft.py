@@ -92,6 +92,14 @@ MAX_KEYS_SCAN = 1000
 # past any live cluster's log between snapshots, so it only rejects
 # nonsense, never a real use.
 TTL_MAX_ENTRIES = 1_000_000
+# Largest offset a ``setrange`` may carry. The offset bounds how
+# far past the current value one write may reach — past it the op
+# pads with zero bytes, so an unbounded offset would let one entry
+# grow a value without limit (and replicate that growth to every
+# node). 1,000,000 characters is far past any real use of an
+# in-place overwrite, so it only rejects nonsense, never a real
+# use — the same scale as the TTL cap above, for the same reason.
+SETRANGE_MAX_OFFSET = 1_000_000
 # Leader lease for reads (Raft dissertation §6.4): how long a majority
 # ack stays fresh. Must be shorter than ELECTION_TIMEOUT_MIN (150ms):
 # a follower that acked at time T heard from the leader no later than
@@ -1328,7 +1336,7 @@ class RaftNode:
                 pass
             else:
                 # The apply result matters for CAS, expire, incr,
-                # setnx, getset, append, and getdel:
+                # setnx, getset, append, getdel, and setrange:
                 # their outcome is decided here, at this exact point
                 # in the log, so the result is recorded in the dedup
                 # table
@@ -1407,8 +1415,17 @@ class RaftNode:
                     # nothing, so it fires nothing.
                     self.watch.notify(entry["command"]["key"], None, "del",
                                       index=self.last_applied)
+                elif (op == "setrange" and result is not None
+                        and result.get("status") == "ok"):
+                    # A successful setrange fires like a set, with
+                    # the new (overwritten) value: a failed
+                    # setrange wrote nothing, so it fires nothing,
+                    # like a failed append.
+                    self.watch.notify(entry["command"]["key"],
+                                      result["value"], "set",
+                                      index=self.last_applied)
                 if (op in ("cas", "expire", "incr", "setnx", "getset",
-                           "append", "getdel")
+                           "append", "getdel", "setrange")
                         and result is not None
                         and self.role == "leader"):
                     # Record the outcome only when a local waiter is
@@ -1420,7 +1437,7 @@ class RaftNode:
                     # without a session id has no dedup key, so it
                     # always records: its waiter is identified by
                     # index alone. CAS, expire, incr, setnx, getset,
-                    # append, and getdel are
+                    # append, getdel, and setrange are
                     # the ops
                     # whose apply returns a result — a set/del
                     # returns None and has nothing to record.
@@ -1458,13 +1475,14 @@ class RaftNode:
         The cached result is what a retry with the same session id gets
         back instead of a second log entry. For set/del the result is
         always ok once committed; for CAS, expire, incr, setnx,
-        getset, append, and getdel
+        getset, append, getdel, and setrange
         it is the
         apply-time outcome (success, mismatch, or missing key for a
         CAS; 1 or 0 for an expire; the new value, or not_an_integer
         / overflow for an incr; 1 or 0 for a setnx; the old value
         for a getset; the new value and length, or wrongtype for
-        an append; the old value and 1 or 0 for a getdel), so a
+        an append; the old value and 1 or 0 for a getdel; the new
+        value and length, or wrongtype for a setrange), so a
         retry returns the first
         attempt's exact result. The result also carries the log
         index and term of the entry that produced it: a retried write
@@ -2155,11 +2173,12 @@ class RaftNode:
         key = msg.get("key")
         if op not in ("set", "get", "del", "cas", "ttl", "expire",
                       "incr", "setnx", "getset", "append", "strlen",
-                      "getdel") \
+                      "getdel", "getrange", "setrange") \
                 or key is None:
             return {"type": "client_response", "status": "error",
                     "error": "op must be set/get/del/cas/ttl/expire/"
-                             "incr/setnx/getset/append/strlen/getdel "
+                             "incr/setnx/getset/append/strlen/getdel/"
+                             "getrange/setrange "
                              "with a key"}
         if self._is_removed():
             return {"type": "client_response", "status": "error",
@@ -2176,6 +2195,37 @@ class RaftNode:
             if error is not None:
                 return error
             return self._serve_read(strlen_key=key, min_index=min_index,
+                                    session_term=session_term,
+                                    stale_ok=bool(msg.get("stale_ok")))
+        if op == "getrange":
+            # A substring query: the characters from ``start`` to
+            # ``end`` inclusive, negative indexes counting back
+            # from the end, out-of-range indexes clamped — Redis
+            # GETRANGE. It rides the same ReadIndex/lease path as
+            # a ``get`` — one leadership confirmation, one apply
+            # wait — so the substring reflects the committed state
+            # as of the read index it names, exactly as
+            # linearizable, and a session read carries the same
+            # watermark a get would. The bounds are validated
+            # here, on the leader, before anything is served: both
+            # must be integers (a bool is not one), so a malformed
+            # range is a client error, not a slice of nonsense.
+            # Negative bounds are legal — they count from the end
+            # — and are clamped at serve time, like Redis.
+            for field in ("start", "end"):
+                bound = msg.get(field)
+                if (not isinstance(bound, int)
+                        or isinstance(bound, bool)):
+                    return {"type": "client_response", "status": "error",
+                            "error": f"getrange {field} must be an "
+                                     "integer"}
+            min_index, session_term, error = self._parse_read_params(msg)
+            if error is not None:
+                return error
+            return self._serve_read(getrange_key=key,
+                                    getrange_start=msg["start"],
+                                    getrange_end=msg["end"],
+                                    min_index=min_index,
                                     session_term=session_term,
                                     stale_ok=bool(msg.get("stale_ok")))
         if op == "ttl":
@@ -2211,7 +2261,7 @@ class RaftNode:
                                     session_term=session_term,
                                     stale_ok=bool(msg.get("stale_ok")))
         command = {"op": op, "key": key}
-        if op in ("set", "setnx", "getset", "append"):
+        if op in ("set", "setnx", "getset", "append", "setrange"):
             command["value"] = msg.get("value")
         if op == "setnx":
             # Set-if-not-exists: the value is required, like a
@@ -2241,6 +2291,29 @@ class RaftNode:
             if msg.get("value") is None:
                 return {"type": "client_response", "status": "error",
                         "error": "append requires value"}
+        if op == "setrange":
+            # Overwrite part of a string value: the value is
+            # required, like a set's — a setrange with no value
+            # names nothing to write, so it is a client error
+            # and appends no log entry. The offset must be an
+            # integer from 0 to SETRANGE_MAX_OFFSET: negative
+            # offsets are an error (Redis rejects them), and
+            # past the cap the op would pad an absurdly long
+            # string with zero bytes — the cap is the same
+            # scale as the TTL cap, for the same reason. Whether
+            # the key holds a string (and what the new value
+            # and length are) is decided at apply time, like a
+            # CAS, not here.
+            if msg.get("value") is None:
+                return {"type": "client_response", "status": "error",
+                        "error": "setrange requires value"}
+            offset = msg.get("offset")
+            if (not isinstance(offset, int) or isinstance(offset, bool)
+                    or offset < 0 or offset > SETRANGE_MAX_OFFSET):
+                return {"type": "client_response", "status": "error",
+                        "error": "setrange offset must be an integer "
+                                 f"between 0 and {SETRANGE_MAX_OFFSET}"}
+            command["offset"] = offset
         if op in ("set", "expire"):
             # A TTL, in log entries: the key lives until the log
             # reaches this entry's index + ttl_entries, then it is
@@ -2861,6 +2934,9 @@ class RaftNode:
                     stale_ok: bool = False,
                     ttl_key: str | None = None,
                     strlen_key: str | None = None,
+                    getrange_key: str | None = None,
+                    getrange_start: int | None = None,
+                    getrange_end: int | None = None,
                     scan_prefix: str | None = None,
                     scan_limit: int = MAX_KEYS_SCAN,
                     scan_start_after: str | None = None) -> dict:
@@ -2878,6 +2954,13 @@ class RaftNode:
         of the string value at that key, 0 for a missing key,
         Redis STRLEN — read off the applied state machine the
         same way, so it is exactly as linearizable as a ``get``.
+        ``getrange_key`` serves a substring query instead — the
+        characters from ``getrange_start`` to ``getrange_end``
+        inclusive, negative indexes counting back from the end
+        and out-of-range indexes clamped, Redis GETRANGE — read
+        off the applied state machine the same way, so it is
+        exactly as linearizable as a ``get``; a missing key
+        holds the empty string, so any range of it is "".
         ``scan_prefix`` serves a key enumeration instead — every key
         in the applied state machine starting with the prefix,
         sorted, at most ``scan_limit`` of them, with ``truncated``
@@ -2892,7 +2975,7 @@ class RaftNode:
         appear in a later page if it sorts ahead of the cursor.
         Everything else — the lease fast path, the pending-read wait,
         the fallback, the redirect on leadership loss — is identical
-        for all four shapes, so a scan or a TTL query is exactly as
+        for all six shapes, so a scan or a TTL query is exactly as
         linearizable as a single ``get``.
 
         A stale read (``stale_ok``) is the one exception to the
@@ -2989,6 +3072,18 @@ class RaftNode:
                 # read index it was measured at.
                 try:
                     return {"length": self.sm.strlen(strlen_key)}
+                except TypeError as e:
+                    return {"status": "error", "error": str(e)}
+            if getrange_key is not None:
+                # A substring query: the characters from start to
+                # end inclusive — Redis GETRANGE — with the same
+                # wrongtype rule as strlen: a non-string value is
+                # a client error, not a substring, carried the
+                # same way, overriding the "ok" in the response
+                # literal.
+                try:
+                    return {"value": self.sm.getrange(
+                        getrange_key, getrange_start, getrange_end)}
                 except TypeError as e:
                     return {"status": "error", "error": str(e)}
             if keys is not None:

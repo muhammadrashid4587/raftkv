@@ -126,7 +126,8 @@ class Session:
         # still have committed, and the next read must not claim a
         # watermark the client never saw acknowledged.
         if (resp.get("status")
-                in ("ok", "cas_failed", "incr_failed", "append_failed")
+                in ("ok", "cas_failed", "incr_failed", "append_failed",
+                    "setrange_failed")
                 and resp.get("index") is not None):
             self.last_write_index = int(resp["index"])
             self.last_write_term = int(resp.get("term") or 0)
@@ -201,6 +202,7 @@ class Session:
             {"op": "getset", "key": k, "value": v}
             {"op": "append", "key": k, "value": v}
             {"op": "getdel", "key": k}
+            {"op": "setrange", "key": k, "offset": n, "value": v}
 
         The whole list goes out in batches of ``depth`` on a single
         persistent socket without waiting between requests, and the
@@ -277,7 +279,7 @@ class Session:
                 replies[positions[j]] = resp
                 if (resp.get("status")
                         in ("ok", "cas_failed", "incr_failed",
-                            "append_failed")
+                            "append_failed", "setrange_failed")
                         and resp.get("index") is not None):
                     index = int(resp["index"])
                     if index > self.last_write_index:
@@ -401,6 +403,58 @@ class Session:
         write watermark from the reply's index, like any other
         write."""
         return self._write({"type": "client", "op": "getdel", "key": key})
+
+    def getrange(self, key: str, start: int, end: int) -> dict:
+        """Ask for the substring of the string value at ``key``
+        from ``start`` to ``end`` inclusive, Redis GETRANGE: a
+        negative index counts back from the end of the string,
+        an index past either end is clamped, and a missing key
+        holds the empty string, so any range of it is "". It
+        rides the same ReadIndex path as ``get``, so it carries
+        the same session watermark and advances the read
+        watermark from the reply's ``read_index`` exactly the
+        same way: a substring query after your own write sees
+        the substring that write produced, and a later read never
+        goes backwards past it."""
+        if self.last_read_index > self.last_write_index:
+            min_index = self.last_read_index
+            term = self.last_read_term
+        else:
+            min_index = self.last_write_index
+            term = self.last_write_term
+        msg: dict = {"type": "client", "op": "getrange", "key": key,
+                     "start": start, "end": end,
+                     "client_id": self.client_id,
+                     "min_commit_index": min_index,
+                     "session_term": term}
+        resp = request(self.node_addr, msg, pool=self._pooled)
+        if (resp.get("status") == "ok"
+                and resp.get("read_index") is not None):
+            read_index = int(resp["read_index"])
+            if read_index > self.last_read_index:
+                self.last_read_index = read_index
+                self.last_read_term = int(resp.get("read_term") or 0)
+        return resp
+
+    def setrange(self, key: str, offset: int, value: str) -> dict:
+        """Overwrite part of the string value at ``key`` starting
+        at ``offset``, Redis SETRANGE: a missing key counts as an
+        empty string, and when the offset lies past the end the
+        gap is padded with zero bytes. The reply carries the new
+        value and its length (``length``). The outcome is decided
+        at apply time, at the entry's position in the log, so a
+        retry with the same session id returns the first
+        attempt's value and length instead of overwriting twice,
+        and a successful setrange keeps the key's TTL deadline,
+        like a CAS. A non-string value fails with
+        ``setrange_failed`` and reason ``wrongtype`` instead of
+        overwriting. A successful setrange advances the write
+        watermark from the reply's index, like any other write —
+        and so does a failed one, since it still committed its
+        entry."""
+        return self._write({"type": "client", "op": "setrange",
+                            "key": key, "offset": offset,
+                            "value": value})
 
     def get(self, key: str) -> dict:
         # The read carries the higher of the two watermarks — the
@@ -680,24 +734,25 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
     ``cas`` a string key, expected, and value, ``incr`` a string
     key and an integer ``by`` (default 1), ``setnx`` a string key
     and value, ``getset`` a string key and value, ``append`` a
-    string key and value, ``getdel`` a string key."""
+    string key and value, ``getdel`` a string key, ``setrange`` a
+    string key, an integer ``offset`` and a string value."""
     if not isinstance(op, dict):
         return None, {"type": "client_response", "status": "error",
                       "error": "pipeline op must be an object with "
                                "op, key, and value fields"}
     name = op.get("op")
     if name not in ("set", "del", "cas", "incr", "setnx", "getset",
-                    "append", "getdel"):
+                    "append", "getdel", "setrange"):
         return None, {"type": "client_response", "status": "error",
                       "error": "pipeline op must be set, del, cas, "
-                               "incr, setnx, getset, append, or "
-                               "getdel"}
+                               "incr, setnx, getset, append, "
+                               "getdel, or setrange"}
     key = op.get("key")
     if not isinstance(key, str):
         return None, {"type": "client_response", "status": "error",
                       "error": f"pipeline {name} needs a string key"}
     msg: dict = {"type": "client", "op": name, "key": key}
-    if name in ("set", "cas", "setnx", "getset", "append"):
+    if name in ("set", "cas", "setnx", "getset", "append", "setrange"):
         value = op.get("value")
         if not isinstance(value, str):
             return None, {"type": "client_response", "status": "error",
@@ -733,6 +788,19 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
                           "error": "pipeline incr by must be an "
                                    "integer"}
         msg["by"] = by
+    if name == "setrange":
+        # ``offset`` rides along with a pipelined setrange,
+        # validated here so a malformed one never goes on the
+        # wire: a non-negative integer — the same shape the
+        # server enforces (the server also caps it, so a huge
+        # offset is still a client error there, not a log entry).
+        offset = op.get("offset")
+        if (not isinstance(offset, int) or isinstance(offset, bool)
+                or offset < 0):
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline setrange offset must be "
+                                   "a non-negative integer"}
+        msg["offset"] = offset
     return msg, None
 
 
@@ -741,7 +809,7 @@ def pipeline(node_addr: tuple[str, int], ops: list,
     """Send many writes pipelined over one connection.
 
     One ``set`` / ``del`` / ``cas`` / ``incr`` / ``setnx`` /
-    ``getset`` / ``append`` / ``getdel`` op per
+    ``getset`` / ``append`` / ``getdel`` / ``setrange`` op per
     dict (see
     ``Session.pipeline`` for the shapes): the ops go out in
     batches of ``depth`` on a single persistent socket and the
@@ -996,6 +1064,45 @@ def getdel(node_addr: tuple[str, int], key: str,
     deadline with it when it goes."""
     return request(node_addr, {"type": "client", "op": "getdel",
                                "key": key}, timeout=timeout)
+
+
+def getrange(node_addr: tuple[str, int], key: str, start: int,
+             end: int, timeout: float = 12.0) -> dict:
+    """Ask for the substring of the string value at ``key`` from
+    ``start`` to ``end`` inclusive, following leader redirects
+    like ``request`` — Redis GETRANGE.
+
+    One request serves the substring through the leader's ReadIndex
+    path, so it reflects the committed state as of one read
+    index, exactly as linearizable as a ``get``. The reply is the
+    plain getrange response (``status`` ``ok`` with ``value`` — the
+    substring, "" when the key does not exist or the range holds
+    nothing — plus the ``read_index`` / ``read_term`` it was
+    measured at). A negative index counts back from the end of
+    the string, and an index past either end is clamped."""
+    return request(node_addr, {"type": "client", "op": "getrange",
+                               "key": key, "start": start, "end": end},
+                   timeout=timeout)
+
+
+def setrange(node_addr: tuple[str, int], key: str, offset: int,
+             value: str, timeout: float = 12.0) -> dict:
+    """Overwrite part of the string value at ``key`` starting at
+    ``offset``, following leader redirects like ``request`` —
+    Redis SETRANGE.
+
+    One request appends the setrange entry, so the new value and
+    length are decided at the entry's position in the log: the
+    reply is the plain setrange response (``status`` ``ok`` with
+    the new ``value`` and its ``length`` — or ``setrange_failed``
+    with reason ``wrongtype`` when the current value is not a
+    string). A missing key counts as an empty string, and when
+    the offset lies past the end the gap is padded with zero
+    bytes; a successful setrange keeps the key's TTL deadline,
+    like a CAS."""
+    return request(node_addr, {"type": "client", "op": "setrange",
+                               "key": key, "offset": offset,
+                               "value": value}, timeout=timeout)
 
 
 def mset(node_addr: tuple[str, int], pairs: list,
@@ -1340,6 +1447,38 @@ def main(argv: list[str] | None = None) -> int:
                                "twice")
     p_getdel.add_argument("--request-id", default=None,
                           help="id of this write within the client session")
+    p_getrange = sub.add_parser(
+        "getrange",
+        help="print the substring of the string at key from start "
+             "to end inclusive (negative indexes count back from "
+             "the end, out-of-range indexes are clamped); empty "
+             "when the key does not exist or the range holds "
+             "nothing")
+    p_getrange.add_argument("key")
+    p_getrange.add_argument("start", type=int,
+                            help="first character, 0-based; negative "
+                                 "counts back from the end")
+    p_getrange.add_argument("end", type=int,
+                            help="last character, inclusive; negative "
+                                 "counts back from the end")
+    p_setrange = sub.add_parser(
+        "setrange",
+        help="overwrite the string at key starting at offset with "
+             "value and print the new length; a missing key "
+             "counts as empty, and a gap past the end is padded "
+             "with zero bytes")
+    p_setrange.add_argument("key")
+    p_setrange.add_argument("offset", type=int,
+                            help="character to start overwriting at, "
+                                 "0-based, at most 1000000")
+    p_setrange.add_argument("value")
+    p_setrange.add_argument("--client-id", default=None,
+                            help="session id for at-most-once writes: a retry "
+                                 "with the same client id + request id returns "
+                                 "the first attempt's result instead of writing "
+                                 "twice")
+    p_setrange.add_argument("--request-id", default=None,
+                            help="id of this write within the client session")
     p_add = sub.add_parser("add-server",
                            help="add a server to the cluster (Raft §6)")
     p_add.add_argument("server_id")
@@ -1431,7 +1570,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     msg: dict = {"type": "client", "op": op}
     if op in ("set", "get", "del", "cas", "ttl", "expire", "incr",
-              "setnx", "getset", "append", "strlen", "getdel"):
+              "setnx", "getset", "append", "strlen", "getdel",
+              "getrange", "setrange"):
         msg["key"] = args.key
     elif op == "mset":
         if len(args.pairs) % 2:
@@ -1472,8 +1612,14 @@ def main(argv: list[str] | None = None) -> int:
         msg["value"] = args.value
     if op == "append":
         msg["value"] = args.value
+    if op == "getrange":
+        msg["start"] = args.start
+        msg["end"] = args.end
+    if op == "setrange":
+        msg["offset"] = args.offset
+        msg["value"] = args.value
     if op in ("set", "del", "cas", "mset", "expire", "incr", "setnx",
-              "getset", "append", "getdel") \
+              "getset", "append", "getdel", "setrange") \
             and args.request_id:
         # A request id without an explicit client id still dedups
         # within the default "cli" session; the same id retried from
@@ -1521,6 +1667,10 @@ def main(argv: list[str] | None = None) -> int:
         elif op == "getdel":
             old = resp.get("value")
             print(old if old is not None else "(nil)")
+        elif op == "getrange":
+            print(resp.get("value") or "")
+        elif op == "setrange":
+            print(resp.get("length"))
         elif op == "mget":
             print(json.dumps(resp.get("values")))
         elif op == "keys":

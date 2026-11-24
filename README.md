@@ -308,6 +308,44 @@ logic and the failure handling, not the key-value API on top.
   It rides the same write path as a single `set` — group-commit
   batching, dedup, the response's log index advancing a session's
   watermark — and `{"op": "getdel", "key": k}` is a pipeline op too.
+- **Substring read** — since v0.44.0 `getrange key start end`
+  (`Session.getrange(k, start, end)`, `client.getrange(addr, k,
+  start, end)`, `getrange key start end` on the CLI) answers the
+  substring of the string at the key from `start` to `end`
+  inclusive — Redis GETRANGE. A negative index counts back from
+  the end of the string (-1 is the last character), an index past
+  either end is clamped to the string, and a range with start past
+  end is empty rather than an error; a missing key holds the empty
+  string, so any range of it is "". It rides the same ReadIndex
+  path as a `get`, so it carries the same session watermark and is
+  exactly as linearizable. A non-string value is a client error,
+  not a substring — defensive, like strlen's wrongtype, since
+  every value this store holds is a string.
+- **Substring overwrite** — since v0.44.0 `setrange key offset
+  value` (`Session.setrange(k, offset, v)`, `client.setrange(addr,
+  k, offset, v)`, `setrange key offset value` on the CLI) overwrites
+  the string at the key starting at `offset` and answers with the
+  new value and its length — Redis SETRANGE. A missing key counts
+  as an empty string, and when the offset lies past the end the gap
+  is padded with zero bytes (`\x00`), exactly as Redis pads with
+  zero bytes. The outcome is decided at apply time, at the entry's
+  exact position in the log, like a CAS: a retry with the same
+  session id returns the first attempt's value and length instead
+  of overwriting twice. A successful setrange fires a `set` watch
+  event with the new value and keeps the key's TTL deadline, like
+  a CAS. A non-string value fails with `setrange_failed` and reason
+  `wrongtype` instead of overwriting. It rides the same write path
+  as a single `set` — group-commit batching, dedup, the response's
+  log index advancing a session's watermark — and `{"op":
+  "setrange", "key": k, "offset": n, "value": v}` is a pipeline op
+  too. An offset must be an integer from 0 to 1,000,000
+  (`SETRANGE_MAX_OFFSET`): a negative offset is a client error and
+  appends nothing, and the cap keeps one entry from growing a value
+  without limit — the same scale as the TTL cap, for the same
+  reason. The honest limit is the padding itself: a setrange past
+  the end grows the value by the whole gap in one entry, so a
+  large offset is a large value on every replica, not just on the
+  leader — the cap is what keeps that bounded.
 - **Key enumeration** — since v0.31.0 one `keys` RPC lists the
   store's keys (`client.keys(prefix, limit, start_after)`,
   `Session.keys(prefix, limit, start_after)`, `keys --prefix p
@@ -622,7 +660,7 @@ make test
 # or: python3 -m unittest discover -s tests -v
 ```
 
-327 tests, plus a smoke test for the benchmark script, all passing:
+381 tests, plus a smoke test for the benchmark script, all passing:
 
 | Test | What it proves |
 |---|---|
@@ -2002,3 +2040,44 @@ entries left in `log.jsonl` are dropped by their index on reload.
   a new roadmap item grounded in this project's purpose,
   proposed by the next run — candidates: a wall-clock TTL
   variant, or more Redis string ops (getrange, setrange).
+- ~~Getrange / setrange~~ — done in v0.44.0,
+  Nov 24, 2026: `getrange key start end` answers the substring
+  from start to end inclusive — Redis GETRANGE — negative indexes
+  counting back from the end, out-of-range indexes clamped, a
+  missing key answering "", through the same ReadIndex path as a
+  `get`. `setrange key offset value` overwrites the string at the
+  key from offset and answers with the new value and length —
+  Redis SETRANGE — a missing key counting as empty, a gap past
+  the end padded with zero bytes, decided at apply time like a
+  CAS, so a retry with the same session id returns the first
+  attempt's value and length instead of overwriting twice; a
+  successful setrange fires a `set` watch event with the new
+  value and keeps the key's TTL deadline, and a non-string value
+  fails with `setrange_failed` / `wrongtype`. An offset must be
+  an integer from 0 to 1,000,000 (`SETRANGE_MAX_OFFSET`); a
+  negative or over-cap offset is a client error and appends
+  nothing. `{"op": "setrange"}` is a pipeline op too.
+  `Session.getrange` / `Session.setrange`,
+  `client.getrange` / `client.setrange`, and `getrange` /
+  `setrange` on the CLI expose them.
+  `tests/test_string_ops.py` proves them: store-level getrange
+  whole and partial, negative indexes, clamped out-of-range,
+  missing key and empty value, wrongtype, setrange create,
+  overwrite in the middle and past the end, zero-byte padding
+  on an existing and a missing key, the TTL deadline kept
+  across a setrange, the new key joining the sorted index,
+  wrongtype leaving the value untouched, and a negative offset
+  raising; replication to every node, a missing value and an
+  invalid offset rejected with no log entry, redirect from a
+  follower, dedup of a setrange retry returning the first
+  attempt's value even after another write moved it,
+  continuing after a leader change, the watch event on leader
+  and follower with the new value, surviving a snapshot +
+  restart, session read-your-writes, pipelined setrange ops
+  with a bad offset and a missing value in position, and the
+  CLI end to end.
+  The roadmap is exhausted again, so the next real thing is
+  a new roadmap item grounded in this project's purpose,
+  proposed by the next run — candidates: a wall-clock TTL
+  variant, or GETEX (get-and-expire), or Redis bit ops
+  (SETBIT / GETBIT).

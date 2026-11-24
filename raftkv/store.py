@@ -96,7 +96,7 @@ class KVStore:
 
         Returns a result dict for commands whose outcome depends on the
         state at apply time — currently "cas", "expire", "incr",
-        "setnx", "getset", "append", and "getdel" —
+        "setnx", "getset", "append", "getdel", and "setrange" —
         and None for set/del, whose outcome is always ok. The result is
         what the leader hands back to the waiting client and what the
         dedup table caches for retries, so it must be a pure function
@@ -371,6 +371,59 @@ class KVStore:
             self._expiry.pop(key, None)
             return {"type": "client_response", "status": "ok",
                     "value": old, "getdel": 1}
+        elif op == "setrange":
+            # Overwrite part of a string value, Redis SETRANGE:
+            # starting at ``offset``, replace as many characters
+            # of the current value as ``value`` holds — a missing
+            # key counts as an empty string, and when the offset
+            # lies past the end the gap is padded with zero bytes
+            # ("\x00"), exactly as Redis pads with zero bytes.
+            # The reply carries the new value and its length, the
+            # length Redis answers with. The outcome is decided
+            # here, at this exact point in the log, so a retry
+            # with the same session id returns the first
+            # attempt's value and length from the dedup table
+            # instead of overwriting twice. A value that is not
+            # a string fails with WRONGTYPE, like append: every
+            # value this store holds is a string, so only a
+            # hand-built state can do that, but the check keeps
+            # the op honest about what it overwrote. A failed
+            # setrange writes nothing at all, like a failed
+            # incr. A successful setrange keeps the key's
+            # deadline, like a CAS or an append: it is an update
+            # of the value, not a fresh set, so it must not
+            # resurrect a key that is about to expire. A new key
+            # joins the sorted index, like a set of a new key.
+            # The offset itself was validated on the leader
+            # before the entry was logged (an integer from 0 to
+            # SETRANGE_MAX_OFFSET), so by apply time it is
+            # always in range — a hand-built log entry with a
+            # bad offset still raises rather than silently
+            # building a nonsense value.
+            key = command["key"]
+            offset = command["offset"]
+            if (not isinstance(offset, int)
+                    or isinstance(offset, bool) or offset < 0):
+                raise ValueError(
+                    "setrange offset must be a non-negative integer")
+            current = self._data.get(key)
+            if current is not None and not isinstance(current, str):
+                return {"type": "client_response",
+                        "status": "setrange_failed",
+                        "reason": "wrongtype",
+                        "current": current,
+                        "error": "setrange failed: value of "
+                                 f"{key!r} is not a string"}
+            current = current or ""
+            if offset > len(current):
+                current += "\x00" * (offset - len(current))
+            new = (current[:offset] + command["value"]
+                   + current[offset + len(command["value"]):])
+            if key not in self._data:
+                bisect.insort(self._keys, key)
+            self._data[key] = new
+            return {"type": "client_response", "status": "ok",
+                    "value": new, "length": len(new)}
         else:
             raise ValueError(f"unknown command op: {op!r}")
 
@@ -424,6 +477,41 @@ class KVStore:
 
     def get(self, key: str) -> str | None:
         return self._data.get(key)
+
+    def getrange(self, key: str, start: int, end: int) -> str:
+        """The substring of the string value at ``key`` from
+        ``start`` to ``end`` inclusive, Redis GETRANGE. A missing
+        key holds the empty string, so any range of it is "". A
+        negative index counts back from the end of the string
+        (-1 is the last character), and an index past either end
+        is clamped to the string — so a range past the end, or
+        with start past end, is "" rather than an error. Raises
+        TypeError when the value is not a string: every value
+        this store holds is a string, so only a hand-built state
+        can do that, but the check keeps the read honest about
+        what it sliced instead of answering a substring of
+        something that has none. Pure read: no log entry, no
+        state change."""
+        value = self._data.get(key)
+        if value is None:
+            return ""
+        if not isinstance(value, str):
+            raise TypeError(
+                f"getrange failed: value of {key!r} is not a string")
+        n = len(value)
+        if start < 0:
+            start += n
+        if end < 0:
+            end += n
+        if start < 0:
+            start = 0
+        if end < 0:
+            end = 0
+        if end >= n:
+            end = n - 1
+        if start > end or n == 0:
+            return ""
+        return value[start:end + 1]
 
     def strlen(self, key: str) -> int:
         """Length of the string value at ``key`` — 0 when the key
