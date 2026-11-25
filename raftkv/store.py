@@ -1418,6 +1418,37 @@ class KVStore:
                 f"hgetall failed: value of {key!r} is not a hash")
         return dict(_hash_fields(value))
 
+    def hlen(self, key: str) -> int:
+        """The number of fields in the hash at ``key`` — 0 when
+        the key does not exist, Redis HLEN. Raises TypeError
+        when the value is a plain string: an HLEN reads a hash,
+        not bytes, so a string key is WRONGTYPE, like an hgetall
+        on a plain string. Pure read: no log entry, no state
+        change."""
+        value = self._data.get(key)
+        if value is None:
+            return 0
+        if not is_hash(value):
+            raise TypeError(
+                f"hlen failed: value of {key!r} is not a hash")
+        return len(_hash_fields(value))
+
+    def hexists(self, key: str, field: str) -> int:
+        """1 when ``field`` is set in the hash at ``key``, 0
+        otherwise — 0 when the key does not exist or the field
+        is not set, Redis HEXISTS. Raises TypeError when the
+        value is a plain string: an HEXISTS reads a hash, not
+        bytes, so a string key is WRONGTYPE, like an hget on a
+        plain string. Pure read: no log entry, no state
+        change."""
+        value = self._data.get(key)
+        if value is None:
+            return 0
+        if not is_hash(value):
+            raise TypeError(
+                f"hexists failed: value of {key!r} is not a hash")
+        return 1 if field in _hash_fields(value) else 0
+
     def getbit(self, key: str, offset: int) -> int:
         """The bit at ``offset`` in the string value at ``key``,
         Redis GETBIT: bit 0 is the most significant bit of the

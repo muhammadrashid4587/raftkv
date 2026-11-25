@@ -63,6 +63,16 @@ def hgetall(addr, key="user:1"):
                                  "key": key})
 
 
+def hlen(addr, key="user:1"):
+    return client_request(addr, {"type": "client", "op": "hlen",
+                                 "key": key})
+
+
+def hexists(addr, key="user:1", field="name"):
+    return client_request(addr, {"type": "client", "op": "hexists",
+                                 "key": key, "field": field})
+
+
 def write(addr, key="user:1", value="plain"):
     return client_request(addr, {"type": "client", "op": "set",
                                  "key": key, "value": value})
@@ -255,6 +265,75 @@ class TestHashStore(unittest.TestCase):
         store.apply({"op": "set", "key": "u", "value": "plain"})
         with self.assertRaises(TypeError):
             store.hgetall("u")
+
+    def test_hlen_counts_fields_and_missing_key_is_zero(self):
+        store = KVStore()
+        self.assertEqual(store.hlen("nope"), 0)
+        store.apply({"op": "hset", "key": "u",
+                     "pairs": [["name", "mo"], ["city", "phl"]]})
+        self.assertEqual(store.hlen("u"), 2)
+        # An overwrite adds no field, so the count stays put.
+        store.apply({"op": "hset", "key": "u",
+                     "pairs": [["name", "rashid"]]})
+        self.assertEqual(store.hlen("u"), 2)
+        store.apply({"op": "hset", "key": "u",
+                     "pairs": [["age", "22"]]})
+        self.assertEqual(store.hlen("u"), 3)
+
+    def test_hlen_tracks_hdel_down_to_zero(self):
+        store = KVStore()
+        store.apply({"op": "hset", "key": "u",
+                     "pairs": [["name", "mo"], ["city", "phl"],
+                               ["age", "22"]]})
+        self.assertEqual(store.hlen("u"), 3)
+        store.apply({"op": "hdel", "key": "u",
+                     "fields": ["city"]})
+        self.assertEqual(store.hlen("u"), 2)
+        # Removing the last fields deletes the key, so the
+        # count is 0 again — a missing key, not an empty hash.
+        store.apply({"op": "hdel", "key": "u",
+                     "fields": ["name", "age"]})
+        self.assertEqual(store.hlen("u"), 0)
+        self.assertIsNone(store.get("u"))
+
+    def test_hlen_on_plain_string_raises(self):
+        store = KVStore()
+        store.apply({"op": "set", "key": "u", "value": "plain"})
+        with self.assertRaises(TypeError):
+            store.hlen("u")
+
+    def test_hexists_answers_presence(self):
+        store = KVStore()
+        self.assertEqual(store.hexists("nope", "name"), 0)
+        store.apply({"op": "hset", "key": "u",
+                     "pairs": [["name", "mo"], ["city", "phl"]]})
+        self.assertEqual(store.hexists("u", "name"), 1)
+        self.assertEqual(store.hexists("u", "city"), 1)
+        self.assertEqual(store.hexists("u", "nope"), 0)
+        store.apply({"op": "hdel", "key": "u",
+                     "fields": ["name"]})
+        self.assertEqual(store.hexists("u", "name"), 0)
+        self.assertEqual(store.hexists("u", "city"), 1)
+
+    def test_hexists_on_plain_string_raises(self):
+        store = KVStore()
+        store.apply({"op": "set", "key": "u", "value": "plain"})
+        with self.assertRaises(TypeError):
+            store.hexists("u", "name")
+
+    def test_hlen_hexists_survive_snapshot_load(self):
+        # The blob is a plain string in _data, so a snapshot
+        # carries it exactly like any other value — and the
+        # count and the presence read back off the loaded blob.
+        store = KVStore()
+        store.apply({"op": "hset", "key": "u",
+                     "pairs": [["name", "mo"], ["city", "phl"]]})
+        state = store.items()
+        store2 = KVStore()
+        store2.load(state)
+        self.assertEqual(store2.hlen("u"), 2)
+        self.assertEqual(store2.hexists("u", "name"), 1)
+        self.assertEqual(store2.hexists("u", "nope"), 0)
 
     def test_hdel_rejects_malformed_fields(self):
         store = KVStore()
@@ -993,6 +1072,258 @@ class TestHashCluster(unittest.TestCase):
             err = io.StringIO()
             with contextlib.redirect_stderr(err):
                 rc = client_main(["--node", node, "hdel", "user:1",
+                                  "name"])
+            self.assertEqual(rc, 1)
+            self.assertIn("not a hash", err.getvalue())
+        finally:
+            cluster.stop_all()
+
+    def test_hlen_hexists_succeed_and_replicate(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            self.assertEqual(
+                hset(addr, pairs=[["name", "mo"], ["city", "phl"],
+                                  ["age", "22"]]).get("hset"), 3)
+            resp = hlen(addr)
+            self.assertEqual(resp.get("status"), "ok", resp)
+            self.assertEqual(resp.get("hlen"), 3, resp)
+            self.assertEqual(hexists(addr, field="name").get("hexists"),
+                             1)
+            self.assertEqual(hexists(addr, field="nope").get("hexists"),
+                             0)
+            for node_id in cluster.live:
+                node = cluster.nodes[node_id]
+                self.assertTrue(
+                    wait_for_hgetall(node, "user:1",
+                                     {"name": "mo", "city": "phl",
+                                      "age": "22"}))
+                self.assertEqual(node.sm.hlen("user:1"), 3)
+                self.assertEqual(node.sm.hexists("user:1", "age"), 1)
+                self.assertEqual(node.sm.hexists("user:1", "nope"), 0)
+            # The count tracks a delete on every node too.
+            self.assertEqual(hdel(addr, fields=["age"]).get("hdel"), 1)
+            for node_id in cluster.live:
+                node = cluster.nodes[node_id]
+                self.assertTrue(
+                    wait_for_hgetall(node, "user:1",
+                                     {"name": "mo", "city": "phl"}))
+                self.assertEqual(node.sm.hlen("user:1"), 2)
+            self.assertEqual(hlen(addr).get("hlen"), 2)
+            self.assertEqual(hexists(addr, field="age").get("hexists"),
+                             0)
+        finally:
+            cluster.stop_all()
+
+    def test_hlen_hexists_missing_key_answer_zero(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            self.assertEqual(hlen(addr).get("hlen"), 0)
+            self.assertEqual(hexists(addr).get("hexists"), 0)
+        finally:
+            cluster.stop_all()
+
+    def test_hlen_hexists_on_plain_string_are_client_errors(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            self.assertEqual(write(addr).get("status"), "ok")
+            resp = hlen(addr)
+            self.assertEqual(resp.get("status"), "error", resp)
+            self.assertIn("not a hash", resp.get("error", ""), resp)
+            resp = hexists(addr)
+            self.assertEqual(resp.get("status"), "error", resp)
+            self.assertIn("not a hash", resp.get("error", ""), resp)
+            # The string is still there, untouched.
+            self.assertEqual(
+                client_request(addr, {"type": "client", "op": "get",
+                                      "key": "user:1"}).get("value"),
+                "plain")
+        finally:
+            cluster.stop_all()
+
+    def test_hexists_rejects_non_string_field(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            self.assertEqual(
+                hset(addr, pairs=[["name", "mo"]]).get("hset"), 1)
+            resp = client_request(
+                addr, {"type": "client", "op": "hexists",
+                       "key": "user:1", "field": 1})
+            self.assertEqual(resp.get("status"), "error", resp)
+            self.assertEqual(hlen(addr).get("hlen"), 1)
+        finally:
+            cluster.stop_all()
+
+    def test_hlen_hexists_from_follower_redirect(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            follower = next(n for n in cluster.live
+                            if n != leader.id)
+            self.assertEqual(
+                hset(cluster.addrs[leader.id],
+                     pairs=[["name", "mo"]]).get("hset"), 1)
+            # Reads sent to a follower are served by the leader
+            # the client is redirected to, like an hget.
+            self.assertEqual(
+                hlen(cluster.addrs[follower]).get("hlen"), 1)
+            self.assertEqual(
+                hexists(cluster.addrs[follower]).get("hexists"), 1)
+        finally:
+            cluster.stop_all()
+
+    def test_hlen_hexists_continue_after_leader_change(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            self.assertEqual(
+                hset(addr, pairs=[["name", "mo"]]).get("hset"), 1)
+            self.assertEqual(hlen(addr).get("hlen"), 1)
+            cluster.stop_node(leader.id)
+            new_leader = cluster.wait_for_leader()
+            addr = cluster.addrs[new_leader.id]
+            self.assertEqual(
+                hset(addr, pairs=[["city", "phl"]]).get("hset"), 1)
+            self.assertEqual(hlen(addr).get("hlen"), 2)
+            self.assertEqual(hexists(addr, field="city").get("hexists"),
+                             1)
+        finally:
+            cluster.stop_all()
+
+    def test_hlen_hexists_survive_snapshot_and_restart(self):
+        cluster = Cluster(3, snapshot_threshold=5)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            self.assertEqual(
+                hset(addr, pairs=[["name", "mo"],
+                                  ["city", "phl"]]).get("hset"), 2)
+            # Enough writes to compact the log past the hash.
+            for i in range(10):
+                self.assertEqual(
+                    write(addr, key=f"pad{i}", value="x").get("status"),
+                    "ok")
+            cluster.stop_node(leader.id)
+            cluster.restart_node(leader.id)
+            new_leader = cluster.wait_for_leader()
+            addr = cluster.addrs[new_leader.id]
+            self.assertEqual(hlen(addr).get("hlen"), 2)
+            self.assertEqual(hexists(addr, field="name").get("hexists"),
+                             1)
+            self.assertEqual(hexists(addr, field="nope").get("hexists"),
+                             0)
+        finally:
+            cluster.stop_all()
+
+    def test_session_hlen_hexists_is_read_your_writes(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            with Session(addr) as session:
+                resp = session.hset("user:1", {"name": "mo",
+                                               "city": "phl"})
+                self.assertEqual(resp.get("status"), "ok", resp)
+                self.assertEqual(resp.get("hset"), 2, resp)
+                self.assertGreater(session.last_write_index, 0)
+                self.assertEqual(
+                    session.hlen("user:1").get("hlen"), 2)
+                self.assertEqual(
+                    session.hexists("user:1", "name").get("hexists"),
+                    1)
+                self.assertEqual(
+                    session.hexists("user:1", "nope").get("hexists"),
+                    0)
+                resp = session.hdel("user:1", "city")
+                self.assertEqual(resp.get("status"), "ok", resp)
+                self.assertEqual(resp.get("hdel"), 1, resp)
+                self.assertEqual(
+                    session.hlen("user:1").get("hlen"), 1)
+                self.assertEqual(
+                    session.hexists("user:1", "city").get("hexists"),
+                    0)
+        finally:
+            cluster.stop_all()
+
+    def test_hlen_hexists_cli(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            host, port = cluster.addrs[leader.id]
+            node = f"{host}:{port}"
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "hlen", "user:1"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(out.getvalue().strip(), "0")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "hexists", "user:1",
+                                  "name"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(out.getvalue().strip(), "0")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "hset", "user:1",
+                                  "name", "mo", "city", "phl"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(out.getvalue().strip(), "2")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "hlen", "user:1"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(out.getvalue().strip(), "2")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "hexists", "user:1",
+                                  "name"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(out.getvalue().strip(), "1")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "hexists", "user:1",
+                                  "nope"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(out.getvalue().strip(), "0")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "hdel", "user:1",
+                                  "city"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(out.getvalue().strip(), "1")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "hlen", "user:1"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(out.getvalue().strip(), "1")
+            # A failed hlen exits 1 and names the failure.
+            self.assertEqual(write(cluster.addrs[leader.id],
+                                   value="plain").get("status"), "ok")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = client_main(["--node", node, "hlen", "user:1"])
+            self.assertEqual(rc, 1)
+            self.assertIn("not a hash", err.getvalue())
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = client_main(["--node", node, "hexists", "user:1",
                                   "name"])
             self.assertEqual(rc, 1)
             self.assertIn("not a hash", err.getvalue())

@@ -840,6 +840,66 @@ class Session:
                 self.last_read_term = int(resp.get("read_term") or 0)
         return resp
 
+    def hlen(self, key: str) -> dict:
+        """Ask for the number of fields in the hash at ``key``,
+        Redis HLEN: 0 when the key does not exist, and a client
+        error — not a count — when the key holds a plain string.
+        It rides the same ReadIndex path as ``get``, so it
+        carries the same session watermark and advances the
+        read watermark from the reply's ``read_index`` exactly
+        the same way: a length queried after your own write
+        counts the fields that write set, and a later read
+        never goes backwards past it."""
+        if self.last_read_index > self.last_write_index:
+            min_index = self.last_read_index
+            term = self.last_read_term
+        else:
+            min_index = self.last_write_index
+            term = self.last_write_term
+        msg: dict = {"type": "client", "op": "hlen", "key": key,
+                     "client_id": self.client_id,
+                     "min_commit_index": min_index,
+                     "session_term": term}
+        resp = request(self.node_addr, msg, pool=self._pooled)
+        if (resp.get("status") == "ok"
+                and resp.get("read_index") is not None):
+            read_index = int(resp["read_index"])
+            if read_index > self.last_read_index:
+                self.last_read_index = read_index
+                self.last_read_term = int(resp.get("read_term") or 0)
+        return resp
+
+    def hexists(self, key: str, field: str) -> dict:
+        """Ask whether ``field`` is set in the hash at ``key``,
+        Redis HEXISTS: 1 when it is, 0 when the key does not
+        exist or the field is not set, and a client error — not
+        a 0 — when the key holds a plain string. It rides the
+        same ReadIndex path as ``get``, so it carries the same
+        session watermark and advances the read watermark from
+        the reply's ``read_index`` exactly the same way: a
+        presence query after your own write sees the field
+        that write set, and a later read never goes backwards
+        past it."""
+        if self.last_read_index > self.last_write_index:
+            min_index = self.last_read_index
+            term = self.last_read_term
+        else:
+            min_index = self.last_write_index
+            term = self.last_write_term
+        msg: dict = {"type": "client", "op": "hexists", "key": key,
+                     "field": field,
+                     "client_id": self.client_id,
+                     "min_commit_index": min_index,
+                     "session_term": term}
+        resp = request(self.node_addr, msg, pool=self._pooled)
+        if (resp.get("status") == "ok"
+                and resp.get("read_index") is not None):
+            read_index = int(resp["read_index"])
+            if read_index > self.last_read_index:
+                self.last_read_index = read_index
+                self.last_read_term = int(resp.get("read_term") or 0)
+        return resp
+
     def get(self, key: str) -> dict:
         # The read carries the higher of the two watermarks — the
         # last acknowledged write, or the newest state a previous
@@ -2051,6 +2111,41 @@ def hgetall(node_addr: tuple[str, int], key: str,
                    timeout=timeout)
 
 
+def hlen(node_addr: tuple[str, int], key: str,
+         timeout: float = 12.0) -> dict:
+    """Ask for the number of fields in the hash at ``key``,
+    following leader redirects like ``request`` — Redis HLEN.
+
+    One request serves the count through the leader's ReadIndex
+    path, so it reflects the committed state as of one read index,
+    exactly as linearizable as a ``get``. The reply is the plain
+    hlen response (``status`` ``ok`` with ``hlen`` — the number of
+    fields, 0 when the key does not exist — plus the
+    ``read_index`` / ``read_term`` it was measured at). A plain
+    string value is a client error, not a count."""
+    return request(node_addr, {"type": "client", "op": "hlen",
+                               "key": key},
+                   timeout=timeout)
+
+
+def hexists(node_addr: tuple[str, int], key: str, field: str,
+            timeout: float = 12.0) -> dict:
+    """Ask whether ``field`` is set in the hash at ``key``,
+    following leader redirects like ``request`` — Redis HEXISTS.
+
+    One request serves the answer through the leader's ReadIndex
+    path, so it reflects the committed state as of one read index,
+    exactly as linearizable as a ``get``. The reply is the plain
+    hexists response (``status`` ``ok`` with ``hexists`` — 1 when
+    the field is set, 0 when the key does not exist or the field
+    is not set — plus the ``read_index`` / ``read_term`` it was
+    measured at). A plain string value is a client error, not
+    a 0."""
+    return request(node_addr, {"type": "client", "op": "hexists",
+                               "key": key, "field": field},
+                   timeout=timeout)
+
+
 def mset(node_addr: tuple[str, int], pairs: list,
          ttl_entries: int | None = None,
          timeout: float = 12.0) -> dict:
@@ -2661,6 +2756,17 @@ def main(argv: list[str] | None = None) -> int:
         help="print every field and value in the hash at key as JSON "
              "({} when the key does not exist)")
     p_hgetall.add_argument("key")
+    p_hlen = sub.add_parser(
+        "hlen",
+        help="print the number of fields in the hash at key "
+             "(0 when the key does not exist)")
+    p_hlen.add_argument("key")
+    p_hexists = sub.add_parser(
+        "hexists",
+        help="print 1 when field is set in the hash at key, 0 when "
+             "the key does not exist or the field is not set")
+    p_hexists.add_argument("key")
+    p_hexists.add_argument("field")
     p_add = sub.add_parser("add-server",
                            help="add a server to the cluster (Raft §6)")
     p_add.add_argument("server_id")
@@ -2756,6 +2862,7 @@ def main(argv: list[str] | None = None) -> int:
               "setnx", "getset", "append", "strlen", "getdel",
               "getex", "getrange", "setrange", "setbit", "getbit",
               "pfadd", "pfcount", "hset", "hget", "hdel", "hgetall",
+              "hlen", "hexists",
               "setex", "expireat",
               "pexpireat"):
         msg["key"] = args.key
@@ -2855,6 +2962,8 @@ def main(argv: list[str] | None = None) -> int:
                         for i in range(0, len(args.pairs), 2)]
     if op == "hget":
         msg["field"] = args.field
+    if op == "hexists":
+        msg["field"] = args.field
     if op == "hdel":
         msg["fields"] = args.fields
     if op in ("set", "del", "cas", "mset", "expire", "incr",
@@ -2939,6 +3048,10 @@ def main(argv: list[str] | None = None) -> int:
             print(resp.get("hdel"))
         elif op == "hgetall":
             print(json.dumps(resp.get("fields")))
+        elif op == "hlen":
+            print(resp.get("hlen"))
+        elif op == "hexists":
+            print(resp.get("hexists"))
         elif op == "mget":
             print(json.dumps(resp.get("values")))
         elif op == "keys":

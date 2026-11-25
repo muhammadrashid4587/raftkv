@@ -2394,6 +2394,7 @@ class RaftNode:
                       "getdel", "getrange", "setrange", "getex",
                       "setbit", "getbit", "pfadd", "pfcount",
                       "hset", "hget", "hdel", "hgetall",
+                      "hlen", "hexists",
                       "setex") \
                 or key is None:
             return {"type": "client_response", "status": "error",
@@ -2402,7 +2403,8 @@ class RaftNode:
                              "incr/incrbyfloat/setnx/getset/append/"
                              "strlen/getdel/"
                              "getrange/setrange/getex/setbit/getbit/"
-                             "pfadd/pfcount/hset/hget/hdel/hgetall/setex "
+                             "pfadd/pfcount/hset/hget/hdel/hgetall/"
+                             "hlen/hexists/setex "
                              "with a key"}
         if self._is_removed():
             return {"type": "client_response", "status": "error",
@@ -2544,6 +2546,52 @@ class RaftNode:
             if error is not None:
                 return error
             return self._serve_read(hgetall_key=key,
+                                    min_index=min_index,
+                                    session_term=session_term,
+                                    stale_ok=bool(msg.get("stale_ok")))
+        if op == "hlen":
+            # The size of a hash: the number of fields at this
+            # key — 0 when the key does not exist, Redis HLEN.
+            # It rides the same ReadIndex/lease path as a
+            # ``get`` — one leadership confirmation, one apply
+            # wait — so the count reflects the committed state
+            # as of the read index it names, exactly as
+            # linearizable, and a session read carries the same
+            # watermark a get would. A string key is a client
+            # error, not a count: the payload carries its own
+            # "status": "error" (see _serve_read), like
+            # hgetall's wrongtype.
+            min_index, session_term, error = self._parse_read_params(msg)
+            if error is not None:
+                return error
+            return self._serve_read(hlen_key=key,
+                                    min_index=min_index,
+                                    session_term=session_term,
+                                    stale_ok=bool(msg.get("stale_ok")))
+        if op == "hexists":
+            # One field's presence: 1 when ``field`` is set in
+            # the hash at this key, 0 otherwise — 0 when the key
+            # does not exist or the field is not set, Redis
+            # HEXISTS. It rides the same ReadIndex/lease path
+            # as a ``get`` — one leadership confirmation, one
+            # apply wait — so the answer reflects the committed
+            # state as of the read index it names, exactly as
+            # linearizable, and a session read carries the same
+            # watermark a get would. A string key is a client
+            # error, not a 0: the payload carries its own
+            # "status": "error" (see _serve_read), like hget's
+            # wrongtype. The field must be a string — an empty
+            # one names a real field, like Redis — so only a
+            # non-string is rejected here.
+            field = msg.get("field")
+            if not isinstance(field, str):
+                return {"type": "client_response", "status": "error",
+                        "error": "hexists field must be a string"}
+            min_index, session_term, error = self._parse_read_params(msg)
+            if error is not None:
+                return error
+            return self._serve_read(hexists_key=key,
+                                    hexists_field=field,
                                     min_index=min_index,
                                     session_term=session_term,
                                     stale_ok=bool(msg.get("stale_ok")))
@@ -3631,6 +3679,9 @@ class RaftNode:
                     hget_key: str | None = None,
                     hget_field: str | None = None,
                     hgetall_key: str | None = None,
+                    hlen_key: str | None = None,
+                    hexists_key: str | None = None,
+                    hexists_field: str | None = None,
                     scan_prefix: str | None = None,
                     scan_limit: int = MAX_KEYS_SCAN,
                     scan_start_after: str | None = None) -> dict:
@@ -3679,6 +3730,17 @@ class RaftNode:
         key, Redis HGETALL — read off the applied state machine
         the same way, so it is exactly as linearizable as a ``get``;
         a plain string value is a client error, not a field map.
+        ``hlen_key`` serves the size of a hash instead — the number
+        of fields at that key, 0 for a missing key, Redis HLEN —
+        read off the applied state machine the same way, so it is
+        exactly as linearizable as a ``get``; a plain string value
+        is a client error, not a count.
+        ``hexists_key`` serves one field's presence instead — 1
+        when ``hexists_field`` is set in the hash at that key, 0
+        otherwise, Redis HEXISTS — read off the applied state
+        machine the same way, so it is exactly as linearizable
+        as a ``get``; a plain string value is a client error,
+        not a 0.
         ``scan_prefix`` serves a key enumeration instead — every key
         in the applied state machine starting with the prefix,
         sorted, at most ``scan_limit`` of them, with ``truncated``
@@ -3693,7 +3755,7 @@ class RaftNode:
         appear in a later page if it sorts ahead of the cursor.
         Everything else — the lease fast path, the pending-read wait,
         the fallback, the redirect on leadership loss — is identical
-        for all ten shapes, so a scan or a TTL query is exactly as
+        for all twelve shapes, so a scan or a TTL query is exactly as
         linearizable as a single ``get``.
 
         A stale read (``stale_ok``) is the one exception to the
@@ -3864,6 +3926,30 @@ class RaftNode:
                 # overriding the "ok" in the response literal.
                 try:
                     return {"fields": self.sm.hgetall(hgetall_key)}
+                except TypeError as e:
+                    return {"status": "error", "error": str(e)}
+            if hlen_key is not None:
+                # The size of a hash: the number of fields at
+                # this key — 0 for a missing key, Redis HLEN —
+                # with the same wrongtype rule as hgetall: a
+                # plain string value is a client error, not a
+                # count, carried the same way, overriding the
+                # "ok" in the response literal.
+                try:
+                    return {"hlen": self.sm.hlen(hlen_key)}
+                except TypeError as e:
+                    return {"status": "error", "error": str(e)}
+            if hexists_key is not None:
+                # One field's presence: 1 when the field is set
+                # in the hash at this key, 0 otherwise — 0 for a
+                # missing key or a missing field, Redis HEXISTS —
+                # with the same wrongtype rule as hget: a plain
+                # string value is a client error, not a 0,
+                # carried the same way, overriding the "ok" in
+                # the response literal.
+                try:
+                    return {"hexists": self.sm.hexists(
+                        hexists_key, hexists_field)}
                 except TypeError as e:
                     return {"status": "error", "error": str(e)}
             if keys is not None:

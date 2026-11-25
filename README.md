@@ -727,9 +727,28 @@ logic and the failure handling, not the key-value API on top.
   batch, so one entry never carries an unbounded list.
   `{"op": "hdel", "key": k, "fields": [f, ...]}` is a pipeline
   op too. The honest limit is the same encoding as hset: a plain
-  `get` on a hash key still returns the encoded blob, and there
-  is no HLEN or HEXISTS yet, so the size of a hash and the
-  presence of one field are only answerable by listing it.
+  `get` on a hash key still returns the encoded blob.
+- **Hash length and field presence** — since v0.57.0 `hlen key`
+  (`Session.hlen(k)`, `client.hlen(addr, k)`, `hlen key` on the
+  CLI) answers the number of fields in the hash at the key, 0
+  when the key does not exist — Redis HLEN — and `hexists key
+  field` (`Session.hexists(k, field)`, `client.hexists(addr, k,
+  field)`, `hexists key field` on the CLI) answers 1 when the
+  field is set, 0 when the key does not exist or the field is
+  not set — Redis HEXISTS. Both are pure reads: no log entry,
+  no state change, no watch event, and the TTL deadline is
+  untouched — a hash's size and one field's presence are read
+  off the applied state machine exactly like an hget. A key
+  holding a plain string makes both a client error, not a count
+  or a 0, like an hgetall on a plain string. Both ride the same
+  ReadIndex path as a `get`, so they carry the same session
+  watermark and are exactly as linearizable, and they survive
+  snapshots and replay exactly like any other hash read — the
+  blob is a plain string in the store, so nothing about the
+  encoding changes. The honest limit is the same encoding as
+  hset: a plain `get` on a hash key still returns the encoded
+  blob, and there is still no way to list field names without
+  their values — that is what hgetall is for.
 - **Key enumeration** — since v0.31.0 one `keys` RPC lists the
   store's keys (`client.keys(prefix, limit, start_after)`,
   `Session.keys(prefix, limit, start_after)`, `keys --prefix p
@@ -3019,6 +3038,34 @@ entries left in `log.jsonl` are dropped by their index on reload.
   restart with the hash still listable, session
   read-your-writes, pipelined hdel ops with a malformed op in
   position, and the CLI end to end.
+- ~~Hashes (HLEN / HEXISTS)~~ — done in v0.57.0,
+  Nov 24, 2026: `hlen key` answers the number of fields in the
+  hash at the key, 0 when the key does not exist — Redis HLEN —
+  and `hexists key field` answers 1 when the field is set, 0
+  when the key does not exist or the field is not set — Redis
+  HEXISTS. Both are pure reads: no log entry, no state change,
+  no watch event, and the TTL deadline is untouched — the size
+  of a hash and one field's presence are read off the applied
+  state machine exactly like an hget. A key holding a plain
+  string makes both a client error, not a count or a 0. Both
+  ride the same ReadIndex path as a `get`, so they are exactly
+  as linearizable, and they survive snapshots and replay exactly
+  like any other hash read — the blob is a plain string in the
+  store, so nothing about the encoding changes.
+  `Session.hlen` / `Session.hexists`, `client.hlen` /
+  `client.hexists`, and `hlen` / `hexists` on the CLI expose
+  them; like hget and hgetall they are reads, so they are not
+  pipeline ops. `tests/test_hash.py` proves them: store-level
+  counts of 0, 1, and 3 fields, a count that tracks hset and
+  hdel, presence of 1 and 0 for a set and an unset field, a
+  missing key answering 0 on both, an hlen and an hexists on a
+  plain string raising, and the count surviving a snapshot load;
+  replication to every node, a missing key answering 0 on the
+  cluster, an hlen and an hexists on a plain string a client
+  error, a non-string field rejected with no log entry, a
+  follower redirect, continuing after a leader change,
+  surviving a snapshot + restart with the count still right,
+  session read-your-writes, and the CLI end to end.
   The roadmap is exhausted again, so the next real thing is
   a new roadmap item grounded in this project's purpose,
   proposed by the next run.
