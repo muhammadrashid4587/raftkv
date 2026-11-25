@@ -155,6 +155,14 @@ HSET_MAX_PAIRS = 1000
 # nonsense, never a real use — the same scale as the hset cap
 # above, for the same reason.
 HDEL_MAX_FIELDS = 1000
+# Largest number of fields one ``hmget`` may carry. The fields
+# ride in one frame, so an unbounded list would let one request
+# grow without limit. 1,000 fields is far past a real use of one
+# HMGET call — a client reading more splits the batch, like an
+# mget client splits a batch past 1000 keys — so it only rejects
+# nonsense, never a real use — the same scale as the hdel cap
+# above, for the same reason.
+HMGET_MAX_FIELDS = 1000
 # Leader lease for reads (Raft dissertation §6.4): how long a majority
 # ack stays fresh. Must be shorter than ELECTION_TIMEOUT_MIN (150ms):
 # a follower that acked at time T heard from the leader no later than
@@ -2394,7 +2402,7 @@ class RaftNode:
                       "getdel", "getrange", "setrange", "getex",
                       "setbit", "getbit", "pfadd", "pfcount",
                       "hset", "hget", "hdel", "hgetall",
-                      "hlen", "hexists",
+                      "hlen", "hexists", "hkeys", "hvals", "hmget",
                       "setex") \
                 or key is None:
             return {"type": "client_response", "status": "error",
@@ -2404,7 +2412,7 @@ class RaftNode:
                              "strlen/getdel/"
                              "getrange/setrange/getex/setbit/getbit/"
                              "pfadd/pfcount/hset/hget/hdel/hgetall/"
-                             "hlen/hexists/setex "
+                             "hlen/hexists/hkeys/hvals/hmget/setex "
                              "with a key"}
         if self._is_removed():
             return {"type": "client_response", "status": "error",
@@ -2592,6 +2600,76 @@ class RaftNode:
                 return error
             return self._serve_read(hexists_key=key,
                                     hexists_field=field,
+                                    min_index=min_index,
+                                    session_term=session_term,
+                                    stale_ok=bool(msg.get("stale_ok")))
+        if op == "hkeys":
+            # Every field name of a hash: the field names at this
+            # key, sorted — an empty list when the key does not
+            # exist, Redis HKEYS. It rides the same ReadIndex/lease
+            # path as a ``get`` — one leadership confirmation, one
+            # apply wait — so the names reflect the committed state
+            # as of the read index it names, exactly as
+            # linearizable, and a session read carries the same
+            # watermark a get would. A string key is a client
+            # error, not a list: the payload carries its own
+            # "status": "error" (see _serve_read), like hgetall's
+            # wrongtype.
+            min_index, session_term, error = self._parse_read_params(msg)
+            if error is not None:
+                return error
+            return self._serve_read(hkeys_key=key,
+                                    min_index=min_index,
+                                    session_term=session_term,
+                                    stale_ok=bool(msg.get("stale_ok")))
+        if op == "hvals":
+            # Every field value of a hash: the values at this key,
+            # in sorted field order — an empty list when the key
+            # does not exist, Redis HVALS. It rides the same
+            # ReadIndex/lease path as a ``get`` — one leadership
+            # confirmation, one apply wait — so the values reflect
+            # the committed state as of the read index it names,
+            # exactly as linearizable, and a session read carries
+            # the same watermark a get would. A string key is a
+            # client error, not a list: the payload carries its
+            # own "status": "error" (see _serve_read), like
+            # hkeys' wrongtype.
+            min_index, session_term, error = self._parse_read_params(msg)
+            if error is not None:
+                return error
+            return self._serve_read(hvals_key=key,
+                                    min_index=min_index,
+                                    session_term=session_term,
+                                    stale_ok=bool(msg.get("stale_ok")))
+        if op == "hmget":
+            # The values of named fields of a hash: one value per
+            # requested field, aligned with the request — None in
+            # a position whose field is not set, and None in every
+            # position when the key does not exist, Redis HMGET.
+            # It rides the same ReadIndex/lease path as a ``get``
+            # — one leadership confirmation, one apply wait — so
+            # the values reflect the committed state as of the
+            # read index it names, exactly as linearizable, and a
+            # session read carries the same watermark a get would.
+            # A string key is a client error, not a list: the
+            # payload carries its own "status": "error" (see
+            # _serve_read), like hget's wrongtype. The fields must
+            # be a non-empty list of at most HMGET_MAX_FIELDS
+            # strings — an empty list names nothing to read, and a
+            # longer one would ride in one frame without bound —
+            # the same cap rationale as hdel's.
+            fields = msg.get("fields")
+            if (not isinstance(fields, list) or not fields
+                    or len(fields) > HMGET_MAX_FIELDS
+                    or any(not isinstance(f, str) for f in fields)):
+                return {"type": "client_response", "status": "error",
+                        "error": "hmget fields must be a list of 1 to "
+                                 f"{HMGET_MAX_FIELDS} strings"}
+            min_index, session_term, error = self._parse_read_params(msg)
+            if error is not None:
+                return error
+            return self._serve_read(hmget_key=key,
+                                    hmget_fields=list(fields),
                                     min_index=min_index,
                                     session_term=session_term,
                                     stale_ok=bool(msg.get("stale_ok")))
@@ -3682,6 +3760,10 @@ class RaftNode:
                     hlen_key: str | None = None,
                     hexists_key: str | None = None,
                     hexists_field: str | None = None,
+                    hkeys_key: str | None = None,
+                    hvals_key: str | None = None,
+                    hmget_key: str | None = None,
+                    hmget_fields: list[str] | None = None,
                     scan_prefix: str | None = None,
                     scan_limit: int = MAX_KEYS_SCAN,
                     scan_start_after: str | None = None) -> dict:
@@ -3741,6 +3823,27 @@ class RaftNode:
         machine the same way, so it is exactly as linearizable
         as a ``get``; a plain string value is a client error,
         not a 0.
+        ``hkeys_key`` serves every field name of a hash instead —
+        the field names at that key, sorted, an empty list for a
+        missing key, Redis HKEYS — read off the applied state
+        machine the same way, so it is exactly as linearizable
+        as a ``get``; a plain string value is a client error,
+        not a list.
+        ``hvals_key`` serves every field value of a hash instead —
+        the values at that key, in sorted field order, an empty
+        list for a missing key, Redis HVALS — read off the applied
+        state machine the same way, so it is exactly as
+        linearizable as a ``get``; a plain string value is a
+        client error, not a list. The values are aligned with
+        ``hkeys`` — the value at position i is the value of the
+        field at position i in the sorted field list.
+        ``hmget_key`` serves the values of named fields of a hash
+        instead — one value per field in ``hmget_fields``, aligned
+        with the request, None in a position whose field is not
+        set, Redis HMGET — read off the applied state machine
+        the same way, so it is exactly as linearizable as a
+        ``get``; a plain string value is a client error, not a
+        list.
         ``scan_prefix`` serves a key enumeration instead — every key
         in the applied state machine starting with the prefix,
         sorted, at most ``scan_limit`` of them, with ``truncated``
@@ -3755,7 +3858,7 @@ class RaftNode:
         appear in a later page if it sorts ahead of the cursor.
         Everything else — the lease fast path, the pending-read wait,
         the fallback, the redirect on leadership loss — is identical
-        for all twelve shapes, so a scan or a TTL query is exactly as
+        for all fifteen shapes, so a scan or a TTL query is exactly as
         linearizable as a single ``get``.
 
         A stale read (``stale_ok``) is the one exception to the
@@ -3950,6 +4053,43 @@ class RaftNode:
                 try:
                     return {"hexists": self.sm.hexists(
                         hexists_key, hexists_field)}
+                except TypeError as e:
+                    return {"status": "error", "error": str(e)}
+            if hkeys_key is not None:
+                # Every field name of a hash: the field names at
+                # this key, sorted — an empty list for a missing
+                # key, Redis HKEYS — with the same wrongtype
+                # rule as hgetall: a plain string value is a
+                # client error, not a list, carried the same way,
+                # overriding the "ok" in the response literal.
+                try:
+                    return {"fields": self.sm.hkeys(hkeys_key)}
+                except TypeError as e:
+                    return {"status": "error", "error": str(e)}
+            if hvals_key is not None:
+                # Every field value of a hash: the values at this
+                # key, in sorted field order — an empty list for a
+                # missing key, Redis HVALS — with the same
+                # wrongtype rule as hkeys: a plain string value
+                # is a client error, not a list, carried the same
+                # way, overriding the "ok" in the response
+                # literal.
+                try:
+                    return {"values": self.sm.hvals(hvals_key)}
+                except TypeError as e:
+                    return {"status": "error", "error": str(e)}
+            if hmget_key is not None:
+                # The values of named fields of a hash: one value
+                # per requested field, aligned with the request —
+                # None in a position whose field is not set, and
+                # None in every position when the key does not
+                # exist, Redis HMGET — with the same wrongtype
+                # rule as hget: a plain string value is a client
+                # error, not a list, carried the same way,
+                # overriding the "ok" in the response literal.
+                try:
+                    return {"values": self.sm.hmget(
+                        hmget_key, hmget_fields)}
                 except TypeError as e:
                     return {"status": "error", "error": str(e)}
             if keys is not None:

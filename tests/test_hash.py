@@ -73,6 +73,23 @@ def hexists(addr, key="user:1", field="name"):
                                  "key": key, "field": field})
 
 
+def hkeys(addr, key="user:1"):
+    return client_request(addr, {"type": "client", "op": "hkeys",
+                                 "key": key})
+
+
+def hvals(addr, key="user:1"):
+    return client_request(addr, {"type": "client", "op": "hvals",
+                                 "key": key})
+
+
+def hmget(addr, key="user:1", fields=None):
+    return client_request(addr, {"type": "client", "op": "hmget",
+                                 "key": key,
+                                 "fields": fields if fields is not None
+                                 else ["name"]})
+
+
 def write(addr, key="user:1", value="plain"):
     return client_request(addr, {"type": "client", "op": "set",
                                  "key": key, "value": value})
@@ -334,6 +351,91 @@ class TestHashStore(unittest.TestCase):
         self.assertEqual(store2.hlen("u"), 2)
         self.assertEqual(store2.hexists("u", "name"), 1)
         self.assertEqual(store2.hexists("u", "nope"), 0)
+
+    def test_hkeys_lists_field_names_sorted(self):
+        store = KVStore()
+        self.assertEqual(store.hkeys("nope"), [])
+        store.apply({"op": "hset", "key": "u",
+                     "pairs": [["name", "mo"], ["city", "phl"],
+                               ["age", "22"]]})
+        # Sorted, not insertion order — the names come back in
+        # the order the blob was dumped in.
+        self.assertEqual(store.hkeys("u"), ["age", "city", "name"])
+        store.apply({"op": "hdel", "key": "u",
+                     "fields": ["city"]})
+        self.assertEqual(store.hkeys("u"), ["age", "name"])
+
+    def test_hkeys_on_plain_string_raises(self):
+        store = KVStore()
+        store.apply({"op": "set", "key": "u", "value": "plain"})
+        with self.assertRaises(TypeError):
+            store.hkeys("u")
+
+    def test_hvals_lists_values_in_sorted_field_order(self):
+        store = KVStore()
+        self.assertEqual(store.hvals("nope"), [])
+        store.apply({"op": "hset", "key": "u",
+                     "pairs": [["name", "mo"], ["city", "phl"],
+                               ["age", "22"]]})
+        # Aligned with hkeys: age, city, name.
+        self.assertEqual(store.hvals("u"), ["22", "phl", "mo"])
+        self.assertEqual(store.hkeys("u"), ["age", "city", "name"])
+        # The two calls together rebuild the map.
+        self.assertEqual(dict(zip(store.hkeys("u"),
+                                  store.hvals("u"))),
+                         {"name": "mo", "city": "phl", "age": "22"})
+        store.apply({"op": "hset", "key": "u",
+                     "pairs": [["name", "rashid"]]})
+        self.assertEqual(store.hvals("u"), ["22", "phl", "rashid"])
+
+    def test_hvals_on_plain_string_raises(self):
+        store = KVStore()
+        store.apply({"op": "set", "key": "u", "value": "plain"})
+        with self.assertRaises(TypeError):
+            store.hvals("u")
+
+    def test_hmget_answers_requested_fields_in_order(self):
+        store = KVStore()
+        self.assertEqual(store.hmget("nope", ["name", "city"]),
+                         [None, None])
+        store.apply({"op": "hset", "key": "u",
+                     "pairs": [["name", "mo"], ["city", "phl"],
+                               ["age", "22"]]})
+        # Requested order, not sorted order — and a missing
+        # field is None in its own position, never a shift.
+        self.assertEqual(store.hmget("u", ["name", "nope", "age"]),
+                         ["mo", None, "22"])
+        self.assertEqual(store.hmget("u", ["age", "name"]),
+                         ["22", "mo"])
+        # A repeated field is answered once per occurrence.
+        self.assertEqual(store.hmget("u", ["name", "name"]),
+                         ["mo", "mo"])
+        store.apply({"op": "hdel", "key": "u",
+                     "fields": ["city"]})
+        self.assertEqual(store.hmget("u", ["city", "name"]),
+                         [None, "mo"])
+
+    def test_hmget_on_plain_string_raises(self):
+        store = KVStore()
+        store.apply({"op": "set", "key": "u", "value": "plain"})
+        with self.assertRaises(TypeError):
+            store.hmget("u", ["name"])
+
+    def test_hkeys_hvals_hmget_survive_snapshot_load(self):
+        # The blob is a plain string in _data, so a snapshot
+        # carries it exactly like any other value — and the
+        # names, values, and multi-get read back off the
+        # loaded blob.
+        store = KVStore()
+        store.apply({"op": "hset", "key": "u",
+                     "pairs": [["name", "mo"], ["city", "phl"]]})
+        state = store.items()
+        store2 = KVStore()
+        store2.load(state)
+        self.assertEqual(store2.hkeys("u"), ["city", "name"])
+        self.assertEqual(store2.hvals("u"), ["phl", "mo"])
+        self.assertEqual(store2.hmget("u", ["name", "nope"]),
+                         ["mo", None])
 
     def test_hdel_rejects_malformed_fields(self):
         store = KVStore()
@@ -1324,6 +1426,240 @@ class TestHashCluster(unittest.TestCase):
             err = io.StringIO()
             with contextlib.redirect_stderr(err):
                 rc = client_main(["--node", node, "hexists", "user:1",
+                                  "name"])
+            self.assertEqual(rc, 1)
+            self.assertIn("not a hash", err.getvalue())
+        finally:
+            cluster.stop_all()
+
+    def test_hkeys_hvals_hmget_succeed_and_replicate(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            self.assertEqual(
+                hset(addr, pairs=[["name", "mo"], ["city", "phl"],
+                                  ["age", "22"]]).get("hset"), 3)
+            resp = hkeys(addr)
+            self.assertEqual(resp.get("status"), "ok", resp)
+            self.assertEqual(resp.get("fields"),
+                             ["age", "city", "name"], resp)
+            resp = hvals(addr)
+            self.assertEqual(resp.get("status"), "ok", resp)
+            self.assertEqual(resp.get("values"),
+                             ["22", "phl", "mo"], resp)
+            resp = hmget(addr, fields=["name", "nope", "age"])
+            self.assertEqual(resp.get("status"), "ok", resp)
+            self.assertEqual(resp.get("values"),
+                             ["mo", None, "22"], resp)
+            for node_id in cluster.live:
+                node = cluster.nodes[node_id]
+                self.assertTrue(
+                    wait_for_hgetall(node, "user:1",
+                                     {"name": "mo", "city": "phl",
+                                      "age": "22"}))
+                self.assertEqual(node.sm.hkeys("user:1"),
+                                 ["age", "city", "name"])
+                self.assertEqual(node.sm.hvals("user:1"),
+                                 ["22", "phl", "mo"])
+                self.assertEqual(node.sm.hmget(
+                    "user:1", ["name", "nope", "age"]),
+                    ["mo", None, "22"])
+            # The listings track a delete on every node too.
+            self.assertEqual(hdel(addr, fields=["age"]).get("hdel"), 1)
+            for node_id in cluster.live:
+                node = cluster.nodes[node_id]
+                self.assertTrue(
+                    wait_for_hgetall(node, "user:1",
+                                     {"name": "mo", "city": "phl"}))
+                self.assertEqual(node.sm.hkeys("user:1"),
+                                 ["city", "name"])
+            self.assertEqual(hkeys(addr).get("fields"),
+                             ["city", "name"])
+            self.assertEqual(hvals(addr).get("values"),
+                             ["phl", "mo"])
+            self.assertEqual(hmget(addr, fields=["age", "name"])
+                             .get("values"), [None, "mo"])
+        finally:
+            cluster.stop_all()
+
+    def test_hkeys_hvals_hmget_missing_key_answer_empty(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            self.assertEqual(hkeys(addr).get("fields"), [])
+            self.assertEqual(hvals(addr).get("values"), [])
+            self.assertEqual(hmget(addr, fields=["name", "city"])
+                             .get("values"), [None, None])
+        finally:
+            cluster.stop_all()
+
+    def test_hkeys_hvals_hmget_on_plain_string_are_client_errors(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            self.assertEqual(write(addr).get("status"), "ok")
+            resp = hkeys(addr)
+            self.assertEqual(resp.get("status"), "error", resp)
+            self.assertIn("not a hash", resp.get("error", ""), resp)
+            resp = hvals(addr)
+            self.assertEqual(resp.get("status"), "error", resp)
+            self.assertIn("not a hash", resp.get("error", ""), resp)
+            resp = hmget(addr)
+            self.assertEqual(resp.get("status"), "error", resp)
+            self.assertIn("not a hash", resp.get("error", ""), resp)
+            # The string is still there, untouched.
+            self.assertEqual(client_request(
+                addr, {"type": "client", "op": "get",
+                       "key": "user:1"}).get("value"), "plain")
+        finally:
+            cluster.stop_all()
+
+    def test_hmget_malformed_fields_rejected_with_no_log_entry(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            node = cluster.nodes[leader.id]
+            before = len(node.log)
+            for bad in (None, [], ["name", 2], "name",
+                        ["f"] * 1001):
+                resp = client_request(
+                    addr, {"type": "client", "op": "hmget",
+                           "key": "user:1", "fields": bad})
+                self.assertEqual(resp.get("status"), "error", bad)
+            # Nothing was logged for any of them.
+            self.assertEqual(len(node.log), before)
+        finally:
+            cluster.stop_all()
+
+    def test_hkeys_hvals_hmget_continue_after_leader_change(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            self.assertEqual(
+                hset(addr, pairs=[["name", "mo"]]).get("hset"), 1)
+            self.assertEqual(hkeys(addr).get("fields"), ["name"])
+            cluster.stop_node(leader.id)
+            new_leader = cluster.wait_for_leader()
+            addr = cluster.addrs[new_leader.id]
+            self.assertEqual(
+                hset(addr, pairs=[["city", "phl"]]).get("hset"), 1)
+            self.assertEqual(hkeys(addr).get("fields"),
+                             ["city", "name"])
+            self.assertEqual(hvals(addr).get("values"),
+                             ["phl", "mo"])
+            self.assertEqual(hmget(addr, fields=["name", "city"])
+                             .get("values"), ["mo", "phl"])
+        finally:
+            cluster.stop_all()
+
+    def test_session_hkeys_hvals_hmget_is_read_your_writes(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            with Session(addr) as session:
+                resp = session.hset("user:1", {"name": "mo",
+                                               "city": "phl"})
+                self.assertEqual(resp.get("status"), "ok", resp)
+                self.assertEqual(resp.get("hset"), 2, resp)
+                self.assertGreater(session.last_write_index, 0)
+                self.assertEqual(
+                    session.hkeys("user:1").get("fields"),
+                    ["city", "name"])
+                self.assertEqual(
+                    session.hvals("user:1").get("values"),
+                    ["phl", "mo"])
+                self.assertEqual(
+                    session.hmget("user:1", ["name", "nope"])
+                    .get("values"), ["mo", None])
+                resp = session.hdel("user:1", "city")
+                self.assertEqual(resp.get("status"), "ok", resp)
+                self.assertEqual(resp.get("hdel"), 1, resp)
+                self.assertEqual(
+                    session.hkeys("user:1").get("fields"), ["name"])
+                self.assertEqual(
+                    session.hvals("user:1").get("values"), ["mo"])
+                self.assertEqual(
+                    session.hmget("user:1", ["city", "name"])
+                    .get("values"), [None, "mo"])
+        finally:
+            cluster.stop_all()
+
+    def test_hkeys_hvals_hmget_cli(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            host, port = cluster.addrs[leader.id]
+            node = f"{host}:{port}"
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "hkeys", "user:1"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(out.getvalue()), [])
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "hvals", "user:1"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(out.getvalue()), [])
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "hmget", "user:1",
+                                  "name", "nope"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(out.getvalue()), [None, None])
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "hset", "user:1",
+                                  "name", "mo", "city", "phl"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(out.getvalue().strip(), "2")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "hkeys", "user:1"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(out.getvalue()),
+                             ["city", "name"])
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "hvals", "user:1"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(out.getvalue()),
+                             ["phl", "mo"])
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "hmget", "user:1",
+                                  "name", "nope", "city"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(out.getvalue()),
+                             ["mo", None, "phl"])
+            # A failed hkeys exits 1 and names the failure.
+            self.assertEqual(write(cluster.addrs[leader.id],
+                                   value="plain").get("status"), "ok")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = client_main(["--node", node, "hkeys", "user:1"])
+            self.assertEqual(rc, 1)
+            self.assertIn("not a hash", err.getvalue())
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = client_main(["--node", node, "hvals", "user:1"])
+            self.assertEqual(rc, 1)
+            self.assertIn("not a hash", err.getvalue())
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = client_main(["--node", node, "hmget", "user:1",
                                   "name"])
             self.assertEqual(rc, 1)
             self.assertIn("not a hash", err.getvalue())

@@ -900,6 +900,103 @@ class Session:
                 self.last_read_term = int(resp.get("read_term") or 0)
         return resp
 
+    def hkeys(self, key: str) -> dict:
+        """Ask for every field name in the hash at ``key``,
+        Redis HKEYS: the field names, sorted, an empty list
+        when the key does not exist, and a client error — not
+        a list — when the key holds a plain string. It rides
+        the same ReadIndex path as ``get``, so it carries the
+        same session watermark and advances the read watermark
+        from the reply's ``read_index`` exactly the same way:
+        a field list queried after your own write shows the
+        fields that write set, and a later read never goes
+        backwards past it."""
+        if self.last_read_index > self.last_write_index:
+            min_index = self.last_read_index
+            term = self.last_read_term
+        else:
+            min_index = self.last_write_index
+            term = self.last_write_term
+        msg: dict = {"type": "client", "op": "hkeys", "key": key,
+                     "client_id": self.client_id,
+                     "min_commit_index": min_index,
+                     "session_term": term}
+        resp = request(self.node_addr, msg, pool=self._pooled)
+        if (resp.get("status") == "ok"
+                and resp.get("read_index") is not None):
+            read_index = int(resp["read_index"])
+            if read_index > self.last_read_index:
+                self.last_read_index = read_index
+                self.last_read_term = int(resp.get("read_term") or 0)
+        return resp
+
+    def hvals(self, key: str) -> dict:
+        """Ask for every field value in the hash at ``key``,
+        Redis HVALS: the values, in sorted field order, an
+        empty list when the key does not exist, and a client
+        error — not a list — when the key holds a plain
+        string. The values are aligned with ``hkeys`` — the
+        value at position i is the value of the field at
+        position i in the sorted field list. It rides the same
+        ReadIndex path as ``get``, so it carries the same
+        session watermark and advances the read watermark from
+        the reply's ``read_index`` exactly the same way: a
+        value list queried after your own write shows the
+        values that write set, and a later read never goes
+        backwards past it."""
+        if self.last_read_index > self.last_write_index:
+            min_index = self.last_read_index
+            term = self.last_read_term
+        else:
+            min_index = self.last_write_index
+            term = self.last_write_term
+        msg: dict = {"type": "client", "op": "hvals", "key": key,
+                     "client_id": self.client_id,
+                     "min_commit_index": min_index,
+                     "session_term": term}
+        resp = request(self.node_addr, msg, pool=self._pooled)
+        if (resp.get("status") == "ok"
+                and resp.get("read_index") is not None):
+            read_index = int(resp["read_index"])
+            if read_index > self.last_read_index:
+                self.last_read_index = read_index
+                self.last_read_term = int(resp.get("read_term") or 0)
+        return resp
+
+    def hmget(self, key: str, fields: list[str]) -> dict:
+        """Ask for the values of ``fields`` in the hash at
+        ``key``, Redis HMGET: one value per requested field,
+        aligned with the request — None in a position whose
+        field is not set, and None in every position when the
+        key does not exist — and a client error — not a list —
+        when the key holds a plain string. At most 1000 fields
+        per call, like an hdel batch. It rides the same
+        ReadIndex path as ``get``, so it carries the same
+        session watermark and advances the read watermark from
+        the reply's ``read_index`` exactly the same way: a
+        value list queried after your own write shows the
+        values that write set, and a later read never goes
+        backwards past it."""
+        if self.last_read_index > self.last_write_index:
+            min_index = self.last_read_index
+            term = self.last_read_term
+        else:
+            min_index = self.last_write_index
+            term = self.last_write_term
+        msg: dict = {"type": "client", "op": "hmget", "key": key,
+                     "fields": list(fields),
+                     "client_id": self.client_id,
+                     "min_commit_index": min_index,
+                     "session_term": term}
+        resp = request(self.node_addr, msg, pool=self._pooled)
+        if (resp.get("status") == "ok"
+                and resp.get("read_index") is not None):
+            read_index = int(resp["read_index"])
+            if read_index > self.last_read_index:
+                self.last_read_index = read_index
+                self.last_read_term = int(resp.get("read_term") or 0)
+        return resp
+
     def get(self, key: str) -> dict:
         # The read carries the higher of the two watermarks — the
         # last acknowledged write, or the newest state a previous
@@ -2146,6 +2243,64 @@ def hexists(node_addr: tuple[str, int], key: str, field: str,
                    timeout=timeout)
 
 
+def hkeys(node_addr: tuple[str, int], key: str,
+          timeout: float = 12.0) -> dict:
+    """Ask for every field name in the hash at ``key``,
+    following leader redirects like ``request`` — Redis HKEYS.
+
+    One request serves the field names through the leader's
+    ReadIndex path, so they reflect the committed state as of
+    one read index, exactly as linearizable as a ``get``. The
+    reply is the plain hkeys response (``status`` ``ok`` with
+    ``fields`` — the field names, sorted, an empty list when
+    the key does not exist — plus the ``read_index`` /
+    ``read_term`` it was measured at). A plain string value is
+    a client error, not a list."""
+    return request(node_addr, {"type": "client", "op": "hkeys",
+                               "key": key},
+                   timeout=timeout)
+
+
+def hvals(node_addr: tuple[str, int], key: str,
+          timeout: float = 12.0) -> dict:
+    """Ask for every field value in the hash at ``key``,
+    following leader redirects like ``request`` — Redis HVALS.
+
+    One request serves the values through the leader's ReadIndex
+    path, so they reflect the committed state as of one read
+    index, exactly as linearizable as a ``get``. The reply is
+    the plain hvals response (``status`` ``ok`` with ``values``
+    — the field values, in sorted field order, an empty list
+    when the key does not exist — plus the ``read_index`` /
+    ``read_term`` it was measured at). The values are aligned
+    with ``hkeys`` — the value at position i is the value of
+    the field at position i in the sorted field list. A plain
+    string value is a client error, not a list."""
+    return request(node_addr, {"type": "client", "op": "hvals",
+                               "key": key},
+                   timeout=timeout)
+
+
+def hmget(node_addr: tuple[str, int], key: str,
+          fields: list[str], timeout: float = 12.0) -> dict:
+    """Ask for the values of ``fields`` in the hash at ``key``,
+    following leader redirects like ``request`` — Redis HMGET.
+
+    One request serves the values through the leader's ReadIndex
+    path, so they reflect the committed state as of one read
+    index, exactly as linearizable as a ``get``. The reply is
+    the plain hmget response (``status`` ``ok`` with ``values``
+    — one value per requested field, aligned with the request,
+    None in a position whose field is not set, and None in
+    every position when the key does not exist — plus the
+    ``read_index`` / ``read_term`` it was measured at). At most
+    1000 fields per call. A plain string value is a client
+    error, not a list."""
+    return request(node_addr, {"type": "client", "op": "hmget",
+                               "key": key, "fields": list(fields)},
+                   timeout=timeout)
+
+
 def mset(node_addr: tuple[str, int], pairs: list,
          ttl_entries: int | None = None,
          timeout: float = 12.0) -> dict:
@@ -2767,6 +2922,27 @@ def main(argv: list[str] | None = None) -> int:
              "the key does not exist or the field is not set")
     p_hexists.add_argument("key")
     p_hexists.add_argument("field")
+    p_hkeys = sub.add_parser(
+        "hkeys",
+        help="print every field name in the hash at key as JSON "
+             "([] when the key does not exist)")
+    p_hkeys.add_argument("key")
+    p_hvals = sub.add_parser(
+        "hvals",
+        help="print every field value in the hash at key as JSON, "
+             "in sorted field order ([] when the key does not "
+             "exist)")
+    p_hvals.add_argument("key")
+    p_hmget = sub.add_parser(
+        "hmget",
+        help="print the values of fields in the hash at key as "
+             "JSON, aligned with the requested fields (null per "
+             "missing field, all null when the key does not "
+             "exist)")
+    p_hmget.add_argument("key")
+    p_hmget.add_argument("fields", nargs="+",
+                         help="fields to read: f1 f2 ... "
+                              "(at most 1000 fields)")
     p_add = sub.add_parser("add-server",
                            help="add a server to the cluster (Raft §6)")
     p_add.add_argument("server_id")
@@ -2862,7 +3038,7 @@ def main(argv: list[str] | None = None) -> int:
               "setnx", "getset", "append", "strlen", "getdel",
               "getex", "getrange", "setrange", "setbit", "getbit",
               "pfadd", "pfcount", "hset", "hget", "hdel", "hgetall",
-              "hlen", "hexists",
+              "hlen", "hexists", "hkeys", "hvals", "hmget",
               "setex", "expireat",
               "pexpireat"):
         msg["key"] = args.key
@@ -2966,6 +3142,8 @@ def main(argv: list[str] | None = None) -> int:
         msg["field"] = args.field
     if op == "hdel":
         msg["fields"] = args.fields
+    if op == "hmget":
+        msg["fields"] = args.fields
     if op in ("set", "del", "cas", "mset", "expire", "incr",
               "incrbyfloat", "setnx",
               "getset", "append", "getdel", "getex", "setrange",
@@ -3052,6 +3230,12 @@ def main(argv: list[str] | None = None) -> int:
             print(resp.get("hlen"))
         elif op == "hexists":
             print(resp.get("hexists"))
+        elif op == "hkeys":
+            print(json.dumps(resp.get("fields")))
+        elif op == "hvals":
+            print(json.dumps(resp.get("values")))
+        elif op == "hmget":
+            print(json.dumps(resp.get("values")))
         elif op == "mget":
             print(json.dumps(resp.get("values")))
         elif op == "keys":

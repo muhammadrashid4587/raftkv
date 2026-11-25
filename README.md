@@ -749,6 +749,39 @@ logic and the failure handling, not the key-value API on top.
   hset: a plain `get` on a hash key still returns the encoded
   blob, and there is still no way to list field names without
   their values — that is what hgetall is for.
+- **Hash field and value listings** — since v0.58.0 `hkeys key`
+  (`Session.hkeys(k)`, `client.hkeys(addr, k)`, `hkeys key` on
+  the CLI) answers every field name in the hash at the key,
+  sorted, an empty list when the key does not exist — Redis
+  HKEYS — `hvals key` (`Session.hvals(k)`,
+  `client.hvals(addr, k)`, `hvals key` on the CLI) answers
+  every field value, in sorted field order, an empty list when
+  the key does not exist — Redis HVALS — and `hmget key field
+  [field ...]` (`Session.hmget(k, fields)`,
+  `client.hmget(addr, k, fields)`, `hmget key f1 f2 ...` on the
+  CLI) answers the values of the requested fields, aligned
+  with the request, None per missing field and all None when
+  the key does not exist — Redis HMGET. All three are pure
+  reads: no log entry, no state change, no watch event, and
+  the TTL deadline is untouched — the listings are read off
+  the applied state machine exactly like an hget. A key
+  holding a plain string makes all three a client error, not
+  a list, like an hgetall on a plain string. All three ride
+  the same ReadIndex path as a `get`, so they carry the same
+  session watermark and are exactly as linearizable, and they
+  survive snapshots and replay exactly like any other hash
+  read — the blob is a plain string in the store, so nothing
+  about the encoding changes. The values `hvals` returns are
+  aligned with `hkeys` — the value at position i is the value
+  of the field at position i in the sorted field list — so the
+  two calls together rebuild the map; `hmget` answers in the
+  order the caller asked, not sorted order, and a field
+  repeated in one call is answered once per occurrence, so the
+  reply never shifts after a miss or a repeat, like an mget.
+  At most 1000 fields per hmget, like an hdel batch. Like
+  hget and hgetall they are reads, so they are not pipeline
+  ops. The honest limit is the same encoding as hset: a plain
+  `get` on a hash key still returns the encoded blob.
 - **Key enumeration** — since v0.31.0 one `keys` RPC lists the
   store's keys (`client.keys(prefix, limit, start_after)`,
   `Session.keys(prefix, limit, start_after)`, `keys --prefix p
@@ -1063,7 +1096,7 @@ make test
 # or: python3 -m unittest discover -s tests -v
 ```
 
-466 tests, plus a smoke test for the benchmark script, all passing:
+660 tests, plus a smoke test for the benchmark script, all passing:
 
 | Test | What it proves |
 |---|---|
@@ -3066,6 +3099,44 @@ entries left in `log.jsonl` are dropped by their index on reload.
   follower redirect, continuing after a leader change,
   surviving a snapshot + restart with the count still right,
   session read-your-writes, and the CLI end to end.
+- ~~Hashes (HKEYS / HVALS / HMGET)~~ — done in v0.58.0,
+  Nov 24, 2026: `hkeys key` answers every field name in the
+  hash at the key, sorted, an empty list when the key does not
+  exist — Redis HKEYS — `hvals key` answers every field value,
+  in sorted field order, an empty list when the key does not
+  exist — Redis HVALS — and `hmget key field [field ...]`
+  answers the values of the requested fields, aligned with the
+  request, None per missing field and all None when the key
+  does not exist — Redis HMGET. All three are pure reads: no
+  log entry, no state change, no watch event, and the TTL
+  deadline is untouched — the listings are read off the applied
+  state machine exactly like an hget. A key holding a plain
+  string makes all three a client error, not a list. All three
+  ride the same ReadIndex path as a `get`, so they are exactly
+  as linearizable, and they survive snapshots and replay exactly
+  like any other hash read — the blob is a plain string in the
+  store, so nothing about the encoding changes. The values
+  `hvals` returns are aligned with `hkeys`, so the two calls
+  together rebuild the map; `hmget` answers in the order the
+  caller asked, and a field repeated in one call is answered
+  once per occurrence, so the reply never shifts after a miss
+  or a repeat, like an mget. At most 1000 fields per hmget,
+  like an hdel batch. `Session.hkeys` / `Session.hvals` /
+  `Session.hmget`, `client.hkeys` / `client.hvals` /
+  `client.hmget`, and `hkeys` / `hvals` / `hmget` on the CLI
+  expose them; like hget and hgetall they are reads, so they
+  are not pipeline ops. `tests/test_hash.py` proves them:
+  store-level sorted field names tracking hset and hdel,
+  values aligned with the sorted names and rebuilding the map,
+  hmget answering in requested order with None per missing
+  field and per repeated field, a missing key answering empty
+  on all three, an hkeys, an hvals, and an hmget on a plain
+  string raising, and the listings surviving a snapshot load;
+  replication to every node, a missing key answering empty on
+  the cluster, an hkeys, an hvals, and an hmget on a plain
+  string a client error, malformed hmget fields rejected with
+  no log entry, continuing after a leader change, session
+  read-your-writes, and the CLI end to end.
   The roadmap is exhausted again, so the next real thing is
   a new roadmap item grounded in this project's purpose,
   proposed by the next run.

@@ -1449,6 +1449,63 @@ class KVStore:
                 f"hexists failed: value of {key!r} is not a hash")
         return 1 if field in _hash_fields(value) else 0
 
+    def hkeys(self, key: str) -> list[str]:
+        """Every field name in the hash at ``key``, sorted — an
+        empty list when the key does not exist, Redis HKEYS.
+        Raises TypeError when the value is a plain string: an
+        HKEYS reads a hash, not bytes, so a string key is
+        WRONGTYPE, like an hgetall on a plain string. Pure
+        read: no log entry, no state change. The names come
+        back sorted — the blob is dumped with sorted keys, so
+        the order is a pure function of the fields, and every
+        node applying the same log answers the same order."""
+        value = self._data.get(key)
+        if value is None:
+            return []
+        if not is_hash(value):
+            raise TypeError(
+                f"hkeys failed: value of {key!r} is not a hash")
+        return sorted(_hash_fields(value))
+
+    def hvals(self, key: str) -> list[str]:
+        """Every field value in the hash at ``key``, in sorted
+        field order — an empty list when the key does not exist,
+        Redis HVALS. Raises TypeError when the value is a plain
+        string: an HVALS reads a hash, not bytes, so a string
+        key is WRONGTYPE, like an hkeys on a plain string. Pure
+        read: no log entry, no state change. The values are
+        aligned with ``hkeys`` — the value at position i is the
+        value of the field at position i in the sorted field
+        list — so the two calls together rebuild the map."""
+        value = self._data.get(key)
+        if value is None:
+            return []
+        if not is_hash(value):
+            raise TypeError(
+                f"hvals failed: value of {key!r} is not a hash")
+        fields = _hash_fields(value)
+        return [fields[f] for f in sorted(fields)]
+
+    def hmget(self, key: str, fields: list[str]) -> list[str | None]:
+        """The values of ``fields`` in the hash at ``key``,
+        aligned with the requested order — None in a position
+        whose field is not set, and None in every position when
+        the key does not exist, Redis HMGET. Raises TypeError
+        when the value is a plain string: an HMGET reads a
+        hash, not bytes, so a string key is WRONGTYPE, like an
+        hget on a plain string. Pure read: no log entry, no
+        state change. A field repeated in one call is answered
+        once per occurrence, at its value each time — the reply
+        never shifts after a miss or a repeat, like an mget."""
+        value = self._data.get(key)
+        if value is None:
+            return [None] * len(fields)
+        if not is_hash(value):
+            raise TypeError(
+                f"hmget failed: value of {key!r} is not a hash")
+        stored = _hash_fields(value)
+        return [stored.get(f) for f in fields]
+
     def getbit(self, key: str, offset: int) -> int:
         """The bit at ``offset`` in the string value at ``key``,
         Redis GETBIT: bit 0 is the most significant bit of the
