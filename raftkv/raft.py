@@ -3837,7 +3837,12 @@ class RaftNode:
             # nothing to re-read. The count, when one is given, is
             # a non-negative integer (a bool is not one), and
             # ``noack`` is a bare flag: deliver without recording
-            # the entries pending. ``block`` waits that many
+            # the entries pending. ``claim`` is a non-negative
+            # integer number of milliseconds: a ">" read first
+            # claims the pending entries idle at least that long
+            # — Redis 8.4's XREADGROUP CLAIM — and with any other
+            # ID it is validated here and then ignored, like
+            # Redis. ``block`` waits that many
             # milliseconds for a new entry when the group has
             # nothing to hand out yet — 0 waits up to the server's
             # WATCH_MAX_TIMEOUT cap, like a watch — and is only
@@ -3892,6 +3897,17 @@ class RaftNode:
                             "error": "xreadgroup NOACK takes no "
                                      "argument"}
                 command["noack"] = True
+            claim_min_idle_ms = msg.get("claim_min_idle_ms")
+            if claim_min_idle_ms is not None and (
+                    not isinstance(claim_min_idle_ms, int)
+                    or isinstance(claim_min_idle_ms, bool)
+                    or claim_min_idle_ms < 0):
+                return {"type": "client_response", "status": "error",
+                        "error": "xreadgroup claim must be a "
+                                 "non-negative integer number of "
+                                 "milliseconds"}
+            if claim_min_idle_ms is not None:
+                command["claim_min_idle_ms"] = claim_min_idle_ms
             block = msg.get("block")
             if block is not None and (
                     not isinstance(block, int)
@@ -4569,7 +4585,8 @@ class RaftNode:
                                 or dedup_key in self._dedup_inflight))
             if not already:
                 timed_out = self._wait_for_xreadgroup_block(
-                    key, group, count, xreadgroup_block_ms)
+                    key, group, count, xreadgroup_block_ms,
+                    command.get("claim_min_idle_ms"))
                 if timed_out is None:
                     return self._redirect()
         result = self._submit_write(command)
@@ -4581,9 +4598,20 @@ class RaftNode:
 
     def _wait_for_xreadgroup_block(self, key: str, group: str,
                                    count: int | None,
-                                   block_ms: int) -> bool | None:
+                                   block_ms: int,
+                                   claim_min_idle_ms: int | None = None
+                                   ) -> bool | None:
         """Wait for a ``">"`` xreadgroup to have something to hand
-        out — the entries appended after the group's last delivery.
+        out — the entries appended after the group's last delivery,
+        or, with a claim, the pending entries idle long enough to
+        claim — so a blocked CLAIM read answers at once when idle
+        entries are already there. An entry that crosses the idle
+        threshold mid-wait does not wake the wait — there is no
+        wakeup timer for the threshold, only the watch on stream
+        changes — so a blocked CLAIM read in a quiet stream waits
+        out its block and then claims whatever is idle at apply
+        time, instead of waking the moment an entry becomes
+        claimable, like Redis 8.4's wakeup does.
 
         Returns True when the wait expired with no change to the
         stream (the caller still submits the write, which answers
@@ -4609,7 +4637,9 @@ class RaftNode:
             term = self.current_term
             if self.role != "leader":
                 return None
-            peeked = self.sm.xreadgroup_peek(key, group, count)
+            peeked = self.sm.xreadgroup_peek(
+                key, group, count, claim_min_idle_ms,
+                int(time.time() * 1000))
             if peeked is None or peeked:
                 # No such key or group (or a plain string): no entry
                 # can ever make this group deliverable — the write
@@ -4633,7 +4663,9 @@ class RaftNode:
             with self.lock:
                 if self.role != "leader" or self.current_term != term:
                     return None
-                peeked = self.sm.xreadgroup_peek(key, group, count)
+                peeked = self.sm.xreadgroup_peek(
+                    key, group, count, claim_min_idle_ms,
+                    int(time.time() * 1000))
                 if peeked is None or peeked:
                     return False
             deadline = time.monotonic() + wait_s

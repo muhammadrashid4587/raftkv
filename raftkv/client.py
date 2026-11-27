@@ -1131,7 +1131,8 @@ class Session:
     def xreadgroup(self, key: str, group: str, consumer: str,
                    id: str = ">", count: int | None = None,
                    noack: bool = False,
-                   block: int | None = None) -> dict:
+                   block: int | None = None,
+                   claim_min_idle_ms: int | None = None) -> dict:
         """Read entries for one consumer of one group on the
         stream at ``key``, Redis XREADGROUP: with ``id`` ">" (the
         default) the group hands the consumer the entries appended
@@ -1153,14 +1154,26 @@ class Session:
         waits up to the server's 25s cap, like a watch — and the
         reply then carries ``timed_out`` when the wait expired
         with no new entry; with any other ID the block is ignored
-        and the read answers at once, like Redis. The reply
-        carries ``entries`` — the [id, {field: value}] pairs in ID
-        order, an empty list when the group has nothing for this
-        consumer. A missing key or group fails with
-        ``xreadgroup_failed`` and reason ``no_group``, and a plain
-        string value fails with reason ``wrongtype``. A bad group,
-        consumer, ID, count, or block never goes on the wire and
-        returns the server's error shape instead. This is a write,
+        and the read answers at once, like Redis.
+        ``claim_min_idle_ms`` — Redis 8.4's XREADGROUP CLAIM —
+        first claims the pending entries idle at least that many
+        milliseconds, from any consumer, longest idle first,
+        moving them to this consumer, and then reads new entries;
+        COUNT is one shared budget across the claim and the new
+        entries, and the reply carries ``claimed`` — one dict per
+        claimed entry, with its idle at claim time and how many
+        times it had been delivered before — alongside
+        ``entries``, claimed first, then new. With an explicit ID
+        the claim is ignored, like Redis, and NOACK does not apply
+        to claimed entries: the transfer of ownership is the
+        point, so they stay pending, now held by this consumer.
+        The reply carries ``entries`` — the [id, {field: value}]
+        pairs in ID order, an empty list when the group has
+        nothing for this consumer. A missing key or group fails
+        with ``xreadgroup_failed`` and reason ``no_group``, and a
+        plain string value fails with reason ``wrongtype``. A bad
+        group, consumer, ID, count, block, or claim never goes on
+        the wire and returns the server's error shape instead. This is a write,
         not a read: handing entries out mutates the pending list
         and the last delivery, and the mutation replicates through
         the log like any other, so a retry with the same session
@@ -1197,6 +1210,14 @@ class Session:
                     "error": "xreadgroup block must be a "
                              "non-negative integer number of "
                              "milliseconds"}
+        if claim_min_idle_ms is not None and (
+                not isinstance(claim_min_idle_ms, int)
+                or isinstance(claim_min_idle_ms, bool)
+                or claim_min_idle_ms < 0):
+            return {"type": "client_response", "status": "error",
+                    "error": "xreadgroup claim must be a "
+                             "non-negative integer number of "
+                             "milliseconds"}
         msg: dict = {"type": "client", "op": "xreadgroup",
                      "key": key, "group": group,
                      "consumer": consumer, "id": id}
@@ -1206,6 +1227,8 @@ class Session:
             msg["noack"] = True
         if block is not None:
             msg["block"] = block
+        if claim_min_idle_ms is not None:
+            msg["claim_min_idle_ms"] = claim_min_idle_ms
         # A blocking readgroup waits on the server up to block ms
         # (0 waits up to the server's 25s cap), so the request
         # timeout must outlast the wait — plus headroom for the
@@ -2904,12 +2927,14 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
                                        "MKSTREAM takes no argument"}
             msg["mkstream"] = True
     if name == "xreadgroup":
-        # ``group``, ``consumer``, ``id``, ``count``, and ``noack``
-        # ride along with a pipelined xreadgroup, validated here
+        # ``group``, ``consumer``, ``id``, ``count``, ``noack``,
+        # and ``claim_min_idle_ms`` ride along with a pipelined
+        # xreadgroup, validated here
         # so a malformed one never goes on the wire: non-empty
         # string group and consumer, an ID of ">", "0", a bare
         # millisecond, or a full "ms-seq", a non-negative integer
-        # count when one is given, and a bare ``noack`` flag —
+        # count when one is given, a bare ``noack`` flag, and a
+        # non-negative integer claim when one is given —
         # the same shapes the server enforces. ``block`` does not
         # ride along: a blocking read would stall the whole
         # pipeline batch waiting on one op, so a pipelined
@@ -2963,6 +2988,18 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
                               "error": "pipeline xreadgroup NOACK "
                                        "takes no argument"}
             msg["noack"] = True
+        claim_min_idle_ms = op.get("claim_min_idle_ms")
+        if claim_min_idle_ms is not None and (
+                not isinstance(claim_min_idle_ms, int)
+                or isinstance(claim_min_idle_ms, bool)
+                or claim_min_idle_ms < 0):
+            return None, {"type": "client_response",
+                          "status": "error",
+                          "error": "pipeline xreadgroup claim must "
+                                   "be a non-negative integer number "
+                                   "of milliseconds"}
+        if claim_min_idle_ms is not None:
+            msg["claim_min_idle_ms"] = claim_min_idle_ms
         if op.get("block") is not None:
             return None, {"type": "client_response",
                           "status": "error",
@@ -4092,6 +4129,7 @@ def xreadgroup(node_addr: tuple[str, int], key: str, group: str,
                consumer: str, id: str = ">",
                count: int | None = None, noack: bool = False,
                block: int | None = None,
+               claim_min_idle_ms: int | None = None,
                timeout: float | None = None) -> dict:
     """Read entries for one consumer of one group on the stream at
     ``key``, following leader redirects like ``request`` — Redis
@@ -4128,7 +4166,16 @@ def xreadgroup(node_addr: tuple[str, int], key: str, group: str,
     attempt's entries instead of delivering them twice.
     ``timeout`` defaults to 12s, or the block plus 10s headroom
     when a block is given, so a blocking readgroup is never cut
-    off by its own client timeout."""
+    off by its own client timeout. ``claim_min_idle_ms`` — Redis
+    8.4's XREADGROUP CLAIM — first claims the pending entries idle
+    at least that many milliseconds, from any consumer, longest
+    idle first, moving them to this consumer, and then reads new
+    entries; COUNT is one shared budget across the claim and the
+    new entries, and the reply carries ``claimed`` — one dict per
+    claimed entry, with its idle at claim time and how many times
+    it had been delivered before — alongside ``entries``, claimed
+    first, then new. With an explicit ID the claim is ignored,
+    like Redis, and NOACK does not apply to claimed entries."""
     if not isinstance(group, str) or not group:
         return {"type": "client_response", "status": "error",
                 "error": "xreadgroup group must be a non-empty "
@@ -4152,6 +4199,14 @@ def xreadgroup(node_addr: tuple[str, int], key: str, group: str,
         return {"type": "client_response", "status": "error",
                 "error": "xreadgroup block must be a non-negative "
                          "integer number of milliseconds"}
+    if claim_min_idle_ms is not None and (
+            not isinstance(claim_min_idle_ms, int)
+            or isinstance(claim_min_idle_ms, bool)
+            or claim_min_idle_ms < 0):
+        return {"type": "client_response", "status": "error",
+                "error": "xreadgroup claim must be a "
+                         "non-negative integer number of "
+                         "milliseconds"}
     msg: dict = {"type": "client", "op": "xreadgroup",
                  "key": key, "group": group, "consumer": consumer,
                  "id": id}
@@ -4161,6 +4216,8 @@ def xreadgroup(node_addr: tuple[str, int], key: str, group: str,
         msg["noack"] = True
     if block is not None:
         msg["block"] = block
+    if claim_min_idle_ms is not None:
+        msg["claim_min_idle_ms"] = claim_min_idle_ms
     if timeout is None:
         timeout = 12.0
         if block is not None:
@@ -5647,6 +5704,12 @@ def main(argv: list[str] | None = None) -> int:
                                    "for a new entry when a \">\" read "
                                    "has nothing to hand out yet (0 "
                                    "waits up to the server's 25s cap)")
+    p_xreadgroup.add_argument("--claim", type=int, default=None,
+                              help="with \">\" only, first claim the "
+                                   "pending entries idle at least "
+                                   "this many milliseconds, longest "
+                                   "idle first, then read new entries "
+                                   "(COUNT is one shared budget)")
     p_xreadgroup.add_argument("--client-id", default=None,
                               help="session id for at-most-once writes: a "
                                    "retry with the same client id + request "
@@ -6224,6 +6287,8 @@ def main(argv: list[str] | None = None) -> int:
             msg["noack"] = True
         if args.block is not None:
             msg["block"] = args.block
+        if args.claim is not None:
+            msg["claim_min_idle_ms"] = args.claim
     if op == "xack":
         msg["group"] = args.group
         msg["ids"] = args.ids

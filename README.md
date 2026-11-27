@@ -965,7 +965,23 @@ logic and the failure handling, not the key-value API on top.
   XPENDING is not one. The honest limits are the same growth as
   xadd — the whole stream is one blob, so a readgroup still scans
   the blob — and the scope: XTRIM's ACKED mode behaves like
-  KEEPREF in this version.
+  KEEPREF in this version. Since v0.76.0 a ">" readgroup may carry
+  CLAIM — Redis 8.4's XREADGROUP CLAIM,
+  `xreadgroup key group consumer [--claim min-idle-ms]` — which
+  first claims the pending entries idle at least that long, from
+  any consumer, longest idle first, and then reads new entries:
+  COUNT is one shared budget across the claim and the new entries,
+  and the reply carries `claimed` — one dict per claimed entry,
+  with its idle at claim time and how many times it had been
+  delivered before — alongside `entries`, claimed first, then new.
+  With an explicit ID the claim is ignored, like Redis, and NOACK
+  does not apply to claimed entries. A blocked CLAIM read answers
+  at once when idle entries are already there to claim, but an
+  entry that crosses the idle threshold mid-BLOCK does not wake
+  the wait — there is no wakeup timer for the threshold, only the
+  watch on stream changes — so it waits out its block and then
+  claims whatever is idle at apply time, instead of waking the
+  moment an entry becomes claimable, like Redis 8.4's wakeup does.
 - **Streams (XAUTOCLAIM)** — since v0.73.0
   `xautoclaim key group consumer min-idle-ms [start] [--count n]
   [--justid]` is XAUTOCLAIM — claiming pending entries in bulk
@@ -1646,7 +1662,7 @@ make test
 # or: python3 -m unittest discover -s tests -v
 ```
 
-893 tests, plus a smoke test for the benchmark script, all passing:
+915 tests, plus a smoke test for the benchmark script, all passing:
 
 | Test | What it proves |
 |---|---|
@@ -4392,8 +4408,58 @@ entries left in `log.jsonl` are dropped by their index on reload.
   ever saw the entries a second time — the count says one
   delivery, not two — so a reaper judging by delivery count alone
   undercounts the attempts.
+- ~~Streams (XREADGROUP CLAIM)~~ — done in v0.76.0,
+  Nov 27, 2026: a ">" read may carry CLAIM — Redis 8.4's
+  XREADGROUP CLAIM, `xreadgroup key group consumer [--claim
+  min-idle-ms]` — which first claims the pending entries idle at
+  least that long, from any consumer, longest idle first, moving
+  each one to the reading consumer, raising its delivery count by
+  one, and re-stamping its delivery time, like an xclaim inline
+  in the read, and then reads new entries: COUNT is one shared
+  budget across the claim and the new entries, so a claim that
+  fills it leaves no room for new ones, and the reply carries
+  `claimed` — one dict per claimed entry, with its idle at claim
+  time and how many times it had been delivered before —
+  alongside `entries`, claimed first, then new, like Redis. With
+  an explicit ID the claim is ignored, like Redis, and NOACK does
+  not apply to claimed entries: the transfer of ownership is the
+  point, so they stay pending, now held by this consumer. A
+  blocked CLAIM read answers at once when idle entries are
+  already there to claim — the BLOCK wait peeks them too — and a
+  claim that takes nothing writes nothing at all. An entry with no
+  provable idle — its deliveries all came from replays of
+  pre-v0.71.0 log entries and so carries no stamp — is skipped,
+  like an xclaim without FORCE, and one whose data was trimmed
+  away under KEEPREF is skipped too, like an xclaim on it. It
+  rides the same write path as any other readgroup — group-commit
+  batching, dedup (a retry with the same session id returns the
+  first attempt's entries instead of claiming twice), the
+  response's log index advancing a session's watermark — and
+  `{"op": "xreadgroup", "key": k, "group": g, "consumer": c,
+  "claim_min_idle_ms": n}` is a pipeline op too. `Session`,
+  `client`, and the CLI (`--claim`) expose it.
+  `tests/test_xreadgroup_claim.py` proves it: store-level the
+  claim moving entries with exact idle times from fixed stamps,
+  longest idle first, the shared COUNT budget, too-fresh and
+  unstamped entries skipped, the claim ignored for an explicit-ID
+  read, NOACK still recording claimed entries, a trimmed KEEPREF
+  entry skipped, claim 0 taking everything, and bad claims
+  rejected; and cluster-level the claim replicated to every node,
+  the shared budget live, a dedup retry claiming once, a blocked
+  CLAIM read answering at once, a pipelined claim, snapshot +
+  restart survival, the module function from a follower, and the
+  CLI end to end. The honest limit is the wait itself: an entry
+  that crosses the idle threshold mid-BLOCK does not wake the
+  wait — there is no wakeup timer for the threshold, only the
+  watch on stream changes — so a blocked CLAIM read in a quiet
+  stream waits out its block and then claims whatever is idle at
+  apply time, instead of waking the moment an entry becomes
+  claimable, like Redis 8.4's wakeup does. (The earlier roadmap
+  note called this Redis 7.2's CLAIM; the option actually landed
+  in Redis 8.4.)
   The roadmap is exhausted again, so the next real thing is
   a new roadmap item grounded in this project's purpose,
-  proposed by the next run — candidate: XREADGROUP CLAIM, claiming
-  idle pending entries inline during a read, Redis 7.2's CLAIM
-  option.
+  proposed by the next run — candidate: multi-stream XREADGROUP /
+  XREAD, one call reading across several streams, which is the
+  remaining gap between this store's single-key reads and
+  Redis's.
