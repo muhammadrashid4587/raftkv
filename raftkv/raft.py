@@ -1490,7 +1490,7 @@ class RaftNode:
                 # The apply result matters for set, CAS, expire,
                 # expireat, pexpireat, incr, incrbyfloat, setnx,
                 # getset, append, getdel, setrange, getex, setbit,
-                # bitop, pfadd, hset, hdel, geoadd, and xadd:
+                # bitop, pfadd, hset, hdel, geoadd, xadd, and xtrim:
                 # their outcome is decided here, at this exact point
                 # in the log, so the result is recorded in the dedup
                 # table
@@ -1722,12 +1722,34 @@ class RaftNode:
                                       self.sm.get(entry["command"]["key"]),
                                       "set",
                                       index=self.last_applied)
+                elif (op == "xtrim" and result is not None
+                        and result.get("status") == "ok"
+                        and result.get("xtrim", 0) > 0):
+                    # A successful xtrim that removed entries fires
+                    # like the change it made: a ``del`` when the
+                    # trim took the key with it, a ``set`` with the
+                    # new (stream blob) value while entries remain.
+                    # An xtrim that removed nothing — a missing key
+                    # or a threshold past every entry — changed
+                    # nothing, so it fires nothing, like a failed
+                    # hset — and a failed xtrim wrote nothing
+                    # either.
+                    if result.get("deleted"):
+                        self.watch.notify(entry["command"]["key"],
+                                          None, "del",
+                                          index=self.last_applied)
+                    else:
+                        self.watch.notify(
+                            entry["command"]["key"],
+                            self.sm.get(entry["command"]["key"]),
+                            "set",
+                            index=self.last_applied)
                 if (op in ("set", "cas", "expire", "expireat",
                            "pexpireat",
                            "incr", "incrbyfloat", "setnx", "getset",
                            "append", "getdel", "setrange", "getex",
                            "setbit", "bitop", "pfadd", "hset", "hdel",
-                           "geoadd", "xadd")
+                           "geoadd", "xadd", "xtrim")
                         and result is not None
                         and self.role == "leader"):
                     # Record the outcome only when a local waiter is
@@ -1782,7 +1804,7 @@ class RaftNode:
         for CAS, expire, expireat,
         pexpireat, incr, incrbyfloat, setnx,
         getset, append, getdel, setrange, getex, setbit, bitop,
-        pfadd, hset, hdel, geoadd, and xadd
+        pfadd, hset, hdel, geoadd, xadd, and xtrim
         it is the
         apply-time outcome (success, mismatch, or missing key for a
         CAS; 1 or 0 for an expire; 1 or 0 for an expireat /
@@ -1799,7 +1821,8 @@ class RaftNode:
         newly added fields, or wrongtype for an hset; the count
         of removed fields, or wrongtype for an hdel; the count of
         newly added members, or wrongtype for a geoadd; the entry
-        ID, or wrongtype / id_not_greater for an xadd), so a
+        ID, or wrongtype / id_not_greater for an xadd; the count
+        of removed entries, or wrongtype for an xtrim), so a
         retry returns the first
         attempt's exact result. The result also carries the log
         index and term of the entry that produced it: a retried write
@@ -2572,7 +2595,7 @@ class RaftNode:
                       "hlen", "hexists", "hkeys", "hvals", "hmget",
                       "hscan",
                       "geoadd", "geodist",
-                      "xadd", "xlen", "xrange",
+                      "xadd", "xtrim", "xlen", "xrange",
                       "setex") \
                 or key is None:
             return {"type": "client_response", "status": "error",
@@ -2585,7 +2608,7 @@ class RaftNode:
                              "pfadd/pfcount/hset/hget/hdel/hgetall/"
                              "hlen/hexists/hkeys/hvals/hmget/hscan/"
                              "geoadd/geodist/"
-                             "xadd/xlen/xrange/"
+                             "xadd/xtrim/xlen/xrange/"
                              "setex "
                              "with a key"}
         if self._is_removed():
@@ -3357,6 +3380,80 @@ class RaftNode:
                     return {"type": "client_response", "status": "error",
                             "error": "xadd id must be greater than 0-0"}
                 command["id"] = id_str
+        if op == "xtrim":
+            # Trim a stream from the front, Redis XTRIM: the
+            # strategy is MAXLEN (keep at most ``threshold``
+            # entries, the newest ones) or MINID (drop every entry
+            # with an ID below ``threshold``), and the threshold
+            # is a non-negative integer for MAXLEN, a bound a
+            # range bound can parse ("-", "+", a bare millisecond,
+            # or "ms-seq") for MINID — a malformed strategy or
+            # threshold is a client error, not a log entry.
+            # Whether the key holds a stream (and how many entries
+            # go) is decided at apply time, like a CAS, not here.
+            # ``approximate`` ("~" in Redis) asks for approximate
+            # trimming: this store trims exactly, so the flag is
+            # recorded and ignored — accepting it keeps a client
+            # that passes "~" working instead of failing on a
+            # distinction the store does not make. ``mode`` is
+            # KEEPREF, DELREF, or ACKED when one is given: those
+            # govern consumer-group references, and there are no
+            # consumer groups yet, so the mode is recorded and
+            # ignored too.
+            strategy = msg.get("strategy")
+            if (not isinstance(strategy, str)
+                    or strategy.upper() not in ("MAXLEN", "MINID")):
+                return {"type": "client_response", "status": "error",
+                        "error": "xtrim strategy must be \"MAXLEN\" "
+                                 "or \"MINID\""}
+            strategy = strategy.upper()
+            command["strategy"] = strategy
+            threshold = msg.get("threshold")
+            if strategy == "MAXLEN":
+                if (not isinstance(threshold, int)
+                        or isinstance(threshold, bool)
+                        or threshold < 0):
+                    return {"type": "client_response",
+                            "status": "error",
+                            "error": "xtrim MAXLEN threshold must be "
+                                     "a non-negative integer"}
+            else:
+                if not isinstance(threshold, str):
+                    return {"type": "client_response",
+                            "status": "error",
+                            "error": "xtrim MINID threshold must be "
+                                     "a string"}
+                parts = threshold.split("-")
+                if (threshold in ("-", "+")
+                        or (len(parts) in (1, 2)
+                            and parts[0].isdigit()
+                            and int(parts[0]) <= STREAM_ID_MAX
+                            and (len(parts) == 1
+                                 or parts[1].isdigit()
+                                 and int(parts[1]) <= STREAM_ID_MAX))):
+                    pass
+                else:
+                    return {"type": "client_response",
+                            "status": "error",
+                            "error": "xtrim MINID threshold must be "
+                                     "\"-\", \"+\", \"ms\", or \"ms-seq\""}
+            command["threshold"] = threshold
+            approximate = msg.get("approximate")
+            if approximate is not None and approximate is not True:
+                return {"type": "client_response", "status": "error",
+                        "error": "xtrim approximate takes no argument"}
+            if approximate:
+                command["approximate"] = True
+            mode = msg.get("mode")
+            if mode is not None:
+                if (not isinstance(mode, str)
+                        or mode.upper() not in ("KEEPREF", "DELREF",
+                                                "ACKED")):
+                    return {"type": "client_response",
+                            "status": "error",
+                            "error": "xtrim mode must be \"KEEPREF\", "
+                                     "\"DELREF\", or \"ACKED\""}
+                command["mode"] = mode.upper()
         if op == "setex":
             # Set a key with a wall-clock TTL, Redis SETEX: the
             # value is required, like a set's — a setex with no

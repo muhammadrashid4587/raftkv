@@ -218,12 +218,15 @@ def geo_distance(lon1: float, lat1: float, lon2: float,
 # the encoding is a pure function of the entries and every node
 # applying the same log computes the same bytes. A plain `get` on
 # a stream key returns the encoded blob, not an entry, exactly as
-# it does for a hash key. The honest limit is the growth itself:
-# there is no MAXLEN trimming yet, so a stream grows without
-# bound — every entry stays in the one blob, and the blob rides
-# every snapshot and replay whole. XRANGE / XLEN (v0.64.0) read
-# the entries back; XREAD (v0.65.0) reads the entries appended
-# after one ID per stream, blocking for new ones when asked.
+# it does for a hash key. XTRIM (v0.66.0) trims the entries from
+# the front — MAXLEN keeps at most N, MINID drops every entry
+# below an ID — and the top ID ("last") never moves when entries
+# are trimmed, so an xadd after a trim still refuses an ID at or
+# below the old top; trimming the last entry deletes the key,
+# like an hdel that removes the last field. XRANGE / XLEN
+# (v0.64.0) read the entries back; XREAD (v0.65.0) reads the
+# entries appended after one ID per stream, blocking for new ones
+# when asked.
 STREAM_PREFIX = "\x00raftkv-stream\x00"
 
 # Largest number of fields one ``xadd`` may carry. The pairs ride
@@ -1799,6 +1802,100 @@ class KVStore:
             self._data[key] = _stream_value(stream)
             return {"type": "client_response", "status": "ok",
                     "xadd": new_id}
+        elif op == "xtrim":
+            # Trim a stream from the front, Redis XTRIM: MAXLEN
+            # keeps at most ``threshold`` entries (the newest
+            # ones), MINID drops every entry with an ID below
+            # ``threshold``. The reply carries ``xtrim`` — the
+            # number of entries removed. A missing key answers 0
+            # and writes nothing, like an expire on a missing key
+            # — the entry still committed, it just had nothing to
+            # trim. A key holding a plain string fails with
+            # WRONGTYPE, like an xadd — an xtrim must not parse
+            # bytes as entries — and writes nothing at all. The
+            # outcome is decided here, at this exact point in the
+            # log, like a CAS, so a retry with the same session
+            # id returns the first attempt's count instead of
+            # trimming twice. The top ID ("last") never moves:
+            # trimming removes entries, it does not rewind the
+            # stream, so an xadd after a trim still refuses an ID
+            # at or below the old top — and a trim that empties
+            # the stream deletes the key outright, deadline and
+            # all, like an hdel that removes the last field, so
+            # a later xadd starts a fresh stream — the old top is
+            # forgotten with the key, exactly as Redis forgets it
+            # once the stream is gone. A successful xtrim
+            # keeps the key's deadline when entries remain, like
+            # an xadd: it is an update of the value, not a fresh
+            # set. The ``approximate`` flag ("~" in Redis) is
+            # accepted and ignored — this store trims exactly,
+            # since there is no radix tree whose nodes need a
+            # visit budget — and the ``mode`` (KEEPREF / DELREF /
+            # ACKED) is accepted and ignored too: those govern
+            # consumer-group references, and there are no
+            # consumer groups yet, so no entry carries one. The
+            # strategy and threshold were validated on the leader
+            # before the entry was logged (MAXLEN with a
+            # non-negative integer threshold, MINID with a bound
+            # a range bound can parse), so by apply time they
+            # are well-formed — a hand-built log entry with a bad
+            # strategy or threshold still raises rather than
+            # silently trimming nonsense.
+            key = command["key"]
+            strategy = command.get("strategy")
+            threshold = command.get("threshold")
+            if strategy not in ("MAXLEN", "MINID"):
+                raise ValueError(
+                    "xtrim strategy must be \"MAXLEN\" or \"MINID\"")
+            if strategy == "MAXLEN":
+                if (not isinstance(threshold, int)
+                        or isinstance(threshold, bool)
+                        or threshold < 0):
+                    raise ValueError(
+                        "xtrim MAXLEN threshold must be a "
+                        "non-negative integer")
+            else:
+                if not isinstance(threshold, str):
+                    raise ValueError(
+                        "xtrim MINID threshold must be a string")
+                min_id = parse_stream_range_bound(threshold)
+            current = self._data.get(key)
+            if current is None:
+                return {"type": "client_response", "status": "ok",
+                        "xtrim": 0}
+            if not is_stream(current):
+                return {"type": "client_response",
+                        "status": "xtrim_failed",
+                        "reason": "wrongtype",
+                        "current": current,
+                        "error": "xtrim failed: value of "
+                                 f"{key!r} is not a stream"}
+            stream = _stream_data(current)
+            entries = stream["entries"]
+            if strategy == "MAXLEN":
+                removed = max(0, len(entries) - threshold)
+                kept = entries[removed:]
+            else:
+                removed = 0
+                for entry_id, _fields in entries:
+                    if parse_stream_id(entry_id) < min_id:
+                        removed += 1
+                    else:
+                        break
+                kept = entries[removed:]
+            if not kept:
+                del self._data[key]
+                idx = bisect.bisect_left(self._keys, key)
+                if idx < len(self._keys) and self._keys[idx] == key:
+                    del self._keys[idx]
+                self._expiry.pop(key, None)
+                self._wall_expiry.pop(key, None)
+                return {"type": "client_response", "status": "ok",
+                        "xtrim": removed, "deleted": True}
+            stream["entries"] = kept
+            self._data[key] = _stream_value(stream)
+            return {"type": "client_response", "status": "ok",
+                    "xtrim": removed}
         elif op == "setrange":
             # Overwrite part of a string value, Redis SETRANGE:
             # starting at ``offset``, replace as many characters

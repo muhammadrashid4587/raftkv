@@ -132,7 +132,7 @@ class Session:
                     "setrange_failed", "setbit_failed",
                     "bitop_failed",
                     "pfadd_failed", "hset_failed", "hdel_failed",
-                    "geoadd_failed", "xadd_failed")
+                    "geoadd_failed", "xadd_failed", "xtrim_failed")
                 and resp.get("index") is not None):
             self.last_write_index = int(resp["index"])
             self.last_write_term = int(resp.get("term") or 0)
@@ -1016,6 +1016,67 @@ class Session:
                 self.last_read_term = int(resp.get("read_term") or 0)
         return resp
 
+    def xtrim(self, key: str, strategy: str, threshold,
+              approximate: bool = False,
+              mode: str | None = None) -> dict:
+        """Trim the stream at ``key`` from the front, Redis XTRIM:
+        ``strategy`` is "MAXLEN" (keep at most ``threshold``
+        entries, the newest ones — ``threshold`` a non-negative
+        integer) or "MINID" (drop every entry with an ID below
+        ``threshold`` — a bound a range bound can parse: "-",
+        "+", a bare millisecond, or "ms-seq"), and the reply
+        carries ``xtrim`` — the number of entries removed, 0 when
+        the key does not exist or nothing fell below the bound.
+        ``approximate`` ("~" in Redis) is accepted and ignored —
+        this store trims exactly — and ``mode`` is KEEPREF, DELREF,
+        or ACKED when one is given: those govern consumer-group
+        references, and there are no consumer groups yet, so the
+        mode is accepted and ignored too. A bad strategy,
+        threshold, or mode never goes on the wire and returns the
+        server's error shape instead. The outcome is decided at
+        apply time, at the entry's position in the log, so a retry
+        with the same session id returns the first attempt's count
+        instead of trimming twice, and a successful xtrim keeps
+        the key's TTL deadline when entries remain, like an xadd.
+        A plain string value fails with ``xtrim_failed`` and
+        reason ``wrongtype`` instead of writing, and a trim that
+        empties the stream deletes the key, like an hdel that
+        removes the last field. A successful xtrim advances the
+        write watermark from the reply's index, like any other
+        write — and so does a failed one, since it still committed
+        its entry."""
+        if (not isinstance(strategy, str)
+                or strategy.upper() not in ("MAXLEN", "MINID")):
+            return {"type": "client_response", "status": "error",
+                    "error": "xtrim strategy must be \"MAXLEN\" "
+                             "or \"MINID\""}
+        strategy = strategy.upper()
+        if strategy == "MAXLEN":
+            if (not isinstance(threshold, int)
+                    or isinstance(threshold, bool)
+                    or threshold < 0):
+                return {"type": "client_response", "status": "error",
+                        "error": "xtrim MAXLEN threshold must be a "
+                                 "non-negative integer"}
+        else:
+            if not isinstance(threshold, str):
+                return {"type": "client_response", "status": "error",
+                        "error": "xtrim MINID threshold must be "
+                                 "a string"}
+        if mode is not None and (
+                not isinstance(mode, str)
+                or mode.upper() not in ("KEEPREF", "DELREF", "ACKED")):
+            return {"type": "client_response", "status": "error",
+                    "error": "xtrim mode must be \"KEEPREF\", "
+                             "\"DELREF\", or \"ACKED\""}
+        msg: dict = {"type": "client", "op": "xtrim", "key": key,
+                     "strategy": strategy, "threshold": threshold}
+        if approximate:
+            msg["approximate"] = True
+        if mode is not None:
+            msg["mode"] = mode.upper()
+        return self._write(msg)
+
     def pfadd(self, key: str, *elements: str) -> dict:
         """Add ``elements`` to the HyperLogLog at ``key``, Redis
         PFADD: each element hashes into one of 16384 registers
@@ -1714,6 +1775,11 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
     ``xadd`` a string key, a non-empty list of at most 1000
     [field, value] string pairs, and an ID — "*" to auto-generate,
     "ms-seq" explicit, or "ms-*" for an auto sequence —
+    ``xtrim`` a string key, a strategy that is MAXLEN or MINID,
+    and a threshold — a non-negative integer for MAXLEN, a bound
+    a range bound can parse ("-", "+", a bare millisecond, or
+    "ms-seq") for MINID — plus an optional ``approximate`` flag
+    and an optional ``mode`` that is KEEPREF, DELREF, or ACKED,
     ``hset`` a string key and a
     non-empty list of at most 1000 [field, value] string pairs,
     ``hdel`` a string key and a non-empty list of at most 1000
@@ -1732,14 +1798,15 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
                     "setnx", "getset",
                     "append", "getdel", "getex", "setrange", "setbit",
                     "bitop",
-                    "pfadd", "geoadd", "xadd", "hset", "hdel", "setex",
+                    "pfadd", "geoadd", "xadd", "xtrim", "hset", "hdel",
+                    "setex",
                     "expireat",
                     "pexpireat"):
         return None, {"type": "client_response", "status": "error",
                       "error": "pipeline op must be set, del, cas, "
                                "incr, incrbyfloat, setnx, getset, append, "
                                "getdel, getex, setrange, setbit, bitop, "
-                               "pfadd, geoadd, xadd, hset, hdel, setex, expireat, or "
+                               "pfadd, geoadd, xadd, xtrim, hset, hdel, setex, expireat, or "
                                "pexpireat"}
     key = op.get("key")
     if not isinstance(key, str):
@@ -2058,6 +2125,58 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
                               "error": "pipeline xadd id must be "
                                        "greater than 0-0"}
         msg["id"] = id_str
+    if name == "xtrim":
+        # ``strategy``, ``threshold``, ``approximate``, and ``mode``
+        # ride along with a pipelined xtrim, validated here so a
+        # malformed one never goes on the wire: MAXLEN or MINID, a
+        # non-negative integer threshold for MAXLEN, a string
+        # threshold for MINID — the same shapes the server
+        # enforces (the server also parses the MINID bound, so a
+        # nonsense bound is still a client error there, not a log
+        # entry).
+        strategy = op.get("strategy")
+        if (not isinstance(strategy, str)
+                or strategy.upper() not in ("MAXLEN", "MINID")):
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline xtrim strategy must be "
+                                   "\"MAXLEN\" or \"MINID\""}
+        strategy = strategy.upper()
+        msg["strategy"] = strategy
+        threshold = op.get("threshold")
+        if strategy == "MAXLEN":
+            if (not isinstance(threshold, int)
+                    or isinstance(threshold, bool)
+                    or threshold < 0):
+                return None, {"type": "client_response",
+                              "status": "error",
+                              "error": "pipeline xtrim MAXLEN "
+                                       "threshold must be a "
+                                       "non-negative integer"}
+        else:
+            if not isinstance(threshold, str):
+                return None, {"type": "client_response",
+                              "status": "error",
+                              "error": "pipeline xtrim MINID "
+                                       "threshold must be a string"}
+        msg["threshold"] = threshold
+        if op.get("approximate") is not None:
+            if op.get("approximate") is not True:
+                return None, {"type": "client_response",
+                              "status": "error",
+                              "error": "pipeline xtrim approximate "
+                                       "takes no argument"}
+            msg["approximate"] = True
+        mode = op.get("mode")
+        if mode is not None:
+            if (not isinstance(mode, str)
+                    or mode.upper() not in ("KEEPREF", "DELREF",
+                                            "ACKED")):
+                return None, {"type": "client_response",
+                              "status": "error",
+                              "error": "pipeline xtrim mode must be "
+                                       "\"KEEPREF\", \"DELREF\", or "
+                                       "\"ACKED\""}
+            msg["mode"] = mode.upper()
     if name == "hset":
         # ``pairs`` rides along with a pipelined hset, validated
         # here so a malformed one never goes on the wire: a
@@ -2852,6 +2971,66 @@ def xread(node_addr: tuple[str, int], keys: list[str],
         timeout = 12.0
         if block is not None:
             timeout = min(block / 1000.0, 25.0) + 10.0
+    return request(node_addr, msg, timeout=timeout)
+
+
+def xtrim(node_addr: tuple[str, int], key: str, strategy: str,
+          threshold, approximate: bool = False,
+          mode: str | None = None,
+          timeout: float = 12.0) -> dict:
+    """Trim the stream at ``key`` from the front, following leader
+    redirects like ``request`` — Redis XTRIM.
+
+    One request trims the stream, so the count it returns is
+    decided at the entry's position in the log: the reply is the
+    plain xtrim response (``status`` ``ok`` with ``xtrim`` — the
+    number of entries removed, 0 when the key does not exist or
+    nothing fell below the bound — or ``xtrim_failed`` with reason
+    ``wrongtype`` when the current value is a plain string).
+    ``strategy`` is "MAXLEN" (keep at most ``threshold`` entries,
+    the newest ones — ``threshold`` a non-negative integer) or
+    "MINID" (drop every entry with an ID below ``threshold`` — a
+    bound a range bound can parse: "-", "+", a bare millisecond,
+    or "ms-seq"). ``approximate`` ("~" in Redis) is accepted and
+    ignored — this store trims exactly — and ``mode`` is KEEPREF,
+    DELREF, or ACKED when one is given: those govern consumer-group
+    references, and there are no consumer groups yet, so the mode
+    is accepted and ignored too. A bad strategy, threshold, or
+    mode never goes on the wire and returns the server's error
+    shape instead. A successful xtrim keeps the key's TTL deadline
+    when entries remain, like an xadd, and a trim that empties the
+    stream deletes the key, like an hdel that removes the last
+    field."""
+    if (not isinstance(strategy, str)
+            or strategy.upper() not in ("MAXLEN", "MINID")):
+        return {"type": "client_response", "status": "error",
+                "error": "xtrim strategy must be \"MAXLEN\" "
+                         "or \"MINID\""}
+    strategy = strategy.upper()
+    if strategy == "MAXLEN":
+        if (not isinstance(threshold, int)
+                or isinstance(threshold, bool)
+                or threshold < 0):
+            return {"type": "client_response", "status": "error",
+                    "error": "xtrim MAXLEN threshold must be a "
+                             "non-negative integer"}
+    else:
+        if not isinstance(threshold, str):
+            return {"type": "client_response", "status": "error",
+                    "error": "xtrim MINID threshold must be "
+                             "a string"}
+    if mode is not None and (
+            not isinstance(mode, str)
+            or mode.upper() not in ("KEEPREF", "DELREF", "ACKED")):
+        return {"type": "client_response", "status": "error",
+                "error": "xtrim mode must be \"KEEPREF\", "
+                         "\"DELREF\", or \"ACKED\""}
+    msg: dict = {"type": "client", "op": "xtrim", "key": key,
+                 "strategy": strategy, "threshold": threshold}
+    if approximate:
+        msg["approximate"] = True
+    if mode is not None:
+        msg["mode"] = mode.upper()
     return request(node_addr, msg, timeout=timeout)
 
 
@@ -3833,6 +4012,40 @@ def main(argv: list[str] | None = None) -> int:
                          help="wait up to this many milliseconds "
                               "for a new entry when there is none "
                               "yet (0 waits up to 25s)")
+    p_xtrim = sub.add_parser(
+        "xtrim",
+        help="trim the stream at key from the front and print the "
+             "number of entries removed (0 when the key does not "
+             "exist or nothing fell below the bound); MAXLEN keeps "
+             "at most N entries, MINID drops every entry below an "
+             "ID")
+    p_xtrim.add_argument("key")
+    p_xtrim.add_argument("strategy", choices=("MAXLEN", "MINID"),
+                         help="MAXLEN keeps at most the threshold "
+                              "newest entries; MINID drops every "
+                              "entry with an ID below the threshold")
+    p_xtrim.add_argument("threshold",
+                         help="for MAXLEN, a non-negative integer "
+                              "(a leading \"~\" or \"=\" asks for "
+                              "approximate or exact trimming); "
+                              "for MINID, \"-\", \"+\", a bare "
+                              "millisecond, or \"ms-seq\"")
+    p_xtrim.add_argument("--approx", action="store_true",
+                         help="approximate trimming (accepted for "
+                              "compatibility; this store trims "
+                              "exactly)")
+    p_xtrim.add_argument("--mode", default=None,
+                         choices=("KEEPREF", "DELREF", "ACKED"),
+                         help="consumer-group reference mode "
+                              "(accepted for compatibility; there "
+                              "are no consumer groups yet)")
+    p_xtrim.add_argument("--client-id", default=None,
+                        help="session id for at-most-once writes: a retry "
+                             "with the same client id + request id returns "
+                             "the first attempt's result instead of writing "
+                             "twice")
+    p_xtrim.add_argument("--request-id", default=None,
+                        help="id of this write within the client session")
     p_pfadd = sub.add_parser(
         "pfadd",
         help="add elements to the HyperLogLog at key and print 1 "
@@ -4043,7 +4256,7 @@ def main(argv: list[str] | None = None) -> int:
               "pfadd", "pfcount", "hset", "hget", "hdel", "hgetall",
               "hlen", "hexists", "hkeys", "hvals", "hmget", "hscan",
               "geoadd", "geodist",
-              "xadd", "xlen", "xrange",
+              "xadd", "xtrim", "xlen", "xrange",
               "setex", "expireat",
               "pexpireat"):
         msg["key"] = args.key
@@ -4182,6 +4395,25 @@ def main(argv: list[str] | None = None) -> int:
             msg["count"] = args.count
         if args.block is not None:
             msg["block"] = args.block
+    if op == "xtrim":
+        threshold = args.threshold
+        if threshold.startswith(("~", "=")):
+            if threshold.startswith("~"):
+                msg["approximate"] = True
+            threshold = threshold[1:]
+        elif args.approx:
+            msg["approximate"] = True
+        if args.strategy == "MAXLEN":
+            try:
+                msg["threshold"] = int(threshold)
+            except ValueError:
+                parser.error("xtrim MAXLEN threshold must be a "
+                             "non-negative integer")
+        else:
+            msg["threshold"] = threshold
+        msg["strategy"] = args.strategy
+        if args.mode is not None:
+            msg["mode"] = args.mode
     if op == "pfadd":
         msg["elements"] = args.elements
     if op == "hset":
@@ -4209,7 +4441,7 @@ def main(argv: list[str] | None = None) -> int:
               "setbit", "bitop", "pfadd", "geoadd", "hset", "hdel",
               "setex",
               "expireat",
-              "pexpireat", "xadd") \
+              "pexpireat", "xadd", "xtrim") \
             and args.request_id:
         # A request id without an explicit client id still dedups
         # within the default "cli" session; the same id retried from
@@ -4296,6 +4528,8 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(resp.get("entries")))
         elif op == "xread":
             print(json.dumps(resp.get("streams")))
+        elif op == "xtrim":
+            print(resp.get("xtrim"))
         elif op == "geodist":
             dist = resp.get("distance")
             print(dist if dist is not None else "(nil)")

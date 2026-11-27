@@ -15,9 +15,12 @@ appending again. A plain string value fails with ``xadd_failed`` /
 JSON blob with a marker prefix, like a hash — the blob is a pure
 function of the entries, so every node applying the same log
 computes the same bytes, and it survives snapshots and replay
-exactly like any other value. There is no MAXLEN trimming yet, so
-a stream grows without bound, and no XREAD / XRANGE / XLEN yet, so
-the only way to read entries back is the raw blob. These spin up
+exactly like any other value. XTRIM (v0.66.0) trims entries from
+the front — MAXLEN keeps at most N, MINID drops every entry below
+an ID — and the top ID never moves when entries are trimmed, so
+an xadd after a trim still refuses an ID at or below the old top.
+There is no XREADGROUP yet, so the only way to read entries back
+is XRANGE / XLEN / XREAD. These spin up
 real nodes (real TCP, real threads, real disk) on localhost, like
 the rest of the suite.
 """
@@ -36,6 +39,7 @@ from raftkv.client import xadd as client_xadd
 from raftkv.client import xlen as client_xlen
 from raftkv.client import xrange as client_xrange
 from raftkv.client import xread as client_xread
+from raftkv.client import xtrim as client_xtrim
 from raftkv.store import KVStore, STREAM_PREFIX, is_stream
 
 ID_RE = re.compile(r"^\d+-\d+$")
@@ -73,6 +77,22 @@ def xread(addr, keys=("events",), ids=("0-0",), count=None,
         msg["count"] = count
     if block is not None:
         msg["block"] = block
+    return client_request(addr, msg)
+
+
+def xtrim(addr, key="events", strategy="MAXLEN", threshold=0,
+          approximate=None, mode=None, client_id=None,
+          request_id=None):
+    msg = {"type": "client", "op": "xtrim", "key": key,
+           "strategy": strategy, "threshold": threshold}
+    if approximate is not None:
+        msg["approximate"] = approximate
+    if mode is not None:
+        msg["mode"] = mode
+    if client_id is not None:
+        msg["client_id"] = client_id
+    if request_id is not None:
+        msg["request_id"] = request_id
     return client_request(addr, msg)
 
 
@@ -1328,6 +1348,501 @@ class TestStreamsCluster(unittest.TestCase):
                                   "events", "bogus"])
             self.assertEqual(rc, 1)
             self.assertIn("stream", err.getvalue())
+        finally:
+            cluster.stop_all()
+
+
+class TestXtrim(unittest.TestCase):
+    def _five(self, store=None):
+        """A stream with five entries, 100-1 through 100-5."""
+        store = store or KVStore()
+        for i in range(1, 6):
+            store.apply({"op": "xadd", "key": "events",
+                         "pairs": [["n", str(i)]],
+                         "id": f"100-{i}"})
+        return store
+
+    def test_xtrim_maxlen_keeps_newest_and_top_stays(self):
+        """MAXLEN keeps the newest N entries and answers how many
+        went; the top ID never moves, so an xadd at or below the
+        old top still fails after the trim."""
+        store = self._five()
+        result = store.apply({"op": "xtrim", "key": "events",
+                              "strategy": "MAXLEN", "threshold": 2})
+        self.assertEqual(result, {"type": "client_response",
+                                  "status": "ok", "xtrim": 3})
+        self.assertEqual(entries_of(store.get("events")),
+                         [("100-4", {"n": "4"}),
+                          ("100-5", {"n": "5"})])
+        self.assertEqual(store.stream_top("events"), "100-5")
+        result = store.apply({"op": "xadd", "key": "events",
+                             "pairs": [["n", "x"]], "id": "100-5"})
+        self.assertEqual(result["status"], "xadd_failed")
+        self.assertEqual(result["reason"], "id_not_greater")
+        self.assertEqual(entries_of(store.get("events")),
+                         [("100-4", {"n": "4"}),
+                          ("100-5", {"n": "5"})])
+
+    def test_xtrim_maxlen_zero_deletes_key(self):
+        """MAXLEN 0 empties the stream, and an emptied stream
+        deletes the key outright, like an hdel that removes the
+        last field — a later xadd starts a fresh stream."""
+        store = self._five()
+        result = store.apply({"op": "xtrim", "key": "events",
+                              "strategy": "MAXLEN", "threshold": 0})
+        self.assertEqual(result["xtrim"], 5)
+        self.assertTrue(result["deleted"])
+        self.assertIsNone(store.get("events"))
+        self.assertEqual(store.xlen("events"), 0)
+        result = store.apply({"op": "xadd", "key": "events",
+                             "pairs": [["n", "6"]], "id": "*",
+                             "auto_ms": 1700000000000})
+        self.assertEqual(result["xadd"], "1700000000000-0")
+        self.assertEqual(entries_of(store.get("events")),
+                         [("1700000000000-0", {"n": "6"})])
+
+    def test_xtrim_maxlen_above_length_is_noop(self):
+        """A MAXLEN past the end removes nothing and rewrites
+        nothing."""
+        store = self._five()
+        before = store.get("events")
+        result = store.apply({"op": "xtrim", "key": "events",
+                              "strategy": "MAXLEN", "threshold": 10})
+        self.assertEqual(result["xtrim"], 0)
+        self.assertNotIn("deleted", result)
+        self.assertEqual(store.get("events"), before)
+
+    def test_xtrim_minid_drops_below_bound(self):
+        """MINID drops every entry strictly below the bound — the
+        bound entry itself stays — and a bare millisecond names
+        that millisecond with sequence 0, like an xrange bound."""
+        store = self._five()
+        result = store.apply({"op": "xtrim", "key": "events",
+                              "strategy": "MINID",
+                              "threshold": "100-3"})
+        self.assertEqual(result["xtrim"], 2)
+        self.assertEqual([e[0] for e in entries_of(
+            store.get("events"))],
+            ["100-3", "100-4", "100-5"])
+        # A bare millisecond is (100, 0): nothing is below it.
+        result = store.apply({"op": "xtrim", "key": "events",
+                              "strategy": "MINID", "threshold": "100"})
+        self.assertEqual(result["xtrim"], 0)
+        # Past the end empties the stream and deletes the key.
+        result = store.apply({"op": "xtrim", "key": "events",
+                              "strategy": "MINID",
+                              "threshold": "200-0"})
+        self.assertEqual(result["xtrim"], 3)
+        self.assertTrue(result["deleted"])
+        self.assertIsNone(store.get("events"))
+
+    def test_xtrim_missing_key_answers_zero(self):
+        """An xtrim on a missing key answers 0 and writes
+        nothing, like an expire on a missing key."""
+        store = KVStore()
+        result = store.apply({"op": "xtrim", "key": "nope",
+                              "strategy": "MAXLEN", "threshold": 5})
+        self.assertEqual(result["xtrim"], 0)
+        self.assertIsNone(store.get("nope"))
+
+    def test_xtrim_wrongtype(self):
+        """An xtrim on a plain string fails with wrongtype and
+        leaves the value untouched, like an xadd."""
+        store = KVStore()
+        store.apply({"op": "set", "key": "plain", "value": "v"})
+        result = store.apply({"op": "xtrim", "key": "plain",
+                              "strategy": "MAXLEN", "threshold": 1})
+        self.assertEqual(result["status"], "xtrim_failed")
+        self.assertEqual(result["reason"], "wrongtype")
+        self.assertEqual(store.get("plain"), "v")
+
+    def test_xtrim_bad_strategy_or_threshold_raises(self):
+        """A hand-built log entry with a bad strategy or
+        threshold raises rather than silently trimming
+        nonsense."""
+        store = self._five()
+        for command in (
+                {"op": "xtrim", "key": "events",
+                 "strategy": "BOGUS", "threshold": 2},
+                {"op": "xtrim", "key": "events",
+                 "strategy": "MAXLEN", "threshold": -1},
+                {"op": "xtrim", "key": "events",
+                 "strategy": "MAXLEN", "threshold": True},
+                {"op": "xtrim", "key": "events",
+                 "strategy": "MAXLEN", "threshold": "2"},
+                {"op": "xtrim", "key": "events",
+                 "strategy": "MINID", "threshold": 100},
+                {"op": "xtrim", "key": "events",
+                 "strategy": "MINID", "threshold": "bogus"},
+                {"op": "xtrim", "key": "events",
+                 "strategy": "MINID", "threshold": "100-3-4"}):
+            with self.assertRaises(ValueError, msg=str(command)):
+                store.apply(command)
+        self.assertEqual(len(entries_of(store.get("events"))), 5)
+
+    def test_xtrim_approximate_and_mode_accepted(self):
+        """The "~" flag and the KEEPREF / DELREF / ACKED modes are
+        accepted and ignored: the trim is exact either way, since
+        there are no consumer groups yet."""
+        store = self._five()
+        for mode in ("KEEPREF", "DELREF", "ACKED"):
+            result = store.apply({"op": "xtrim", "key": "events",
+                                  "strategy": "MAXLEN", "threshold": 4,
+                                  "approximate": True, "mode": mode})
+            self.assertEqual(result["status"], "ok", mode)
+            self.assertEqual(result["xtrim"], 1, mode)
+            top_ms, top_seq = store.stream_top("events").split("-")
+            store.apply({"op": "xadd", "key": "events",
+                         "pairs": [["n", "back"]],
+                         "id": f"{top_ms}-{int(top_seq) + 1}"})
+
+    def test_xtrim_survives_snapshot_load(self):
+        """A trimmed stream is a plain string in the store, so a
+        snapshot load rebuilds the same entries and the same top
+        ID — and an ID below the top still fails after the load."""
+        store = self._five()
+        store.apply({"op": "xtrim", "key": "events",
+                     "strategy": "MAXLEN", "threshold": 2})
+        loaded = KVStore()
+        loaded.load(store.items())
+        self.assertEqual(entries_of(loaded.get("events")),
+                         [("100-4", {"n": "4"}),
+                          ("100-5", {"n": "5"})])
+        self.assertEqual(loaded.stream_top("events"), "100-5")
+        result = loaded.apply({"op": "xadd", "key": "events",
+                              "pairs": [["n", "x"]], "id": "100-3"})
+        self.assertEqual(result["status"], "xadd_failed")
+        self.assertEqual(result["reason"], "id_not_greater")
+
+    def test_xtrim_keeps_ttl_deadline(self):
+        """An xtrim is an update, not a fresh set: the deadline
+        survives it when entries remain, like an xadd — and it
+        goes with the key when the trim deletes it."""
+        store = KVStore()
+        store.apply({"op": "xadd", "key": "s",
+                     "pairs": [["a", "1"]], "id": "1-0"}, index=10)
+        store.apply({"op": "xadd", "key": "s",
+                     "pairs": [["a", "2"]], "id": "2-0"}, index=11)
+        store.apply({"op": "expire", "key": "s",
+                     "ttl_entries": 10}, index=12)
+        self.assertEqual(store.expiries(), {"s": 22})
+        result = store.apply({"op": "xtrim", "key": "s",
+                              "strategy": "MAXLEN", "threshold": 1},
+                             index=13)
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(store.expiries(), {"s": 22})
+        result = store.apply({"op": "xtrim", "key": "s",
+                              "strategy": "MAXLEN", "threshold": 0},
+                             index=14)
+        self.assertTrue(result["deleted"])
+        self.assertEqual(store.expiries(), {})
+
+    def test_xtrim_maxlen_replicates(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            with Session(addr) as session:
+                for i in range(1, 6):
+                    resp = session.xadd("events", {"n": str(i)},
+                                        id=f"100-{i}")
+                    self.assertEqual(resp.get("status"), "ok", resp)
+                resp = session.xtrim("events", "MAXLEN", 2)
+                self.assertEqual(resp.get("status"), "ok", resp)
+                self.assertEqual(resp.get("xtrim"), 3, resp)
+                # A session read after its own trim sees the trim.
+                resp = session.xlen("events")
+                self.assertEqual(resp.get("xlen"), 2, resp)
+            for node_id in cluster.live:
+                self.assertTrue(
+                    wait_for_key(cluster.nodes[node_id], "events",
+                                 cluster.nodes[leader.id].sm.get(
+                                     "events")))
+                self.assertEqual(
+                    [e[0] for e in entries_of(
+                        cluster.nodes[node_id].sm.get("events"))],
+                    ["100-4", "100-5"])
+        finally:
+            cluster.stop_all()
+
+    def test_xtrim_minid_module_function_from_follower(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            follower = next(n for n in cluster.live
+                            if n != leader.id)
+            addr = cluster.addrs[leader.id]
+            for i in range(1, 6):
+                self.assertEqual(
+                    xadd(addr, id=f"100-{i}").get("status"), "ok")
+            # The module function follows the leader redirect.
+            resp = client_xtrim(cluster.addrs[follower], "events",
+                                "MINID", "100-4")
+            self.assertEqual(resp.get("status"), "ok", resp)
+            self.assertEqual(resp.get("xtrim"), 3, resp)
+            self.assertEqual(
+                [e[0] for e in entries_of(
+                    cluster.nodes[leader.id].sm.get("events"))],
+                ["100-4", "100-5"])
+        finally:
+            cluster.stop_all()
+
+    def test_xtrim_wrongtype_and_bad_args(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            self.assertEqual(write(addr, key="plain").get("status"),
+                             "ok")
+            resp = xtrim(addr, key="plain", threshold=1)
+            self.assertEqual(resp.get("status"), "xtrim_failed", resp)
+            self.assertEqual(resp.get("reason"), "wrongtype", resp)
+            self.assertEqual(
+                client_request(addr, {"type": "client", "op": "get",
+                                      "key": "plain"}).get("value"),
+                "old")
+            # Bad arguments are client errors with no log entry.
+            before = len(leader.log)
+            for msg in (
+                    {"strategy": "BOGUS", "threshold": 2},
+                    {"strategy": "MAXLEN", "threshold": -1},
+                    {"strategy": "MAXLEN", "threshold": "2"},
+                    {"strategy": "MINID", "threshold": 100},
+                    {"strategy": "MINID", "threshold": "bogus"},
+                    {"strategy": "MAXLEN", "threshold": 2,
+                     "mode": "BOGUS"},
+                    {"strategy": "MAXLEN", "threshold": 2,
+                     "approximate": "yes"}):
+                resp = client_request(
+                    addr, {"type": "client", "op": "xtrim",
+                           "key": "events", **msg})
+                self.assertEqual(resp.get("status"), "error", resp)
+            self.assertEqual(len(leader.log), before)
+            # A missing key answers 0, like an expire on one.
+            resp = xtrim(addr, key="nope", threshold=5)
+            self.assertEqual(resp.get("status"), "ok", resp)
+            self.assertEqual(resp.get("xtrim"), 0, resp)
+        finally:
+            cluster.stop_all()
+
+    def test_xtrim_dedup_retry(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            for i in range(1, 6):
+                self.assertEqual(
+                    xadd(addr, id=f"100-{i}").get("status"), "ok")
+            resp = xtrim(addr, threshold=2, client_id="c1",
+                         request_id="t1")
+            self.assertEqual(resp.get("status"), "ok", resp)
+            self.assertEqual(resp.get("xtrim"), 3, resp)
+            # The retry returns the first attempt's count instead
+            # of trimming twice — and logs one entry, not two.
+            resp = xtrim(addr, threshold=2, client_id="c1",
+                         request_id="t1")
+            self.assertEqual(resp.get("status"), "ok", resp)
+            self.assertEqual(resp.get("xtrim"), 3, resp)
+            self.assertEqual(count_entries(leader, "t1"), 1)
+            self.assertEqual(len(entries_of(
+                leader.sm.get("events"))), 2)
+        finally:
+            cluster.stop_all()
+
+    def test_xtrim_to_empty_deletes_key_and_top_survives(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            for i in range(1, 4):
+                self.assertEqual(
+                    xadd(addr, id=f"100-{i}").get("status"), "ok")
+            resp = xtrim(addr, threshold=0)
+            self.assertEqual(resp.get("status"), "ok", resp)
+            self.assertEqual(resp.get("xtrim"), 3, resp)
+            self.assertIsNone(leader.sm.get("events"))
+            self.assertEqual(xlen(addr).get("xlen"), 0)
+            # The key is gone, so the old top is forgotten with it
+            # — a new xadd starts a fresh stream, exactly as Redis
+            # starts one once the stream is gone — and an auto ID
+            # appends after it.
+            resp = xadd(addr, id="100-3")
+            self.assertEqual(resp.get("status"), "ok", resp)
+            self.assertEqual(resp.get("xadd"), "100-3", resp)
+            resp = xadd(addr)
+            self.assertEqual(resp.get("status"), "ok", resp)
+            self.assertGreater(id_tuple(resp["xadd"]), (100, 3))
+        finally:
+            cluster.stop_all()
+
+    def test_xtrim_fires_watch_events(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            for i in range(1, 4):
+                self.assertEqual(
+                    xadd(addr, id=f"100-{i}").get("status"), "ok")
+            events = []
+            leader.watch.watch("events", events.append)
+            resp = xtrim(addr, threshold=2)
+            self.assertEqual(resp.get("xtrim"), 1, resp)
+            deadline = time.monotonic() + 5.0
+            while len(events) < 1 and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertEqual(len(events), 1, events)
+            self.assertEqual(events[0]["key"], "events", events)
+            self.assertEqual(events[0]["op"], "set", events)
+            self.assertEqual(events[0]["value"],
+                             leader.sm.get("events"), events)
+            # A trim that removes nothing fires nothing.
+            resp = xtrim(addr, threshold=2)
+            self.assertEqual(resp.get("xtrim"), 0, resp)
+            time.sleep(0.3)
+            self.assertEqual(len(events), 1, events)
+            # A trim that empties the stream fires a del.
+            resp = xtrim(addr, threshold=0)
+            self.assertEqual(resp.get("xtrim"), 2, resp)
+            deadline = time.monotonic() + 5.0
+            while len(events) < 2 and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertEqual(len(events), 2, events)
+            self.assertEqual(events[1]["op"], "del", events)
+            self.assertIsNone(events[1]["value"], events)
+        finally:
+            cluster.stop_all()
+
+    def test_pipeline_xtrim_ops(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            with Session(addr) as session:
+                for i in range(1, 4):
+                    resp = session.xadd("events", {"n": str(i)},
+                                        id=f"100-{i}")
+                    self.assertEqual(resp.get("status"), "ok", resp)
+                replies = session.pipeline([
+                    {"op": "xtrim", "key": "events",
+                     "strategy": "MAXLEN", "threshold": 2},
+                    {"op": "xtrim", "key": "events",
+                     "strategy": "MINID", "threshold": "100-3"},
+                    {"op": "xtrim", "key": "events",
+                     "strategy": "BOGUS", "threshold": 2},
+                    {"op": "xtrim", "key": "events",
+                     "strategy": "MAXLEN", "threshold": -1},
+                    {"op": "xtrim", "key": "nope",
+                     "strategy": "MAXLEN", "threshold": 5},
+                ])
+            self.assertEqual(len(replies), 5, replies)
+            self.assertEqual(replies[0].get("xtrim"), 1, replies)
+            self.assertEqual(replies[1].get("xtrim"), 1, replies)
+            self.assertEqual(replies[2].get("status"), "error",
+                             replies)
+            self.assertEqual(replies[3].get("status"), "error",
+                             replies)
+            self.assertEqual(replies[4].get("xtrim"), 0, replies)
+            self.assertEqual(
+                [e[0] for e in entries_of(leader.sm.get("events"))],
+                ["100-3"])
+        finally:
+            cluster.stop_all()
+
+    def test_xtrim_survives_snapshot_and_restart(self):
+        cluster = Cluster(3, snapshot_threshold=5)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            for i in range(1, 6):
+                self.assertEqual(
+                    xadd(addr, id=f"100-{i}").get("status"), "ok")
+            resp = xtrim(addr, threshold=2)
+            self.assertEqual(resp.get("xtrim"), 3, resp)
+            # Enough writes to compact the log past the trim.
+            for i in range(10):
+                self.assertEqual(
+                    write(addr, key=f"pad{i}", value="x").get("status"),
+                    "ok")
+            self.assertEqual(
+                [e[0] for e in entries_of(leader.sm.get("events"))],
+                ["100-4", "100-5"])
+            cluster.stop_node(leader.id)
+            cluster.restart_node(leader.id)
+            new_leader = cluster.wait_for_leader()
+            addr = cluster.addrs[new_leader.id]
+            # The trimmed stream survived the snapshot + restart:
+            # only the kept entries are there, and an ID below the
+            # top still fails.
+            self.assertEqual(
+                [e[0] for e in entries_of(
+                    new_leader.sm.get("events"))],
+                ["100-4", "100-5"])
+            resp = xadd(addr, id="100-3")
+            self.assertEqual(resp.get("status"), "xadd_failed", resp)
+            self.assertEqual(resp.get("reason"), "id_not_greater",
+                             resp)
+            resp = xadd(addr, id="100-6")
+            self.assertEqual(resp.get("xadd"), "100-6", resp)
+        finally:
+            cluster.stop_all()
+
+    def test_xtrim_cli(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            host, port = cluster.addrs[leader.id]
+            node = f"{host}:{port}"
+            for i in range(1, 4):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    rc = client_main(["--node", node, "xadd", "events",
+                                      f"100-{i}", "n", str(i)])
+                self.assertEqual(rc, 0)
+            # MAXLEN prints the number of entries removed.
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "xtrim", "events",
+                                  "MAXLEN", "2"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(out.getvalue().strip(), "1")
+            # "~" asks for approximate trimming (exact here).
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "xtrim", "events",
+                                  "MAXLEN", "~1"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(out.getvalue().strip(), "1")
+            # MINID drops below the bound; the bound entry stays.
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "xtrim", "events",
+                                  "MINID", "100-3"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(out.getvalue().strip(), "0")
+            # A bad threshold fails: rc 1, and the error names the
+            # problem.
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = client_main(["--node", node, "xtrim", "events",
+                                  "MAXLEN", "-1"])
+            self.assertEqual(rc, 1)
+            self.assertIn("threshold", err.getvalue())
+            # A bad mode fails at the CLI, before anything is sent.
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                with self.assertRaises(SystemExit) as cm:
+                    client_main(["--node", node, "xtrim", "events",
+                                 "MAXLEN", "1", "--mode", "BOGUS"])
+            self.assertEqual(cm.exception.code, 2)
         finally:
             cluster.stop_all()
 

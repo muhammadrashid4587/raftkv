@@ -767,9 +767,9 @@ logic and the failure handling, not the key-value API on top.
   with the new value; a failed one fires nothing.
   `{"op": "xadd", "key": k, "pairs": [[f, v], ...], "id": id}`
   is a pipeline op too. The honest limit is the growth itself:
-  there is no MAXLEN trimming yet, so a stream grows without
-  bound — every entry stays in the one blob, and the blob rides
-  every snapshot and replay whole.
+  every entry stays in the one blob, and the blob rides every
+  snapshot and replay whole — XTRIM (v0.66.0) is the way to keep
+  it bounded.
 - **Streams (XLEN / XRANGE)** — since v0.64.0 `xlen key`
   (`Session.xlen(k)`, `client.xlen(addr, k)`, `xlen key` on the
   CLI) answers the number of entries in the stream at the key, 0
@@ -827,6 +827,40 @@ logic and the failure handling, not the key-value API on top.
   stream is one blob, so a read still scans the blob to filter
   it — there is no index over entries — and there are no consumer
   groups yet, so XREADGROUP is still missing.
+- **Streams (XTRIM)** — since v0.66.0 `xtrim key MAXLEN [~|=]
+  threshold [KEEPREF|DELREF|ACKED]` or `xtrim key MINID [~|=]
+  threshold [KEEPREF|DELREF|ACKED]` (`Session.xtrim(k, strategy,
+  threshold, approximate, mode)`, `client.xtrim(addr, k, strategy,
+  threshold, approximate, mode)`, `xtrim key MAXLEN [~]n` /
+  `xtrim key MINID id` on the CLI) trims a stream from the front
+  — Redis XTRIM — and answers with the number of entries removed.
+  MAXLEN keeps at most the threshold newest entries; MINID drops
+  every entry with an ID below the threshold ("-", "+", a bare
+  millisecond, or a full "ms-seq"). A missing key answers 0, and
+  a plain string value is a client error, not a count. The top ID
+  never moves when entries are trimmed, so an xadd after a trim
+  still refuses an ID at or below the old top — but a trim that
+  empties the stream deletes the key outright, like an hdel that
+  removes the last field, so a later xadd starts a fresh stream
+  and the old top is forgotten with the key, exactly as Redis
+  forgets it once the stream is gone. The outcome is decided at
+  apply time, at the entry's exact position in the log, like a
+  CAS, so a retry with the same session id returns the first
+  attempt's count instead of trimming twice, and a successful
+  xtrim keeps the key's TTL deadline when entries remain, like an
+  xadd. A trim that removes entries fires a `set` watch event
+  with the new value, a trim that empties the stream fires a
+  `del`, and a trim that removes nothing fires nothing.
+  `{"op": "xtrim", "key": k, "strategy": "MAXLEN"|"MINID",
+  "threshold": n|"ms-seq", "approximate": true,
+  "mode": "KEEPREF"|"DELREF"|"ACKED"}` is a pipeline op too. The
+  "~" flag is accepted and ignored — this store trims exactly,
+  since there is no radix tree whose nodes need a visit budget —
+  and the mode is accepted and ignored too: those govern
+  consumer-group references, and there are no consumer groups
+  yet, so no entry carries one. The honest limit is the same
+  growth as xadd: the whole stream is one blob, so a trim still
+  rewrites the blob whole — there is no index over entries.
 - **HyperLogLog** — since v0.47.0 `pfadd key element [element ...]`
   (`Session.pfadd(k, *elements)`, `client.pfadd(addr, k, *elements)`,
   `pfadd key element ...` on the CLI) adds elements to the
@@ -3635,7 +3669,49 @@ entries left in `log.jsonl` are dropped by their index on reload.
   wrongtype and bad arguments as client errors with no log entry,
   session read-your-writes, the module function from a follower,
   and the CLI end to end.
+- ~~Streams (XTRIM)~~ — done in v0.66.0,
+  Nov 27, 2026: `xtrim key MAXLEN [~|=] threshold
+  [KEEPREF|DELREF|ACKED]` or `xtrim key MINID [~|=] threshold
+  [KEEPREF|DELREF|ACKED]` trims a stream from the front — Redis
+  XTRIM — and answers with the number of entries removed. MAXLEN
+  keeps at most the threshold newest entries; MINID drops every
+  entry with an ID below the threshold ("-", "+", a bare
+  millisecond, or a full "ms-seq"). A missing key answers 0, and
+  a plain string value fails with `xtrim_failed` / `wrongtype`.
+  The top ID never moves when entries are trimmed, so an xadd
+  after a trim still refuses an ID at or below the old top — but
+  a trim that empties the stream deletes the key outright, like an
+  hdel that removes the last field, so a later xadd starts a fresh
+  stream and the old top is forgotten with the key, exactly as
+  Redis forgets it once the stream is gone. The outcome is decided
+  at apply time, at the entry's exact position in the log, like a
+  CAS, so a retry with the same session id returns the first
+  attempt's count instead of trimming twice, and a successful
+  xtrim keeps the key's TTL deadline when entries remain, like an
+  xadd. A trim that removes entries fires a `set` watch event
+  with the new value, a trim that empties the stream fires a
+  `del`, and a trim that removes nothing fires nothing. The "~"
+  flag and the KEEPREF / DELREF / ACKED modes are accepted and
+  ignored: the trim is exact either way, and there are no
+  consumer groups yet, so no entry carries a reference.
+  `Session.xtrim`, `client.xtrim`, and `xtrim` on the CLI; like
+  xadd, it is a pipeline op.
+  `tests/test_streams.py` proves it: store-level MAXLEN keeping
+  the newest entries with the top ID unmoved, MAXLEN 0 deleting
+  the key, MINID dropping strictly below the bound, missing keys
+  answering 0, wrongtype leaving the value untouched, bad
+  strategies and thresholds raising, "~" and the three modes
+  accepted, snapshot loads rebuilding the trimmed stream with
+  its top, and the TTL deadline surviving a trim that leaves
+  entries behind; and cluster-level trimming replicated to every
+  node, the module function from a follower, wrongtype and bad
+  arguments as client errors with no log entry, dedup retries
+  returning the first attempt's count, a trim to empty deleting
+  the key and starting a fresh stream, watch events for a
+  trimming set, a no-op trim, and a deleting trim, pipelined
+  xtrim ops in position, snapshot + restart survival, and the CLI
+  end to end.
   The roadmap is exhausted again, so the next real thing is
   a new roadmap item grounded in this project's purpose,
-  proposed by the next run — candidates: XTRIM (MAXLEN trimming),
-  or XREADGROUP (consumer groups).
+  proposed by the next run — candidates: XREADGROUP (consumer
+  groups).
