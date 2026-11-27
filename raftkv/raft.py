@@ -137,6 +137,15 @@ SETBIT_MAX_OFFSET = 1_000_000
 # never a real use — the same scale as the TTL cap above, for the
 # same reason.
 PFADD_MAX_ELEMENTS = 1000
+# Largest number of source keys one ``bitop`` may carry. The keys
+# ride in one log entry and one frame, so an unbounded list would
+# let one entry grow without limit (and replicate that growth to
+# every node). 1,000 keys is far past a real use of one BITOP call
+# — a client combining more splits the batch, like an mget client
+# splits a batch past 1000 keys — so it only rejects nonsense,
+# never a real use — the same scale as the pfadd cap above, for the
+# same reason.
+BITOP_MAX_KEYS = 1000
 # Largest number of field-value pairs one ``hset`` may carry. The
 # pairs ride in one log entry and one frame, so an unbounded list
 # would let one entry grow without limit (and replicate that growth
@@ -1451,7 +1460,7 @@ class RaftNode:
                 # The apply result matters for set, CAS, expire,
                 # expireat, pexpireat, incr, incrbyfloat, setnx,
                 # getset, append, getdel, setrange, getex, setbit,
-                # pfadd, hset, and hdel:
+                # bitop, pfadd, hset, and hdel:
                 # their outcome is decided here, at this exact point
                 # in the log, so the result is recorded in the dedup
                 # table
@@ -1599,6 +1608,23 @@ class RaftNode:
                     self.watch.notify(entry["command"]["key"],
                                       result["value"], "set",
                                       index=self.last_applied)
+                elif (op == "bitop" and result is not None
+                        and result.get("status") == "ok"):
+                    # A successful bitop fires like a set, with the
+                    # new (combined) value — or like a del when
+                    # every input was empty and the destination
+                    # went; a failed bitop wrote nothing, so it
+                    # fires nothing, like a failed setbit — and an
+                    # empty result on a missing destination changed
+                    # nothing either, so it fires nothing at all.
+                    if result.get("deleted"):
+                        self.watch.notify(entry["command"]["key"],
+                                          None, "del",
+                                          index=self.last_applied)
+                    elif result.get("bitop", 0) > 0:
+                        self.watch.notify(entry["command"]["key"],
+                                          result["value"], "set",
+                                          index=self.last_applied)
                 elif (op == "pfadd" and result is not None
                         and result.get("status") == "ok"
                         and result.get("pfadd") == 1):
@@ -1647,7 +1673,7 @@ class RaftNode:
                            "pexpireat",
                            "incr", "incrbyfloat", "setnx", "getset",
                            "append", "getdel", "setrange", "getex",
-                           "setbit", "pfadd", "hset", "hdel")
+                           "setbit", "bitop", "pfadd", "hset", "hdel")
                         and result is not None
                         and self.role == "leader"):
                     # Record the outcome only when a local waiter is
@@ -1660,7 +1686,7 @@ class RaftNode:
                     # always records: its waiter is identified by
                     # index alone. Set, CAS, expire, expireat, pexpireat,
                     # incr, incrbyfloat, setnx, getset, append,
-                    # getdel, setrange, getex, setbit, pfadd, and hset are
+                    # getdel, setrange, getex, setbit, bitop, pfadd, and hset are
                     # the ops whose apply returns a result — a del
                     # returns None and has nothing to record.
                     key = _dedup_key(entry["command"])
@@ -1700,8 +1726,8 @@ class RaftNode:
         the write happened (a set that lost on NX / XX answers 0);
         for CAS, expire, expireat,
         pexpireat, incr, incrbyfloat, setnx,
-        getset, append, getdel, setrange, getex, setbit, pfadd,
-        hset, and hdel
+        getset, append, getdel, setrange, getex, setbit, bitop,
+        pfadd, hset, and hdel
         it is the
         apply-time outcome (success, mismatch, or missing key for a
         CAS; 1 or 0 for an expire; 1 or 0 for an expireat /
@@ -1712,7 +1738,8 @@ class RaftNode:
         an append; the old value and 1 or 0 for a getdel; the new
         value and length, or wrongtype for a setrange; the value
         and 1 or 0, plus the deadline, for a getex; the old bit
-        and the new value, or wrongtype for a setbit; 1 or 0 plus
+        and the new value, or wrongtype for a setbit; the result
+        length and value, or wrongtype for a bitop; 1 or 0 plus
         the estimate, or wrongtype for a pfadd; the count of
         newly added fields, or wrongtype for an hset; the count
         of removed fields, or wrongtype for an hdel), so a
@@ -2409,7 +2436,7 @@ class RaftNode:
                       "incr", "incrbyfloat", "setnx", "getset",
                       "append", "strlen",
                       "getdel", "getrange", "setrange", "getex",
-                      "setbit", "getbit", "pfadd", "pfcount",
+                      "setbit", "getbit", "bitop", "pfadd", "pfcount",
                       "hset", "hget", "hdel", "hgetall",
                       "hlen", "hexists", "hkeys", "hvals", "hmget",
                       "hscan",
@@ -2421,6 +2448,7 @@ class RaftNode:
                              "incr/incrbyfloat/setnx/getset/append/"
                              "strlen/getdel/"
                              "getrange/setrange/getex/setbit/getbit/"
+                             "bitop/"
                              "pfadd/pfcount/hset/hget/hdel/hgetall/"
                              "hlen/hexists/hkeys/hvals/hmget/hscan/"
                              "setex "
@@ -2843,6 +2871,40 @@ class RaftNode:
                                  f"between 0 and {SETBIT_MAX_OFFSET}"}
             command["offset"] = offset
             command["bit"] = bit
+        if op == "bitop":
+            # Bitwise AND / OR / XOR / NOT across string keys,
+            # Redis BITOP: the destination is ``key`` (this
+            # message's key), the sources ride in ``keys``. The
+            # operation must be one of the four — matched
+            # case-insensitively, since a client may send "and"
+            # and mean AND — and is normalized to upper case
+            # before it is logged, so every node applies the same
+            # spelling; NOT takes exactly one source key, the
+            # others one to BITOP_MAX_KEYS, so one entry never
+            # carries an unbounded key list. Whether each source
+            # holds a byte string (and what the result is) is
+            # decided at apply time, like a CAS, not here.
+            operation = msg.get("operation")
+            if (not isinstance(operation, str)
+                    or operation.upper()
+                    not in ("AND", "OR", "XOR", "NOT")):
+                return {"type": "client_response", "status": "error",
+                        "error": "bitop operation must be AND, OR, "
+                                 "XOR, or NOT"}
+            operation = operation.upper()
+            keys = msg.get("keys")
+            if (not isinstance(keys, list) or not keys
+                    or len(keys) > BITOP_MAX_KEYS
+                    or any(not isinstance(k, str) for k in keys)):
+                return {"type": "client_response", "status": "error",
+                        "error": "bitop keys must be a list of 1 to "
+                                 f"{BITOP_MAX_KEYS} strings"}
+            if operation == "NOT" and len(keys) != 1:
+                return {"type": "client_response", "status": "error",
+                        "error": "bitop NOT takes exactly one "
+                                 "source key"}
+            command["operation"] = operation
+            command["keys"] = list(keys)
         if op == "pfadd":
             # Add elements to a HyperLogLog: the elements must be a
             # non-empty list of at most PFADD_MAX_ELEMENTS strings

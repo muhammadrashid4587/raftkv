@@ -1,4 +1,5 @@
-"""Tests for raftkv SETBIT / GETBIT (Redis bit operations, v0.46.0).
+"""Tests for raftkv SETBIT / GETBIT (Redis bit operations, v0.46.0)
+and BITOP (v0.60.0).
 
 ``setbit key offset bit`` sets one bit in the string at the key to 0
 or 1 and answers with the old bit value (``old_bit``) and the new
@@ -16,9 +17,23 @@ read through the same ReadIndex path as a ``get``. A successful
 setbit keeps the key's TTL deadline, like a CAS, and fires a ``set``
 watch event with the new value. A value that is not a byte string —
 one holding a character above U+00FF — fails with ``setbit_failed``
-/ ``wrongtype`` instead of writing. These spin up real nodes (real
-TCP, real threads, real disk) on localhost, like the rest of the
-suite.
+/ ``wrongtype`` instead of writing.
+
+``bitop operation destkey key [key ...]`` combines the string values
+at the source keys bitwise — AND, OR, XOR, or NOT (NOT takes exactly
+one source key) — and stores the result at the destination, answering
+with the result length (``bitop``) and the result value. The result
+is as long as the longest input, missing keys count as empty strings,
+and when every input is missing or empty the destination is deleted
+instead of storing an empty value, answering ``bitop`` 0. A bitop is
+a fresh set of its destination, so it clears the destination's TTL
+deadline, like a plain set, and fires a ``set`` watch event with the
+result — or a ``del`` event when the empty result deletes the
+destination. Like a setbit, its outcome is decided at apply time, so
+a retry returns the first attempt's length instead of combining
+twice, and a non-byte-string source fails with ``bitop_failed`` /
+``wrongtype``. These spin up real nodes (real TCP, real threads,
+real disk) on localhost, like the rest of the suite.
 """
 
 import contextlib
@@ -28,6 +43,7 @@ import unittest
 
 from harness import Cluster, client_request, wait_for_key
 from raftkv.client import Session, main as client_main
+from raftkv.client import bitop as client_bitop
 from raftkv.client import getbit as client_getbit
 from raftkv.client import setbit as client_setbit
 from raftkv.store import KVStore
@@ -47,6 +63,17 @@ def setbit(addr, key="k", offset=0, bit=1, client_id=None,
 def getbit(addr, key="k", offset=0):
     return client_request(addr, {"type": "client", "op": "getbit",
                                  "key": key, "offset": offset})
+
+
+def bitop(addr, operation="AND", dest="dest", keys=("a", "b"),
+          client_id=None, request_id=None):
+    msg = {"type": "client", "op": "bitop", "key": dest,
+           "operation": operation, "keys": list(keys)}
+    if client_id is not None:
+        msg["client_id"] = client_id
+    if request_id is not None:
+        msg["request_id"] = request_id
+    return client_request(addr, msg)
 
 
 def write(addr, key="k", value="old"):
@@ -586,6 +613,519 @@ class TestBitOpsCluster(unittest.TestCase):
                 with self.assertRaises(SystemExit) as cm:
                     client_main(["--node", node, "setbit", "k", "0"])
             self.assertEqual(cm.exception.code, 2)
+        finally:
+            cluster.stop_all()
+
+
+class TestBitopStore(unittest.TestCase):
+    def _two_keys(self):
+        # "a" is 0x61 = 0110 0001, "A" is 0x41 = 0100 0001.
+        store = KVStore()
+        store.apply({"op": "set", "key": "a", "value": "a"})
+        store.apply({"op": "set", "key": "b", "value": "A"})
+        return store
+
+    def test_bitop_and_or_xor(self):
+        """AND, OR, and XOR of "a" (0x61) and "A" (0x41) are "A"
+        (0x41), "a" (0x61), and " " (0x20) — bit by bit, with the
+        reply carrying the result length and value."""
+        store = self._two_keys()
+        result = store.apply({"op": "bitop", "key": "dest",
+                              "operation": "AND", "keys": ["a", "b"]})
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["bitop"], 1)
+        self.assertEqual(result["value"], "A")
+        self.assertEqual(store.get("dest"), "A")
+        result = store.apply({"op": "bitop", "key": "dest",
+                              "operation": "OR", "keys": ["a", "b"]})
+        self.assertEqual(result["value"], "a")
+        self.assertEqual(store.get("dest"), "a")
+        result = store.apply({"op": "bitop", "key": "dest",
+                              "operation": "XOR", "keys": ["a", "b"]})
+        self.assertEqual(result["value"], " ")
+        self.assertEqual(store.get("dest"), " ")
+
+    def test_bitop_not(self):
+        """NOT of "a" (0x61) is 0x9E — every bit flipped — and NOT
+        of a missing key is the empty result, which deletes the
+        destination instead of storing an empty value."""
+        store = self._two_keys()
+        result = store.apply({"op": "bitop", "key": "dest",
+                              "operation": "NOT", "keys": ["a"]})
+        self.assertEqual(result["bitop"], 1)
+        self.assertEqual(result["value"], "\x9e")
+        self.assertEqual(store.get("dest"), "\x9e")
+        result = store.apply({"op": "bitop", "key": "dest",
+                              "operation": "NOT", "keys": ["missing"]})
+        self.assertEqual(result["bitop"], 0)
+        self.assertTrue(result["deleted"])
+        self.assertIsNone(store.get("dest"))
+
+    def test_bitop_missing_key_counts_as_empty(self):
+        """A missing source counts as an all-zero string: AND with
+        one is all zeros, OR with one is the other value, and XOR
+        with one is the other value too."""
+        store = self._two_keys()
+        result = store.apply({"op": "bitop", "key": "dest",
+                              "operation": "AND",
+                              "keys": ["a", "missing"]})
+        self.assertEqual(result["bitop"], 1)
+        self.assertEqual(result["value"], "\x00")
+        result = store.apply({"op": "bitop", "key": "dest",
+                              "operation": "OR",
+                              "keys": ["a", "missing"]})
+        self.assertEqual(result["value"], "a")
+        result = store.apply({"op": "bitop", "key": "dest",
+                              "operation": "XOR",
+                              "keys": ["missing", "b"]})
+        self.assertEqual(result["value"], "A")
+
+    def test_bitop_different_lengths_pad_with_zeros(self):
+        """The result is as long as the longest input, and a
+        shorter input is padded with zero bytes — so AND keeps
+        only the long key's low byte zeroed, OR keeps it whole,
+        and XOR keeps it whole too."""
+        store = KVStore()
+        store.apply({"op": "set", "key": "a", "value": "\xff\xff"})
+        store.apply({"op": "set", "key": "b", "value": "\x0f"})
+        result = store.apply({"op": "bitop", "key": "dest",
+                              "operation": "AND", "keys": ["a", "b"]})
+        self.assertEqual(result["bitop"], 2)
+        self.assertEqual(result["value"], "\x0f\x00")
+        result = store.apply({"op": "bitop", "key": "dest",
+                              "operation": "OR", "keys": ["a", "b"]})
+        self.assertEqual(result["value"], "\xff\xff")
+        result = store.apply({"op": "bitop", "key": "dest",
+                              "operation": "XOR", "keys": ["a", "b"]})
+        self.assertEqual(result["value"], "\xf0\xff")
+
+    def test_bitop_all_missing_deletes_destination(self):
+        """When every input is missing or empty the result is the
+        empty string: the destination is deleted outright — it
+        leaves the sorted index and takes its deadline with it —
+        and the reply answers ``bitop`` 0 with ``deleted`` set."""
+        store = KVStore()
+        store.apply({"op": "set", "key": "dest", "value": "old",
+                     "ttl_entries": 10}, index=10)
+        store.apply({"op": "set", "key": "b", "value": "x"})
+        self.assertEqual(store.expiries(), {"dest": 20})
+        result = store.apply({"op": "bitop", "key": "dest",
+                              "operation": "AND",
+                              "keys": ["missing1", "missing2"]},
+                       index=11)
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["bitop"], 0)
+        self.assertTrue(result["deleted"])
+        self.assertIsNone(store.get("dest"))
+        self.assertEqual(store.keys(), (["b"], False))
+        self.assertEqual(store.expiries(), {})
+
+    def test_bitop_clears_dest_ttl(self):
+        """A bitop is a fresh set of its destination, not an
+        update: the deadline the destination had is cleared, like
+        a plain set — unlike a setbit, which keeps it."""
+        store = KVStore()
+        store.apply({"op": "set", "key": "dest", "value": "old",
+                     "ttl_entries": 10}, index=10)
+        store.apply({"op": "set", "key": "a", "value": "a"})
+        self.assertEqual(store.expiries(), {"dest": 20})
+        result = store.apply({"op": "bitop", "key": "dest",
+                              "operation": "OR", "keys": ["a"]},
+                       index=11)
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(store.get("dest"), "a")
+        self.assertEqual(store.expiries(), {})
+
+    def test_bitop_dest_as_source(self):
+        """The destination may also be a source: it is read as a
+        source first, then overwritten with the result — AND of a
+        key with itself is itself."""
+        store = self._two_keys()
+        store.apply({"op": "set", "key": "dest", "value": "\x0f"})
+        result = store.apply({"op": "bitop", "key": "dest",
+                              "operation": "AND",
+                              "keys": ["dest", "a"]})
+        self.assertEqual(result["value"], "\x01")
+        self.assertEqual(store.get("dest"), "\x01")
+
+    def test_bitop_wrongtype_leaves_dest_untouched(self):
+        """A source holding a character above U+00FF has no byte
+        form: bitop fails with bitop_failed / wrongtype and writes
+        nothing — the destination keeps its old value."""
+        store = KVStore()
+        store.apply({"op": "set", "key": "a", "value": "€"})
+        store.apply({"op": "set", "key": "dest", "value": "old"})
+        result = store.apply({"op": "bitop", "key": "dest",
+                              "operation": "OR", "keys": ["a", "b"]})
+        self.assertEqual(result["status"], "bitop_failed")
+        self.assertEqual(result["reason"], "wrongtype")
+        self.assertEqual(store.get("dest"), "old")
+
+    def test_bitop_new_key_joins_sorted_index(self):
+        """A bitop that creates its destination inserts it in the
+        sorted index, so a scan finds it in order."""
+        store = KVStore()
+        store.apply({"op": "set", "key": "b", "value": "x"})
+        store.apply({"op": "set", "key": "a", "value": "\xff"})
+        store.apply({"op": "bitop", "key": "c",
+                      "operation": "NOT", "keys": ["a"]})
+        self.assertEqual(store.keys(), (["a", "b", "c"], False))
+
+    def test_bitop_operation_is_case_insensitive(self):
+        """The operation is matched case-insensitively and
+        normalized — "and" combines like AND."""
+        store = self._two_keys()
+        result = store.apply({"op": "bitop", "key": "dest",
+                              "operation": "and", "keys": ["a", "b"]})
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["value"], "A")
+
+    def test_bitop_bad_operation_and_keys_raise(self):
+        """A bad operation, NOT with two keys, an empty key list,
+        a key list past the cap, or a non-string key is a
+        programming error at apply time — the leader validates
+        all of them before logging, so a hand-built entry with
+        any of them raises instead of combining nonsense."""
+        store = self._two_keys()
+        with self.assertRaises(ValueError):
+            store.apply({"op": "bitop", "key": "dest",
+                         "operation": "NAND", "keys": ["a"]})
+        with self.assertRaises(ValueError):
+            store.apply({"op": "bitop", "key": "dest",
+                         "operation": "NOT", "keys": ["a", "b"]})
+        with self.assertRaises(ValueError):
+            store.apply({"op": "bitop", "key": "dest",
+                         "operation": "AND", "keys": []})
+        with self.assertRaises(ValueError):
+            store.apply({"op": "bitop", "key": "dest",
+                         "operation": "AND",
+                         "keys": ["k"] * 1001})
+        with self.assertRaises(ValueError):
+            store.apply({"op": "bitop", "key": "dest",
+                         "operation": "AND", "keys": ["a", 7]})
+
+
+class TestBitopCluster(unittest.TestCase):
+    def test_bitop_replicates_to_every_node(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            self.assertEqual(write(addr, key="a", value="a")
+                             .get("status"), "ok")
+            self.assertEqual(write(addr, key="b", value="A")
+                             .get("status"), "ok")
+            with Session(addr) as session:
+                resp = session.bitop("dest", "AND", ["a", "b"])
+                self.assertEqual(resp.get("status"), "ok", resp)
+                self.assertEqual(resp.get("bitop"), 1, resp)
+                self.assertEqual(resp.get("value"), "A", resp)
+                self.assertGreater(session.last_write_index, 0)
+                # Read-your-writes through the same session: the
+                # get sees the bitop's result.
+                self.assertEqual(session.get("dest").get("value"),
+                                 "A")
+                resp = session.bitop("dest", "XOR", ["a", "b"])
+                self.assertEqual(resp.get("value"), " ", resp)
+                self.assertEqual(session.get("dest").get("value"),
+                                 " ")
+            for node_id in cluster.live:
+                self.assertTrue(
+                    wait_for_key(cluster.nodes[node_id], "dest",
+                                 " "))
+        finally:
+            cluster.stop_all()
+
+    def test_invalid_bitop_rejected_with_no_log_entry(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            before = len(leader.log)
+            resp = bitop(addr, operation="NAND", keys=["a"])
+            self.assertEqual(resp.get("status"), "error", resp)
+            self.assertIn("operation", resp.get("error", ""), resp)
+            resp = bitop(addr, operation="NOT", keys=["a", "b"])
+            self.assertEqual(resp.get("status"), "error", resp)
+            self.assertIn("NOT", resp.get("error", ""), resp)
+            resp = bitop(addr, operation="AND", keys=[])
+            self.assertEqual(resp.get("status"), "error", resp)
+            self.assertIn("keys", resp.get("error", ""), resp)
+            resp = bitop(addr, operation="AND",
+                         keys=["k"] * 1001)
+            self.assertEqual(resp.get("status"), "error", resp)
+            self.assertIn("keys", resp.get("error", ""), resp)
+            resp = client_request(
+                addr, {"type": "client", "op": "bitop", "key": "dest",
+                       "operation": "AND", "keys": ["a", 7]})
+            self.assertEqual(resp.get("status"), "error", resp)
+            self.assertIn("keys", resp.get("error", ""), resp)
+            resp = client_request(
+                addr, {"type": "client", "op": "bitop", "key": "dest",
+                       "operation": 7, "keys": ["a"]})
+            self.assertEqual(resp.get("status"), "error", resp)
+            self.assertIn("operation", resp.get("error", ""), resp)
+            # None of the rejected writes left a key behind, and
+            # none appended a log entry.
+            self.assertIsNone(read(addr, key="dest").get("value"))
+            self.assertEqual(len(leader.log), before)
+        finally:
+            cluster.stop_all()
+
+    def test_bitop_retry_returns_first_result_and_writes_once(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            self.assertEqual(write(addr, key="a", value="a")
+                             .get("status"), "ok")
+            self.assertEqual(write(addr, key="b", value="A")
+                             .get("status"), "ok")
+            resp = bitop(addr, operation="AND", dest="dest",
+                         keys=["a", "b"],
+                         client_id="c1", request_id="r1")
+            self.assertEqual(resp.get("bitop"), 1, resp)
+            self.assertEqual(resp.get("value"), "A", resp)
+            # A later write moves a source on — but the retry of
+            # the first bitop still answers the first attempt's
+            # length and value, and appends no second entry.
+            self.assertEqual(write(addr, key="a", value="b")
+                             .get("status"), "ok")
+            resp = bitop(addr, operation="XOR", dest="dest",
+                         keys=["a", "b"],
+                         client_id="c1", request_id="r1")
+            self.assertEqual(resp.get("status"), "ok", resp)
+            self.assertEqual(resp.get("bitop"), 1, resp)
+            self.assertEqual(resp.get("value"), "A", resp)
+            self.assertEqual(read(addr, key="dest").get("value"),
+                             "A")
+            self.assertEqual(count_entries(leader, "r1"), 1)
+        finally:
+            cluster.stop_all()
+
+    def test_bitop_fires_watch_events(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            follower = next(cluster.nodes[n] for n in cluster.live
+                            if n != leader.id)
+            self.assertEqual(write(addr, key="a", value="a")
+                             .get("status"), "ok")
+            self.assertEqual(write(addr, key="b", value="A")
+                             .get("status"), "ok")
+            events = []
+            leader.watch.watch("dest", events.append)
+            follower.watch.watch("dest", events.append)
+            resp = bitop(addr, operation="AND", dest="dest",
+                         keys=["a", "b"])
+            self.assertEqual(resp.get("value"), "A", resp)
+            deadline = time.monotonic() + 5.0
+            while len(events) < 2 and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertEqual(len(events), 2, events)
+            for event in events:
+                self.assertEqual(event["key"], "dest", event)
+                self.assertEqual(event["value"], "A", event)
+                self.assertEqual(event["op"], "set", event)
+            # An empty result deletes the destination, so the
+            # watch fires a del event instead.
+            events.clear()
+            resp = bitop(addr, operation="AND", dest="dest",
+                         keys=["missing1", "missing2"])
+            self.assertEqual(resp.get("bitop"), 0, resp)
+            self.assertTrue(resp.get("deleted"), resp)
+            deadline = time.monotonic() + 5.0
+            while len(events) < 2 and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertEqual(len(events), 2, events)
+            for event in events:
+                self.assertEqual(event["key"], "dest", event)
+                self.assertIsNone(event["value"], event)
+                self.assertEqual(event["op"], "del", event)
+            # A failed bitop — wrongtype on a non-byte-string
+            # source — writes nothing, so it fires nothing.
+            w_events = []
+            leader.watch.watch("w", w_events.append)
+            follower.watch.watch("w", w_events.append)
+            self.assertEqual(write(addr, key="w", value="€")
+                             .get("status"), "ok")
+            deadline = time.monotonic() + 5.0
+            while len(w_events) < 2 and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertEqual(len(w_events), 2, w_events)
+            resp = bitop(addr, operation="OR", dest="w",
+                         keys=["w", "a"])
+            self.assertEqual(resp.get("status"), "bitop_failed", resp)
+            time.sleep(0.3)
+            self.assertEqual(len(w_events), 2, w_events)
+        finally:
+            cluster.stop_all()
+
+    def test_bitop_survives_snapshot_and_restart(self):
+        cluster = Cluster(3, snapshot_threshold=5)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            self.assertEqual(write(addr, key="a", value="a")
+                             .get("status"), "ok")
+            self.assertEqual(write(addr, key="b", value="A")
+                             .get("status"), "ok")
+            self.assertEqual(bitop(addr, operation="XOR", dest="dest",
+                                   keys=["a", "b"]).get("value"), " ")
+            # Enough writes to compact the log past the bitop.
+            for i in range(10):
+                self.assertEqual(
+                    write(addr, key=f"pad{i}", value="x").get("status"),
+                    "ok")
+            self.assertEqual(read(addr, key="dest").get("value"), " ")
+            cluster.stop_node(leader.id)
+            cluster.restart_node(leader.id)
+            new_leader = cluster.wait_for_leader()
+            addr = cluster.addrs[new_leader.id]
+            self.assertEqual(read(addr, key="dest").get("value"), " ")
+            self.assertEqual(bitop(addr, operation="NOT", dest="dest",
+                                   keys=["dest"]).get("value"), "\xdf")
+        finally:
+            cluster.stop_all()
+
+    def test_pipeline_bitop_ops(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            with Session(addr) as session:
+                self.assertEqual(session.set("a", "a")
+                                 .get("status"), "ok")
+                self.assertEqual(session.set("b", "A")
+                                 .get("status"), "ok")
+                replies = session.pipeline([
+                    {"op": "bitop", "key": "d1",
+                     "operation": "AND", "keys": ["a", "b"]},
+                    {"op": "bitop", "key": "d2",
+                     "operation": "NOT", "keys": ["a"]},
+                    {"op": "bitop", "key": "d3",
+                     "operation": "NAND", "keys": ["a"]},
+                    {"op": "bitop", "key": "d4",
+                     "operation": "NOT", "keys": ["a", "b"]},
+                    {"op": "bitop", "key": "d5",
+                     "operation": "XOR", "keys": ["a", "b"]},
+                ])
+            self.assertEqual(len(replies), 5, replies)
+            self.assertEqual(replies[0].get("bitop"), 1, replies)
+            self.assertEqual(replies[0].get("value"), "A", replies)
+            self.assertEqual(replies[1].get("bitop"), 1, replies)
+            self.assertEqual(replies[1].get("value"), "\x9e", replies)
+            self.assertEqual(replies[2].get("status"), "error", replies)
+            self.assertEqual(replies[3].get("status"), "error", replies)
+            self.assertEqual(replies[4].get("bitop"), 1, replies)
+            self.assertEqual(replies[4].get("value"), " ", replies)
+            self.assertEqual(read(addr, key="d1").get("value"), "A")
+            self.assertEqual(read(addr, key="d2").get("value"), "\x9e")
+            self.assertIsNone(read(addr, key="d3").get("value"))
+            self.assertIsNone(read(addr, key="d4").get("value"))
+            self.assertEqual(read(addr, key="d5").get("value"), " ")
+        finally:
+            cluster.stop_all()
+
+    def test_bitop_module_function(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            follower = next(n for n in cluster.live
+                            if n != leader.id)
+            addr = cluster.addrs[leader.id]
+            self.assertEqual(write(addr, key="a", value="a")
+                             .get("status"), "ok")
+            self.assertEqual(write(addr, key="b", value="A")
+                             .get("status"), "ok")
+            # Sent to a follower, it follows the redirect to the
+            # leader like any other module-level write.
+            resp = client_bitop(cluster.addrs[follower], "dest",
+                                "AND", ["a", "b"])
+            self.assertEqual(resp.get("status"), "ok", resp)
+            self.assertEqual(resp.get("bitop"), 1, resp)
+            self.assertEqual(resp.get("value"), "A", resp)
+            self.assertEqual(read(addr, key="dest").get("value"), "A")
+        finally:
+            cluster.stop_all()
+
+    def test_bitop_cli(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            host, port = cluster.addrs[leader.id]
+            node = f"{host}:{port}"
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "set", "a", "a"])
+            self.assertEqual(rc, 0)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "set", "b", "A"])
+            self.assertEqual(rc, 0)
+            # AND prints the result length; the destination holds
+            # the combined value.
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "bitop", "AND",
+                                  "dest", "a", "b"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(out.getvalue().strip(), "1")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "get", "dest"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(out.getvalue().strip(), "A")
+            # XOR of the same two keys is a space.
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "bitop", "XOR",
+                                  "dest", "a", "b"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(out.getvalue().strip(), "1")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "get", "dest"])
+            self.assertEqual(rc, 0)
+            # The value is one space: compare un-stripped, since
+            # strip() would eat the value itself.
+            self.assertEqual(out.getvalue(), " \n")
+            # An empty result prints 0 and deletes the
+            # destination.
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "bitop", "AND",
+                                  "dest", "missing1", "missing2"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(out.getvalue().strip(), "0")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "get", "dest"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(out.getvalue().strip(), "(nil)")
+            # A bad operation is a server error, not a write.
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = client_main(["--node", node, "bitop", "NAND",
+                                  "dest", "a"])
+            self.assertEqual(rc, 1)
+            self.assertIn("operation", err.getvalue())
+            # NOT with two keys is a server error too.
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = client_main(["--node", node, "bitop", "NOT",
+                                  "dest", "a", "b"])
+            self.assertEqual(rc, 1)
+            self.assertIn("NOT", err.getvalue())
         finally:
             cluster.stop_all()
 

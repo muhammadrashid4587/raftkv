@@ -45,6 +45,16 @@ HLL_REGISTERS = 1 << HLL_PRECISION
 HLL_PREFIX = "\x00raftkv-hll\x00"
 HLL_VALUE_LENGTH = len(HLL_PREFIX) + HLL_REGISTERS
 
+# Largest number of source keys one ``bitop`` may carry. The keys
+# ride in one log entry and one frame, so an unbounded list would
+# let one entry grow without limit (and replicate that growth to
+# every node). 1,000 keys is far past a real use of one BITOP call
+# — a client combining more splits the batch, like an mget client
+# splits a batch past 1000 keys — so it only rejects nonsense,
+# never a real use — the same scale as the pfadd cap above, for the
+# same reason.
+BITOP_MAX_KEYS = 1000
+
 # Hashes (HSET / HGET), Redis-style field-value maps. A hash rides in
 # _data as a JSON object with a marker prefix, the same trick the HLL
 # uses — one string in the same keyspace every other value lives in,
@@ -323,7 +333,10 @@ class KVStore:
         a getset, an hset, and an hdel that leaves fields behind:        all five are updates of the value, not fresh sets, so
         none must resurrect a key that is about to expire. (An
         hdel that removes the last field deletes the key, and
-        the deadline goes with it.) A
+        the deadline goes with it.) A bitop is a fresh set of its
+        destination, so it clears the destination's deadline, like
+        a plain set — and when every input is empty it deletes the
+        destination outright, deadline and all. A
         ``setex`` carries an absolute wall-clock deadline
         (``wall_deadline``, fixed by the leader before the entry
         was logged) instead of a log distance: it is recorded
@@ -334,7 +347,7 @@ class KVStore:
         Returns a result dict for commands whose outcome depends on the
         state at apply time — currently "set", "cas", "expire", "expireat",
         "pexpireat", "incr", "incrbyfloat", "setnx", "getset", "append", "getdel",
-        "setrange", "getex", "setbit", "pfadd", "hset", and "hdel" —
+        "setrange", "getex", "setbit", "bitop", "pfadd", "hset", and "hdel" —
         and None for del, whose outcome is always ok. The result is
         what the leader hands back to the waiting client and what the
         dedup table caches for retries, so it must be a pure function
@@ -985,6 +998,124 @@ class KVStore:
             self._data[key] = new
             return {"type": "client_response", "status": "ok",
                     "old_bit": old, "value": new}
+        elif op == "bitop":
+            # Bitwise AND / OR / XOR / NOT across string keys,
+            # Redis BITOP: the result is a string of the same
+            # length as the longest input, missing keys count as
+            # empty (all-zero) strings, and the result overwrites
+            # the destination key — a fresh set, so any deadline
+            # the destination had is cleared, log-entry or
+            # wall-clock, like a plain set. Bit 0 is the most
+            # significant bit of the first byte, like a setbit.
+            # The reply carries ``bitop`` — the length of the
+            # result — and the result ``value`` itself, which is
+            # what the watch event fires with. When every input
+            # is missing or empty the result is the empty string:
+            # Redis deletes the destination there instead of
+            # storing an empty value, so this does too — the
+            # reply is ``bitop`` 0 with ``deleted`` set when a
+            # key actually went, and the apply path fires a
+            # ``del`` event for it. The outcome is decided here,
+            # at this exact point in the log, so a retry with
+            # the same session id returns the first attempt's
+            # length instead of combining twice. A source value
+            # that is not a byte string fails with WRONGTYPE,
+            # like a setbit on a value that is not a byte
+            # string — a bit op reads each value as bytes, one
+            # byte per character (latin-1), so a value holding
+            # a character above U+00FF has no byte form to
+            # combine. A failed bitop writes nothing at all,
+            # like a failed setbit — and the destination is
+            # untouched even when it is also a source, since the
+            # failure is decided before anything is written.
+            # The operation and the key list were validated on
+            # the leader before the entry was logged (one of
+            # AND / OR / XOR / NOT, 1 to BITOP_MAX_KEYS string
+            # keys, NOT with exactly one), so by apply time
+            # they are well-formed — a hand-built log entry with
+            # a bad operation or key list still raises rather
+            # than silently combining nonsense.
+            key = command["key"]
+            operation = command.get("operation")
+            if (not isinstance(operation, str)
+                    or operation.upper()
+                    not in ("AND", "OR", "XOR", "NOT")):
+                raise ValueError(
+                    "bitop operation must be AND, OR, XOR, or NOT")
+            operation = operation.upper()
+            keys = command.get("keys")
+            if (not isinstance(keys, list) or not keys
+                    or len(keys) > BITOP_MAX_KEYS
+                    or any(not isinstance(k, str) for k in keys)):
+                raise ValueError(
+                    "bitop keys must be a list of 1 to "
+                    f"{BITOP_MAX_KEYS} strings")
+            if operation == "NOT" and len(keys) != 1:
+                raise ValueError(
+                    "bitop NOT takes exactly one source key")
+            raws: list[bytes] = []
+            for source in keys:
+                current = self._data.get(source)
+                if current is not None and not isinstance(current, str):
+                    return {"type": "client_response",
+                            "status": "bitop_failed",
+                            "reason": "wrongtype",
+                            "current": current,
+                            "error": "bitop failed: value of "
+                                     f"{source!r} is not a byte string"}
+                try:
+                    raws.append((current or "").encode("latin-1"))
+                except UnicodeEncodeError:
+                    return {"type": "client_response",
+                            "status": "bitop_failed",
+                            "reason": "wrongtype",
+                            "current": current,
+                            "error": "bitop failed: value of "
+                                     f"{source!r} is not a byte string"}
+            length = max((len(raw) for raw in raws), default=0)
+            if length == 0:
+                # Every input missing or empty: the destination
+                # goes, like Redis — no empty value is stored.
+                deleted = key in self._data
+                if deleted:
+                    del self._data[key]
+                    idx = bisect.bisect_left(self._keys, key)
+                    if idx < len(self._keys) and self._keys[idx] == key:
+                        del self._keys[idx]
+                self._expiry.pop(key, None)
+                self._wall_expiry.pop(key, None)
+                return {"type": "client_response", "status": "ok",
+                        "bitop": 0, "value": "",
+                        "deleted": deleted}
+            # Every input is padded with zero bytes to the longest
+            # one's length before combining: a missing key is an
+            # all-zero string, and a shorter key's missing tail is
+            # zeros too — so AND zeroes the tail, OR / XOR keep
+            # the long key's tail whole, exactly as Redis does.
+            padded = [raw + b"\x00" * (length - len(raw))
+                      for raw in raws]
+            result = bytearray(padded[0])
+            for raw in padded[1:]:
+                if operation == "AND":
+                    for i in range(length):
+                        result[i] &= raw[i]
+                elif operation == "OR":
+                    for i in range(length):
+                        result[i] |= raw[i]
+                elif operation == "XOR":
+                    for i in range(length):
+                        result[i] ^= raw[i]
+            if operation == "NOT":
+                for i in range(length):
+                    result[i] = ~padded[0][i] & 0xFF
+            new = bytes(result).decode("latin-1")
+            if key not in self._data:
+                bisect.insort(self._keys, key)
+            self._data[key] = new
+            self._expiry.pop(key, None)
+            self._wall_expiry.pop(key, None)
+            return {"type": "client_response", "status": "ok",
+                    "bitop": length, "value": new}
         elif op == "pfadd":
             # Add elements to a HyperLogLog, Redis PFADD: each
             # element hashes (SHA-256, deterministic across nodes)

@@ -631,6 +631,39 @@ logic and the failure handling, not the key-value API on top.
   a value written as multi-byte UTF-8 text is read as its
   latin-1 characters, not its UTF-8 bytes, and a character
   above U+00FF is not a byte string at all.
+- **Bitwise combination** — since v0.60.0 `bitop operation
+  destkey key [key ...]` (`Session.bitop(dest, operation, keys)`,
+  `client.bitop(addr, dest, operation, keys)`, `bitop AND dest
+  k1 k2 ...` on the CLI) combines the string values at the source
+  keys bitwise — AND, OR, XOR, or NOT (NOT takes exactly one
+  source key) — stores the result at the destination, and answers
+  with the result length (`bitop`) and the result value itself —
+  Redis BITOP. The result is as long as the longest input, missing
+  keys count as empty (all-zero) strings, and a shorter input is
+  padded with zero bytes, so AND zeroes a missing tail while OR /
+  XOR keep the long key's tail whole. When every input is missing
+  or empty the result is the empty string: the destination is
+  deleted instead of storing an empty value, answering `bitop` 0
+  with `deleted` set when a key actually went. A bitop is a fresh
+  set of its destination, so it clears the destination's TTL
+  deadline, like a plain set — unlike a setbit, which keeps it —
+  and it fires a `set` watch event with the result, or a `del`
+  event when the empty result deletes the destination. The outcome
+  is decided at apply time, at the entry's exact position in the
+  log, like a CAS: a retry with the same session id returns the
+  first attempt's length instead of combining twice. A source value
+  that is not a byte string fails with `bitop_failed` and reason
+  `wrongtype` instead of writing, and a bad operation, an empty
+  key list, or more than 1000 keys (`BITOP_MAX_KEYS`) is a client
+  error and appends nothing — NOT with two keys is one too. The
+  operation is matched case-insensitively and normalized to upper
+  case before it is logged, so every node applies the same
+  spelling. `{"op": "bitop", "key": d, "operation": "AND", "keys":
+  [k1, k2, ...]}` is a pipeline op too. The result rides in the
+  store as a plain string, so it survives snapshots and replay
+  exactly like any other value. The honest limit is the same
+  encoding as setbit: a value holding a character above U+00FF
+  has no byte form to combine.
 - **HyperLogLog** — since v0.47.0 `pfadd key element [element ...]`
   (`Session.pfadd(k, *elements)`, `client.pfadd(addr, k, *elements)`,
   `pfadd key element ...` on the CLI) adds elements to the
@@ -1128,7 +1161,7 @@ make test
 # or: python3 -m unittest discover -s tests -v
 ```
 
-672 tests, plus a smoke test for the benchmark script, all passing:
+691 tests, plus a smoke test for the benchmark script, all passing:
 
 | Test | What it proves |
 |---|---|
@@ -3208,3 +3241,41 @@ entries left in `log.jsonl` are dropped by their index on reload.
   a new roadmap item grounded in this project's purpose,
   proposed by the next run — candidates: BITOP (bitwise ops
   across string keys), or GEO, or streams.
+- ~~BITOP (bitwise combination)~~ — done in v0.60.0,
+  Nov 26, 2026: `bitop operation destkey key [key ...]`
+  combines the string values at the source keys bitwise — AND,
+  OR, XOR, or NOT (NOT takes exactly one source key) — stores
+  the result at the destination, and answers with the result
+  length (`bitop`) and the result value itself — Redis BITOP.
+  The result is as long as the longest input, missing keys count
+  as empty strings, shorter inputs are padded with zero bytes,
+  and when every input is missing or empty the destination is
+  deleted instead of storing an empty value, answering `bitop` 0.
+  A bitop is a fresh set of its destination, so it clears the
+  destination's TTL deadline, like a plain set, and fires a `set`
+  watch event with the result — or a `del` event when the empty
+  result deletes the destination. The outcome is decided at apply
+  time, so a retry with the same session id returns the first
+  attempt's length instead of combining twice; a non-byte-string
+  source fails with `bitop_failed` / `wrongtype`, and a bad
+  operation, an empty key list, or more than 1000 keys is a client
+  error that appends nothing. `Session.bitop` /
+  `client.bitop`, and `bitop` on the CLI, plus `{"op": "bitop"}`
+  as a pipeline op. `tests/test_bit_ops.py` proves it: store-level
+  AND / OR / XOR / NOT, missing keys as empty strings, different
+  lengths padded with zeros, all-missing deleting the destination
+  and its deadline, TTL cleared on the destination, the
+  destination as a source, wrongtype leaving the destination
+  untouched, the destination joining the sorted index, and bad
+  operations and key lists raising at apply time; cluster-level
+  replication to every node, invalid bitops rejected with no log
+  entry, dedup of a bitop retry returning the first attempt's
+  length, the watch events on leader and follower (set, del, and
+  nothing on a failed bitop), surviving a snapshot + restart,
+  session read-your-writes, pipelined bitop ops with a bad
+  operation and a NOT with two keys in position, the module
+  function from a follower, and the CLI end to end.
+  The roadmap is exhausted again, so the next real thing is
+  a new roadmap item grounded in this project's purpose,
+  proposed by the next run — candidates: BITCOUNT, or GEO, or
+  streams.

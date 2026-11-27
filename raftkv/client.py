@@ -130,6 +130,7 @@ class Session:
                 in ("ok", "cas_failed", "incr_failed",
                     "incrbyfloat_failed", "append_failed",
                     "setrange_failed", "setbit_failed",
+                    "bitop_failed",
                     "pfadd_failed", "hset_failed", "hdel_failed")
                 and resp.get("index") is not None):
             self.last_write_index = int(resp["index"])
@@ -325,6 +326,8 @@ class Session:
             {"op": "getex", "key": k, "persist": True}
             {"op": "setrange", "key": k, "offset": n, "value": v}
             {"op": "setbit", "key": k, "offset": n, "bit": b}
+            {"op": "bitop", "key": d, "operation": "AND",
+             "keys": [k1, k2, ...]}
             {"op": "pfadd", "key": k, "elements": [e1, e2, ...]}
             {"op": "hset", "key": k, "pairs": [[f1, v1], [f2, v2]]}
             {"op": "setex", "key": k, "value": v, "seconds": n}
@@ -408,8 +411,8 @@ class Session:
                         in ("ok", "cas_failed", "incr_failed",
                             "incrbyfloat_failed",
                             "append_failed", "setrange_failed",
-                            "setbit_failed", "pfadd_failed",
-                            "hset_failed", "hdel_failed")
+                            "setbit_failed", "bitop_failed",
+                            "pfadd_failed", "hset_failed", "hdel_failed")
                         and resp.get("index") is not None):
                     index = int(resp["index"])
                     if index > self.last_write_index:
@@ -693,6 +696,30 @@ class Session:
                 self.last_read_index = read_index
                 self.last_read_term = int(resp.get("read_term") or 0)
         return resp
+
+    def bitop(self, dest: str, operation: str,
+              keys: list[str]) -> dict:
+        """Combine the string values at ``keys`` bitwise and store
+        the result at ``dest``, Redis BITOP: ``operation`` is one
+        of AND, OR, XOR, NOT (NOT takes exactly one source key),
+        the result is as long as the longest input, missing keys
+        count as empty strings, and the reply carries ``bitop`` —
+        the length of the result — and the result ``value``. A
+        result of length 0 deletes the destination instead of
+        storing an empty value, and answers ``bitop`` 0. The
+        outcome is decided at apply time, at the entry's position
+        in the log, so a retry with the same session id returns
+        the first attempt's length instead of combining twice,
+        and a successful bitop clears the destination's TTL
+        deadline, like a plain set. A source value that is not a
+        byte string fails with ``bitop_failed`` and reason
+        ``wrongtype`` instead of writing. A successful bitop
+        advances the write watermark from the reply's index, like
+        any other write — and so does a failed one, since it still
+        committed its entry."""
+        return self._write({"type": "client", "op": "bitop",
+                            "key": dest, "operation": operation,
+                            "keys": list(keys)})
 
     def pfadd(self, key: str, *elements: str) -> dict:
         """Add ``elements`` to the HyperLogLog at ``key``, Redis
@@ -1381,7 +1408,10 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
     log index, ``persist`` a bare flag), ``setrange`` a
     string key, an integer ``offset`` and a string value,
     ``setbit`` a string key, an integer ``offset`` and a bit
-    that is 0 or 1, ``pfadd`` a string key and a non-empty list
+    that is 0 or 1, ``bitop`` a string destination key, an
+    operation that is AND, OR, XOR, or NOT, and a non-empty list
+    of at most 1000 string source keys (NOT takes exactly one),
+    ``pfadd`` a string key and a non-empty list
     of at most 1000 string elements, ``hset`` a string key and a
     non-empty list of at most 1000 [field, value] string pairs,
     ``hdel`` a string key and a non-empty list of at most 1000
@@ -1399,12 +1429,13 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
     if name not in ("set", "del", "cas", "incr", "incrbyfloat",
                     "setnx", "getset",
                     "append", "getdel", "getex", "setrange", "setbit",
+                    "bitop",
                     "pfadd", "hset", "hdel", "setex", "expireat",
                     "pexpireat"):
         return None, {"type": "client_response", "status": "error",
                       "error": "pipeline op must be set, del, cas, "
                                "incr, incrbyfloat, setnx, getset, append, "
-                               "getdel, getex, setrange, setbit, "
+                               "getdel, getex, setrange, setbit, bitop, "
                                "pfadd, hset, hdel, setex, expireat, or "
                                "pexpireat"}
     key = op.get("key")
@@ -1600,6 +1631,34 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
                                    "or 1"}
         msg["offset"] = offset
         msg["bit"] = bit
+    if name == "bitop":
+        # ``operation`` and ``keys`` ride along with a pipelined
+        # bitop, validated here so a malformed one never goes on
+        # the wire: an operation that is AND, OR, XOR, or NOT —
+        # matched case-insensitively, like the server — and a
+        # non-empty list of at most 1000 string source keys, with
+        # NOT taking exactly one — the same shapes the server
+        # enforces.
+        operation = op.get("operation")
+        if (not isinstance(operation, str)
+                or operation.upper()
+                not in ("AND", "OR", "XOR", "NOT")):
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline bitop operation must be "
+                                   "AND, OR, XOR, or NOT"}
+        keys = op.get("keys")
+        if (not isinstance(keys, list) or not keys
+                or len(keys) > 1000
+                or any(not isinstance(k, str) for k in keys)):
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline bitop keys must be a "
+                                   "list of 1 to 1000 strings"}
+        if operation.upper() == "NOT" and len(keys) != 1:
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline bitop NOT takes exactly "
+                                   "one source key"}
+        msg["operation"] = operation.upper()
+        msg["keys"] = list(keys)
     if name == "pfadd":
         # ``elements`` rides along with a pipelined pfadd,
         # validated here so a malformed one never goes on the
@@ -1744,7 +1803,8 @@ def pipeline(node_addr: tuple[str, int], ops: list,
 
     One ``set`` / ``del`` / ``cas`` / ``incr`` / ``setnx`` /
     ``getset`` / ``append`` / ``getdel`` / ``getex`` / ``setrange`` /
-    ``setbit`` / ``pfadd`` / ``setex`` / ``expireat`` / ``pexpireat``
+    ``setbit`` / ``bitop`` / ``pfadd`` / ``setex`` / ``expireat`` /
+    ``pexpireat``
     op per
     dict (see
     ``Session.pipeline`` for the shapes): the ops go out in
@@ -2190,6 +2250,29 @@ def getbit(node_addr: tuple[str, int], key: str, offset: int,
     return request(node_addr, {"type": "client", "op": "getbit",
                                "key": key, "offset": offset},
                    timeout=timeout)
+
+
+def bitop(node_addr: tuple[str, int], dest: str, operation: str,
+          keys: list[str], timeout: float = 12.0) -> dict:
+    """Combine the string values at ``keys`` bitwise and store the
+    result at ``dest``, following leader redirects like
+    ``request`` — Redis BITOP.
+
+    One request appends the bitop entry, so the length it returns
+    is decided at the entry's position in the log: the reply is the
+    plain bitop response (``status`` ``ok`` with ``bitop`` — the
+    length of the result — and the result ``value`` — or
+    ``bitop_failed`` with reason ``wrongtype`` when a source value
+    is not a byte string). ``operation`` is one of AND, OR, XOR,
+    NOT (NOT takes exactly one source key); the result is as long
+    as the longest input, missing keys count as empty strings, and
+    a result of length 0 deletes the destination instead of
+    storing an empty value, answering ``bitop`` 0. A successful
+    bitop clears the destination's TTL deadline, like a plain
+    set."""
+    return request(node_addr, {"type": "client", "op": "bitop",
+                               "key": dest, "operation": operation,
+                               "keys": list(keys)}, timeout=timeout)
 
 
 def pfadd(node_addr: tuple[str, int], key: str, *elements: str,
@@ -3020,6 +3103,26 @@ def main(argv: list[str] | None = None) -> int:
     p_getbit.add_argument("offset", type=int,
                           help="bit to read, 0-based; bit 0 is the most "
                                "significant bit of the first byte")
+    p_bitop = sub.add_parser(
+        "bitop",
+        help="combine the string values at key ... bitwise (AND, "
+             "OR, XOR, NOT) and store the result at dest, printing "
+             "the length of the result; a missing key counts as "
+             "empty, and an empty result deletes dest")
+    p_bitop.add_argument("operation",
+                         help="the bitwise operation: AND, OR, XOR, "
+                              "or NOT (NOT takes exactly one key)")
+    p_bitop.add_argument("key",
+                         help="destination key to store the result at")
+    p_bitop.add_argument("keys", nargs="+",
+                         help="source keys to combine (at most 1000)")
+    p_bitop.add_argument("--client-id", default=None,
+                         help="session id for at-most-once writes: a retry "
+                              "with the same client id + request id returns "
+                              "the first attempt's result instead of writing "
+                              "twice")
+    p_bitop.add_argument("--request-id", default=None,
+                         help="id of this write within the client session")
     p_pfadd = sub.add_parser(
         "pfadd",
         help="add elements to the HyperLogLog at key and print 1 "
@@ -3226,6 +3329,7 @@ def main(argv: list[str] | None = None) -> int:
               "incrbyfloat",
               "setnx", "getset", "append", "strlen", "getdel",
               "getex", "getrange", "setrange", "setbit", "getbit",
+              "bitop",
               "pfadd", "pfcount", "hset", "hget", "hdel", "hgetall",
               "hlen", "hexists", "hkeys", "hvals", "hmget", "hscan",
               "setex", "expireat",
@@ -3317,6 +3421,9 @@ def main(argv: list[str] | None = None) -> int:
         msg["bit"] = args.bit
     if op == "getbit":
         msg["offset"] = args.offset
+    if op == "bitop":
+        msg["operation"] = args.operation
+        msg["keys"] = args.keys
     if op == "pfadd":
         msg["elements"] = args.elements
     if op == "hset":
@@ -3341,7 +3448,8 @@ def main(argv: list[str] | None = None) -> int:
     if op in ("set", "del", "cas", "mset", "expire", "incr",
               "incrbyfloat", "setnx",
               "getset", "append", "getdel", "getex", "setrange",
-              "setbit", "pfadd", "hset", "hdel", "setex", "expireat",
+              "setbit", "bitop", "pfadd", "hset", "hdel", "setex",
+              "expireat",
               "pexpireat") \
             and args.request_id:
         # A request id without an explicit client id still dedups
@@ -3407,6 +3515,8 @@ def main(argv: list[str] | None = None) -> int:
             print(resp.get("old_bit"))
         elif op == "getbit":
             print(resp.get("bit"))
+        elif op == "bitop":
+            print(resp.get("bitop"))
         elif op == "pfadd":
             print(resp.get("pfadd"))
         elif op == "pfcount":
