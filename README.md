@@ -961,6 +961,64 @@ logic and the failure handling, not the key-value API on top.
   xadd — the whole stream is one blob, so a readgroup still scans
   the blob — and the scope: XTRIM's ACKED mode behaves like
   KEEPREF in this version.
+- **Streams (XAUTOCLAIM)** — since v0.73.0
+  `xautoclaim key group consumer min-idle-ms [start] [--count n]
+  [--justid]` is XAUTOCLAIM — claiming pending entries in bulk
+  from a dead consumer, the reaper loop to XCLAIM's one-off
+  takeover: it walks the group's pending list in ID order from
+  just after `start` ("0-0" or "0" from the very first pending
+  entry, a bare millisecond, or a full "ms-seq") and takes over
+  every entry idle at least the minimum — the milliseconds since
+  its last delivery, measured against the wall-clock millisecond
+  the leader fixed at log time, like an xclaim — moving it to
+  the claiming consumer, raising its delivery count by one, and
+  re-stamping its delivery time to the claim's time, so the idle
+  measures since this claim. COUNT caps how many pending
+  entries one call examines (default 100), not how many it
+  claims — a call can return fewer than COUNT claimed entries
+  when the ones it examined were too fresh to take — and the
+  reply carries `next`, the ID to pass as `start` on the next
+  call, "0-0" when the scan reached the end of the pending
+  list, so a reaper pages through the whole pending list one
+  call at a time. A pending entry whose data is gone — trimmed
+  away under KEEPREF, so there is nothing left to return — is
+  dropped from the pending list and reported under `deleted`,
+  like Redis's third reply element, and JUSTID answers only
+  the claimed IDs. An entry with no provable idle — its
+  deliveries all came from replays of pre-v0.71.0 log entries
+  and so carries no stamp — is skipped, like an xclaim without
+  FORCE, and there is no FORCE here: Redis has none for
+  XAUTOCLAIM either. It is a write through the log like an
+  xclaim, decided at apply time, so a retry with the same
+  session id returns the first attempt's cursor and entries
+  instead of claiming them twice, and a call that claims
+  nothing and deletes nothing writes nothing at all; a missing
+  key or group — or a plain string value, or a bad group,
+  consumer, start, minimum idle, or count — fails as a client
+  error, not an empty claim. `Session` methods, `client`
+  module functions, a pipelined xautoclaim, and the
+  `xautoclaim` command on the CLI.
+  `tests/test_xautoclaim.py` proves it: store-level the claim
+  moving entries in ID order with exact idle times from fixed
+  stamps and the cursor at the end, the cursor paging through
+  the pending list one entry at a time, COUNT bounding the
+  entries examined rather than the entries claimed, too-fresh
+  and unstamped entries skipped, JUSTID answering only IDs,
+  a trimmed KEEPREF entry reported deleted and dropped from
+  the pending list, COUNT 0 claiming nothing and leaving the
+  cursor where it was, a start past the last pending entry
+  answering empty, missing keys and groups, wrongtype, and bad
+  arguments; and cluster-level the full flow replicated to every
+  node, idle times that grow as time passes, the cursor paging
+  through a fresh batch, the options end to end, bad arguments
+  as client errors with no log entry, session methods, the
+  module functions from a follower, a pipelined autoclaim,
+  snapshot + restart survival, and the CLI end to end.
+  The honest limit is the scan itself: COUNT bounds the work
+  per call, but the entries examined are the pending list's,
+  and the whole stream is still one blob, so a reaper over a
+  huge pending list still walks it — just a bounded slice at a
+  time.
 - **Streams (XGROUP SETID / DESTROY / DELCONSUMER)** — since
   v0.69.0 `xgroup_setid key group [id] [--entries-read n]`,
   `xgroup_destroy key group`, and `xgroup_delconsumer key group
@@ -4185,7 +4243,66 @@ entries left in `log.jsonl` are dropped by their index on reload.
   end, bad arguments as client errors with no log entry, session
   methods, the module functions from a follower, a pipelined
   claim, snapshot + restart survival, and the CLI end to end.
+- ~~Streams (XAUTOCLAIM)~~ — done in v0.73.0, Nov 27, 2026:
+  `xautoclaim key group consumer min-idle-ms [start] [--count n]
+  [--justid]` is XAUTOCLAIM — claiming pending entries in bulk
+  from a dead consumer, the reaper loop to XCLAIM's one-off
+  takeover: it walks the group's pending list in ID order from
+  just after `start` ("0-0" or "0" from the very first pending
+  entry, a bare millisecond, or a full "ms-seq") and takes over
+  every entry idle at least the minimum — the milliseconds since
+  its last delivery, measured against the wall-clock millisecond
+  the leader fixed at log time, like an xclaim — moving it to
+  the claiming consumer, raising its delivery count by one, and
+  re-stamping its delivery time to the claim's time, so the idle
+  measures since this claim. COUNT caps how many pending
+  entries one call examines (default 100), not how many it
+  claims — a call can return fewer than COUNT claimed entries
+  when the ones it examined were too fresh to take — and the
+  reply carries `next`, the ID to pass as `start` on the next
+  call, "0-0" when the scan reached the end of the pending
+  list, so a reaper pages through the whole pending list one
+  call at a time. A pending entry whose data is gone — trimmed
+  away under KEEPREF, so there is nothing left to return — is
+  dropped from the pending list and reported under `deleted`,
+  like Redis's third reply element, and JUSTID answers only
+  the claimed IDs. An entry with no provable idle — its
+  deliveries all came from replays of pre-v0.71.0 log entries
+  and so carries no stamp — is skipped, like an xclaim without
+  FORCE, and there is no FORCE here: Redis has none for
+  XAUTOCLAIM either. It is a write through the log like an
+  xclaim, decided at apply time, so a retry with the same
+  session id returns the first attempt's cursor and entries
+  instead of claiming them twice, and a call that claims
+  nothing and deletes nothing writes nothing at all; a missing
+  key or group — or a plain string value, or a bad group,
+  consumer, start, minimum idle, or count — fails as a client
+  error, not an empty claim. `Session` methods, `client`
+  module functions, a pipelined xautoclaim, and the
+  `xautoclaim` command on the CLI.
+  `tests/test_xautoclaim.py` proves it: store-level the claim
+  moving entries in ID order with exact idle times from fixed
+  stamps and the cursor at the end, the cursor paging through
+  the pending list one entry at a time, COUNT bounding the
+  entries examined rather than the entries claimed, too-fresh
+  and unstamped entries skipped, JUSTID answering only IDs,
+  a trimmed KEEPREF entry reported deleted and dropped from
+  the pending list, COUNT 0 claiming nothing and leaving the
+  cursor where it was, a start past the last pending entry
+  answering empty, missing keys and groups, wrongtype, and bad
+  arguments; and cluster-level the full flow replicated to every
+  node, idle times that grow as time passes, the cursor paging
+  through a fresh batch, the options end to end, bad arguments
+  as client errors with no log entry, session methods, the
+  module functions from a follower, a pipelined autoclaim,
+  snapshot + restart survival, and the CLI end to end.
+  The honest limit is the scan itself: COUNT bounds the work
+  per call, but the entries examined are the pending list's,
+  and the whole stream is still one blob, so a reaper over a
+  huge pending list still walks it — just a bounded slice at a
+  time.
   The roadmap is exhausted again, so the next real thing is
   a new roadmap item grounded in this project's purpose,
-  proposed by the next run — candidates: XAUTOCLAIM, claiming
-  pending entries in bulk by idle time.
+  proposed by the next run — candidates: XREADGROUP with
+  NOACK re-reads of pending entries by consumer, or a
+  stream-level XINFO lag report per consumer.

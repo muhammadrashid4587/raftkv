@@ -1497,7 +1497,7 @@ class RaftNode:
                 # getset, append, getdel, setrange, getex, setbit,
                 # bitop, pfadd, hset, hdel, geoadd, xadd, xtrim,
                 # xgroup_create, xreadgroup, xack, xclaim,
-                # xgroup_setid,
+                # xautoclaim, xgroup_setid,
                 # xgroup_destroy, and xgroup_delconsumer:
                 # their outcome is decided here, at this exact point
                 # in the log, so the result is recorded in the dedup
@@ -1808,6 +1808,26 @@ class RaftNode:
                                       self.sm.get(entry["command"]["key"]),
                                       "set",
                                       index=self.last_applied)
+                elif (op == "xautoclaim" and result is not None
+                        and result.get("status") == "ok"
+                        and (result.get("entries")
+                             or result.get("ids")
+                             or result.get("deleted"))):
+                    # An autoclaim that took entries over — or
+                    # dropped trimmed ones from the pending list —
+                    # fires like a set, with the new (stream blob)
+                    # value: it changed who holds the entries, so
+                    # a watcher sees the change — and a call that
+                    # took nothing and dropped nothing changed
+                    # nothing, so it fires nothing, like a failed
+                    # xadd — and a failed autoclaim wrote nothing
+                    # either. A JUSTID call carries its IDs under
+                    # "ids", not "entries", so it fires on those
+                    # instead.
+                    self.watch.notify(entry["command"]["key"],
+                                      self.sm.get(entry["command"]["key"]),
+                                      "set",
+                                      index=self.last_applied)
                 elif (op == "xgroup_setid" and result is not None
                         and result.get("status") == "ok"
                         and result.get("changed")):
@@ -1859,7 +1879,7 @@ class RaftNode:
                            "geoadd", "xadd", "xtrim", "xgroup_create",
                            "xreadgroup", "xack", "xgroup_setid",
                            "xgroup_destroy", "xgroup_delconsumer",
-                           "xclaim")
+                           "xclaim", "xautoclaim")
                         and result is not None
                         and self.role == "leader"):
                     # Record the outcome only when a local waiter is
@@ -1938,7 +1958,10 @@ class RaftNode:
         the entries, or no_group / wrongtype for an xreadgroup;
         the count of acked entries, or no_group / wrongtype for
         an xack; the claimed entries (or just their IDs with
-        JUSTID), or no_group / wrongtype for an xclaim; 1, or
+        JUSTID), or no_group / wrongtype for an xclaim; the next
+        cursor, the claimed entries (or just their IDs with
+        JUSTID), and the deleted IDs, or no_group / wrongtype for
+        an xautoclaim; 1, or
         no_group / wrongtype for an xgroup_setid;
         1 or 0, or no_group / wrongtype for an xgroup_destroy;
         the count of dropped pending entries, or no_group /
@@ -2879,7 +2902,7 @@ class RaftNode:
                       "geoadd", "geodist",
                       "xadd", "xtrim", "xlen", "xrange",
                       "xgroup_create", "xreadgroup", "xack",
-                      "xclaim",
+                      "xclaim", "xautoclaim",
                       "xgroup_setid", "xgroup_destroy",
                       "xgroup_delconsumer",
                       "setex") \
@@ -2896,7 +2919,7 @@ class RaftNode:
                              "geoadd/geodist/"
                              "xadd/xtrim/xlen/xrange/"
                              "xgroup_create/xreadgroup/xack/"
-                             "xclaim/"
+                             "xclaim/xautoclaim/"
                              "xgroup_setid/xgroup_destroy/"
                              "xgroup_delconsumer/"
                              "setex "
@@ -4009,6 +4032,80 @@ class RaftNode:
                                  "non-negative integer"}
             if retrycount is not None:
                 command["retrycount"] = retrycount
+        if op == "xautoclaim":
+            # Claim pending entries in bulk, Redis XAUTOCLAIM:
+            # the group and the consumer must be non-empty
+            # strings, ``start`` the ID to resume after — "0-0"
+            # or "0" from the very first pending entry, a bare
+            # millisecond, or a full "ms-seq" — ``min_idle_ms``
+            # a non-negative integer number of milliseconds, the
+            # idle an entry must have reached before it can be
+            # taken over. COUNT caps how many pending entries one
+            # call examines (default 100, fixed in the store), a
+            # non-negative integer when given, and ``justid`` is
+            # a bare flag: JUSTID answers only the claimed IDs.
+            # A malformed group, consumer, start, minimum idle,
+            # count, or option is a client error, not a log entry.
+            # Whether the key or the group exists (and which
+            # entries are actually pending and idle enough) is
+            # decided at apply time, like a CAS, not here.
+            group = msg.get("group")
+            if not isinstance(group, str) or not group:
+                return {"type": "client_response", "status": "error",
+                        "error": "xautoclaim group must be a "
+                                 "non-empty string"}
+            command["group"] = group
+            consumer = msg.get("consumer")
+            if not isinstance(consumer, str) or not consumer:
+                return {"type": "client_response", "status": "error",
+                        "error": "xautoclaim consumer must be a "
+                                 "non-empty string"}
+            command["consumer"] = consumer
+            start = msg.get("start")
+            if not isinstance(start, str):
+                return {"type": "client_response", "status": "error",
+                        "error": "xautoclaim start must be a stream "
+                                 "ID string"}
+            parts = start.split("-")
+            if (start in ("-", "+")
+                    or (len(parts) in (1, 2)
+                        and parts[0].isdigit()
+                        and int(parts[0]) <= STREAM_ID_MAX
+                        and (len(parts) == 1
+                             or parts[1].isdigit()
+                             and int(parts[1]) <= STREAM_ID_MAX))):
+                pass
+            else:
+                return {"type": "client_response", "status": "error",
+                        "error": "xautoclaim start must be \"0-0\", "
+                                 "\"0\", a bare millisecond, or a "
+                                 "full \"ms-seq\" stream ID"}
+            command["start"] = start
+            min_idle_ms = msg.get("min_idle_ms")
+            if (not isinstance(min_idle_ms, int)
+                    or isinstance(min_idle_ms, bool)
+                    or min_idle_ms < 0):
+                return {"type": "client_response", "status": "error",
+                        "error": "xautoclaim min_idle_ms must be a "
+                                 "non-negative integer number of "
+                                 "milliseconds"}
+            command["min_idle_ms"] = min_idle_ms
+            count = msg.get("count")
+            if count is not None and (
+                    not isinstance(count, int)
+                    or isinstance(count, bool) or count < 0):
+                return {"type": "client_response", "status": "error",
+                        "error": "xautoclaim count must be a "
+                                 "non-negative integer"}
+            if count is not None:
+                command["count"] = count
+            if msg.get("justid") is not None:
+                if msg.get("justid") is not True:
+                    return {"type": "client_response",
+                            "status": "error",
+                            "error": "xautoclaim JUSTID takes no "
+                                     "argument"}
+                command["justid"] = True
         if op == "xgroup_setid":
             # Set a consumer group's last-delivered ID, Redis
             # XGROUP SETID: the group must be a non-empty string,
@@ -4433,7 +4530,7 @@ class RaftNode:
         for field in ("client_id", "request_id"):
             if msg.get(field):
                 command[field] = msg[field]
-        if op in ("xreadgroup", "xclaim"):
+        if op in ("xreadgroup", "xclaim", "xautoclaim"):
             # The wall-clock millisecond this delivery — or this
             # claim — is stamped with, fixed here on the leader
             # just before the entry is appended — after any BLOCK
@@ -4446,10 +4543,10 @@ class RaftNode:
             # what keeps the stamp identical across nodes, the
             # same fix-at-log-time as an xadd auto ID. A retry
             # whose first attempt already applied never logs again,
-            # so the stamp is harmless there. For an xclaim the
-            # same stamp is the now the idle check measures
-            # against, so every replica agrees on which entries
-            # were idle enough to take over.
+            # so the stamp is harmless there. For an xclaim — or
+            # an xautoclaim — the same stamp is the now the idle
+            # check measures against, so every replica agrees on
+            # which entries were idle enough to take over.
             command["seen_ms"] = int(time.time() * 1000)
         timed_out: bool | None = None
         if (op == "xreadgroup" and xreadgroup_block_ms is not None

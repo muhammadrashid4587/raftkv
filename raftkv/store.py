@@ -271,6 +271,13 @@ XADD_MAX_FIELDS = 1000
 # the same reason.
 XACK_MAX_IDS = 1000
 
+# How many pending entries one ``xautoclaim`` examines when the
+# caller gives no COUNT — Redis's default of 100. The count bounds
+# the work per call, not the claims: a call can return fewer than
+# this many claimed entries when the ones it examined were too
+# fresh to take.
+XAUTOCLAIM_DEFAULT_COUNT = 100
+
 # A stream ID is two 64-bit halves, milliseconds and sequence,
 # Redis's shape: each half is an unsigned 64-bit integer, and 0-0
 # is not a valid ID — the first entry in a stream is never 0-0, so
@@ -791,7 +798,7 @@ class KVStore:
         "pexpireat", "incr", "incrbyfloat", "setnx", "getset", "append", "getdel",
         "setrange", "getex", "setbit", "bitop", "pfadd", "hset", "hdel",
         "geoadd", "xadd", "xtrim", "xgroup_create", "xreadgroup", "xack",
-        "xclaim", "xgroup_setid", "xgroup_destroy", and
+        "xclaim", "xautoclaim", "xgroup_setid", "xgroup_destroy", and
         "xgroup_delconsumer" —
         and None for del, whose outcome is always ok. The result is
         what the leader hands back to the waiting client and what the
@@ -2543,6 +2550,167 @@ class KVStore:
             return {"type": "client_response", "status": "ok",
                     "entries": [[eid, dict(fields)]
                                 for eid, fields in claimed]}
+        elif op == "xautoclaim":
+            # Claim pending entries in bulk, Redis XAUTOCLAIM:
+            # walk the group's pending list in ID order from just
+            # after ``start`` ("0-0" or "0" from the very first
+            # pending entry, a bare millisecond, or a full
+            # "ms-seq"), and take over every entry idle at least
+            # ``min_idle_ms`` — the milliseconds since its last
+            # delivery, measured against ``seen_ms``, the
+            # wall-clock millisecond the leader fixed at log time,
+            # like an xclaim — moving it to ``consumer``, raising
+            # its delivery count by one, and re-stamping its
+            # delivery time to the claim's time. An entry whose
+            # deliveries all came from replays of pre-v0.71.0 log
+            # entries carries no stamp and no provable idle, so it
+            # is skipped, like an xclaim without FORCE — there is
+            # no FORCE here, Redis has none for XAUTOCLAIM either.
+            # A pending entry whose data is gone — trimmed away
+            # under KEEPREF, so there is nothing left to return —
+            # is dropped from the pending list and reported under
+            # ``deleted``, like Redis's third reply element. COUNT
+            # caps how many pending entries one call examines
+            # (default 100): a call can return fewer than COUNT
+            # claimed entries when the ones it examined were too
+            # fresh to take, and the cursor resumes after the last
+            # entry examined — that is what bounds the work per
+            # call, the point of the cursor. The reply carries
+            # ``next`` — the ID to pass as ``start`` on the next
+            # call, "0-0" when the scan reached the end of the
+            # pending list — plus ``entries`` ([id, {field: value}]
+            # pairs in ID order), or ``ids`` with JUSTID, and
+            # ``deleted``. A missing key or a missing group fails
+            # with ``xautoclaim_failed`` / ``no_group`` — Redis's
+            # NOGROUP — and a key holding a plain string fails
+            # with WRONGTYPE, like an xadd. The outcome is decided
+            # here, at this exact point in the log, like a CAS, so
+            # a retry with the same session id returns the first
+            # attempt's cursor and entries instead of claiming
+            # them twice. A successful claim keeps the key's
+            # deadline, like an xadd, stamps the claiming
+            # consumer's last-seen time, and a call that claims
+            # nothing and deletes nothing writes nothing at all.
+            # The group, consumer, start, minimum idle, count,
+            # and options were validated on the leader before the
+            # entry was logged, so by apply time they are
+            # well-formed — a hand-built log entry with a bad
+            # group, consumer, start, or option still raises
+            # rather than silently claiming nonsense — and
+            # ``seen_ms`` is required, since the idle check has
+            # no now to measure against without it.
+            key = command["key"]
+            group = command.get("group")
+            if not isinstance(group, str) or not group:
+                raise ValueError(
+                    "xautoclaim group must be a non-empty string")
+            consumer = command.get("consumer")
+            if not isinstance(consumer, str) or not consumer:
+                raise ValueError(
+                    "xautoclaim consumer must be a non-empty string")
+            start = command.get("start")
+            if not isinstance(start, str):
+                raise ValueError(
+                    "xautoclaim start must be a stream ID string")
+            start_id = parse_stream_range_bound(start)
+            min_idle_ms = command.get("min_idle_ms")
+            if (not isinstance(min_idle_ms, int)
+                    or isinstance(min_idle_ms, bool)
+                    or min_idle_ms < 0):
+                raise ValueError(
+                    "xautoclaim min_idle_ms must be a non-negative "
+                    "integer number of milliseconds")
+            count = command.get("count")
+            if count is not None and (
+                    not isinstance(count, int)
+                    or isinstance(count, bool) or count < 0):
+                raise ValueError(
+                    "xautoclaim count must be a non-negative "
+                    "integer")
+            if count is None:
+                count = XAUTOCLAIM_DEFAULT_COUNT
+            seen_ms = command.get("seen_ms")
+            if (not isinstance(seen_ms, int)
+                    or isinstance(seen_ms, bool) or seen_ms < 0):
+                raise ValueError(
+                    "xautoclaim seen_ms must be a non-negative "
+                    "integer number of milliseconds")
+            justid = bool(command.get("justid"))
+            current = self._data.get(key)
+            if current is None:
+                return {"type": "client_response",
+                        "status": "xautoclaim_failed",
+                        "reason": "no_group",
+                        "error": "xautoclaim failed: no such key "
+                                 f"{key!r} or consumer group "
+                                 f"{group!r}"}
+            if not is_stream(current):
+                return {"type": "client_response",
+                        "status": "xautoclaim_failed",
+                        "reason": "wrongtype",
+                        "current": current,
+                        "error": "xautoclaim failed: value of "
+                                 f"{key!r} is not a stream"}
+            stream = _stream_data(current)
+            groups = stream.get("groups", {})
+            if group not in groups:
+                return {"type": "client_response",
+                        "status": "xautoclaim_failed",
+                        "reason": "no_group",
+                        "error": "xautoclaim failed: no such key "
+                                 f"{key!r} or consumer group "
+                                 f"{group!r}"}
+            state = groups[group]
+            by_id = {eid: fields for eid, fields in stream["entries"]}
+            pending_ids = sorted(state["pending"],
+                                 key=_parse_stored_stream_id)
+            after = [eid for eid in pending_ids
+                     if _parse_stored_stream_id(eid) > start_id]
+            claimed: list[tuple[str, dict]] = []
+            deleted: list[str] = []
+            examined = 0
+            for entry_id in after:
+                if examined >= count:
+                    break
+                examined += 1
+                info = state["pending"][entry_id]
+                if entry_id not in by_id:
+                    del state["pending"][entry_id]
+                    deleted.append(entry_id)
+                    continue
+                delivered_ms = info.get("delivered_ms")
+                idle = (None if delivered_ms is None
+                        else max(0, seen_ms - delivered_ms))
+                if idle is None or idle < min_idle_ms:
+                    continue
+                info["consumer"] = consumer
+                info["deliveries"] += 1
+                info["delivered_ms"] = seen_ms
+                claimed.append((entry_id, by_id[entry_id]))
+            if claimed or deleted:
+                if claimed:
+                    state.setdefault("consumers", {})[consumer] = {
+                        "last_seen_ms": seen_ms}
+                self._data[key] = _stream_value(stream)
+            if examined >= len(after):
+                next_id = "0-0"
+            elif examined == 0:
+                # COUNT 0 examined nothing, so the cursor does not
+                # move: it comes back as the start that was given,
+                # normalized to "ms-seq" form.
+                next_id = f"{start_id[0]}-{start_id[1]}"
+            else:
+                next_id = after[examined - 1]
+            if justid:
+                return {"type": "client_response", "status": "ok",
+                        "next": next_id,
+                        "ids": [eid for eid, _fields in claimed],
+                        "deleted": deleted}
+            return {"type": "client_response", "status": "ok",
+                    "next": next_id,
+                    "entries": [[eid, dict(fields)]
+                                for eid, fields in claimed],
+                    "deleted": deleted}
         elif op == "xgroup_setid":
             # Set a consumer group's last-delivered ID, Redis
             # XGROUP SETID: ``id`` is "$" (the stream's top, or
