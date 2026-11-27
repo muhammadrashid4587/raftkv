@@ -107,6 +107,104 @@ def _hash_value(fields: dict[str, str]) -> str:
                                     separators=(",", ":"))
 
 
+# Geo (GEOADD / GEODIST), Redis-style member positions. A geo set
+# rides in _data as a JSON object with a marker prefix, the same
+# trick the hash uses — one string in the same keyspace every other
+# value lives in, so snapshots, the sorted index, TTL expiry, and
+# `get` all treat a geo key like any other key — with the prefix so
+# a GEOADD / GEODIST can tell a geo set apart from a plain string
+# and answer WRONGTYPE on the latter instead of parsing bytes as
+# coordinates. The JSON maps member names to [lon, lat] pairs,
+# dumped with sorted keys and no spaces, so the encoding is a pure
+# function of the members: every node applying the same log
+# computes the same bytes. The honest limit is the encoding
+# itself: positions are stored as plain longitude/latitude pairs,
+# not as Redis's 52-bit geohash scores in a sorted set, so there
+# is no radius search yet (GEORADIUS / GEOSEARCH would need the
+# geohash ordering) — and a distance computed here is the exact
+# haversine over the stored coordinates, which can differ from
+# Redis's by a fraction of a metre, since Redis quantizes each
+# coordinate through its geohash first. A plain `get` on a geo key
+# returns the encoded blob, not a member, exactly as it does for a
+# hash key.
+GEO_PREFIX = "\x00raftkv-geo\x00"
+
+# Largest number of members one ``geoadd`` may carry. The members
+# ride in one log entry and one frame, so an unbounded list would
+# let one entry grow without limit — the same scale as the pfadd
+# cap, for the same reason.
+GEOADD_MAX_MEMBERS = 1000
+
+# Redis's coordinate ranges: longitude -180..180, latitude
+# -85.05112878..85.05112878 (the latitude of the Mercator
+# projection's edge — beyond it the geohash math breaks down, and
+# Redis rejects it, so this does too).
+GEO_LON_MIN = -180.0
+GEO_LON_MAX = 180.0
+GEO_LAT_MIN = -85.05112878
+GEO_LAT_MAX = 85.05112878
+
+# The Earth's radius Redis's GEODIST uses, in metres — the WGS-84
+# equatorial radius. Distances in other units are the metre
+# distance divided by the unit's metres, so every unit agrees on
+# the same underlying distance.
+GEO_EARTH_RADIUS_M = 6372797.560856
+GEO_UNIT_METRES = {"m": 1.0, "km": 1000.0, "mi": 1609.344,
+                   "ft": 0.3048}
+
+
+def is_geo(value) -> bool:
+    """Whether ``value`` is a geo blob: a string carrying the
+    marker prefix and a JSON object of member to [lon, lat] pairs
+    behind it. A plain string can only pass this by being
+    hand-built to the exact shape — the same class of collision
+    the hash check has — so a GEOADD / GEODIST trusts the shape."""
+    if not isinstance(value, str) or not value.startswith(GEO_PREFIX):
+        return False
+    try:
+        members = json.loads(value[len(GEO_PREFIX):])
+    except (ValueError, TypeError):
+        return False
+    return (isinstance(members, dict)
+            and all(isinstance(m, str) and isinstance(p, list)
+                    and len(p) == 2
+                    and all(isinstance(c, (int, float))
+                            and not isinstance(c, bool) for c in p)
+                    for m, p in members.items()))
+
+
+def _geo_members(value: str) -> dict[str, list[float]]:
+    """The member map behind a geo blob. Only called on values
+    ``is_geo`` already accepted, so the JSON is a dict of member
+    to [lon, lat] pairs and the parse cannot fail."""
+    return json.loads(value[len(GEO_PREFIX):])
+
+
+def _geo_value(members: dict[str, list[float]]) -> str:
+    """A member map as a stored blob: the marker prefix plus the
+    members as JSON, keys sorted and no spaces, so the same
+    members always encode to the same bytes on every node."""
+    return GEO_PREFIX + json.dumps(members, sort_keys=True,
+                                   separators=(",", ":"))
+
+
+def geo_distance(lon1: float, lat1: float, lon2: float,
+                 lat2: float) -> float:
+    """The great-circle distance between two points, in metres —
+    the haversine formula over Redis's Earth radius. Two
+    identical points are 0, antipodes are half the circumference;
+    the formula is a pure function of the coordinates, so every
+    node applying the same log computes the same distance."""
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = (math.sin(dphi / 2) ** 2
+         + math.cos(phi1) * math.cos(phi2)
+         * math.sin(dlambda / 2) ** 2)
+    return 2 * GEO_EARTH_RADIUS_M * math.asin(math.sqrt(a))
+
+
 def _is_integer_string(s: str) -> bool:
     """Whether ``s`` is a Redis-style integer: an optional sign
     followed by digits only. ``int()`` alone is too lenient — it
@@ -347,7 +445,9 @@ class KVStore:
         Returns a result dict for commands whose outcome depends on the
         state at apply time — currently "set", "cas", "expire", "expireat",
         "pexpireat", "incr", "incrbyfloat", "setnx", "getset", "append", "getdel",
-        "setrange", "getex", "setbit", "bitop", "pfadd", "hset", and "hdel" —
+        "setrange", "getex", "setbit", "bitop", "pfadd", "hset", "hdel",
+        and "geoadd" —
+        and "geoadd" —
         and None for del, whose outcome is always ok. The result is
         what the leader hands back to the waiting client and what the
         dedup table caches for retries, so it must be a pure function
@@ -1307,6 +1407,81 @@ class KVStore:
             self._data[key] = _hash_value(remaining)
             return {"type": "client_response", "status": "ok",
                     "hdel": removed}
+        elif op == "geoadd":
+            # Add members with positions to a geo set, Redis
+            # GEOADD: each member is a [lon, lat, member] triple,
+            # and the reply carries ``geoadd`` — the number of
+            # members that did not exist before (a member whose
+            # position is updated is not counted, and a member
+            # repeated in one call counts once, at its last
+            # position). The outcome is decided here, at this
+            # exact point in the log, so a retry with the same
+            # session id returns the first attempt's count from
+            # the dedup table instead of adding twice. A missing
+            # key is created as an empty geo set; a key holding
+            # a plain string fails with WRONGTYPE, like an hset
+            # — a geoadd must not parse bytes as coordinates —
+            # and writes nothing at all, like a failed hset. A
+            # successful geoadd keeps the key's deadline, like
+            # an hset: it is an update of the value, not a fresh
+            # set, so it must not resurrect a key that is about
+            # to expire. A new key joins the sorted index, like
+            # a set of a new key. The members ride in _data as
+            # a JSON blob with the geo marker prefix, so they
+            # survive snapshots and replay exactly like any
+            # other value — and the stored blob is a pure
+            # function of the members, so every node computes
+            # the same bytes. The members were validated on the
+            # leader before the entry was logged (a non-empty
+            # list of at most GEOADD_MAX_MEMBERS triples, each
+            # a finite longitude in -180..180, a finite
+            # latitude in -85.05112878..85.05112878, and a
+            # string member), so by apply time they are
+            # well-formed — a hand-built log entry with bad
+            # members still raises rather than silently
+            # writing nonsense.
+            key = command["key"]
+            members = command.get("members")
+            if (not isinstance(members, list) or not members
+                    or len(members) > GEOADD_MAX_MEMBERS
+                    or any(not isinstance(m, (list, tuple))
+                           or len(m) != 3
+                           or not isinstance(m[0], (int, float))
+                           or isinstance(m[0], bool)
+                           or not math.isfinite(m[0])
+                           or m[0] < GEO_LON_MIN or m[0] > GEO_LON_MAX
+                           or not isinstance(m[1], (int, float))
+                           or isinstance(m[1], bool)
+                           or not math.isfinite(m[1])
+                           or m[1] < GEO_LAT_MIN or m[1] > GEO_LAT_MAX
+                           or not isinstance(m[2], str)
+                           for m in members)):
+                raise ValueError(
+                    "geoadd members must be a non-empty list of "
+                    f"at most {GEOADD_MAX_MEMBERS} "
+                    "[lon, lat, member] triples with lon in "
+                    "-180..180 and lat in "
+                    "-85.05112878..85.05112878")
+            current = self._data.get(key)
+            if current is not None and not is_geo(current):
+                return {"type": "client_response",
+                        "status": "geoadd_failed",
+                        "reason": "wrongtype",
+                        "current": current,
+                        "error": "geoadd failed: value of "
+                                 f"{key!r} is not a geo set"}
+            positions = (_geo_members(current)
+                         if current is not None else {})
+            added = 0
+            for lon, lat, member in members:
+                if member not in positions:
+                    added += 1
+                positions[member] = [float(lon), float(lat)]
+            if key not in self._data:
+                bisect.insort(self._keys, key)
+            self._data[key] = _geo_value(positions)
+            return {"type": "client_response", "status": "ok",
+                    "geoadd": added}
         elif op == "setrange":
             # Overwrite part of a string value, Redis SETRANGE:
             # starting at ``offset``, replace as many characters
@@ -1806,6 +1981,38 @@ class KVStore:
             mask = ((0xFF >> low) & (0xFF << (7 - high))) & 0xFF
             count += (raw[i] & mask).bit_count()
         return count
+
+    def geodist(self, key: str, member1: str, member2: str,
+                unit: str = "m") -> float | None:
+        """The distance between two members of the geo set at
+        ``key``, Redis GEODIST: None when the key does not exist
+        or either member is not in the set, like Redis answering
+        nil — and the distance itself in ``unit`` (``m`` by
+        default, or ``km``, ``mi``, ``ft``), the haversine over
+        the stored coordinates divided by the unit's metres, so
+        every unit agrees on the same underlying distance. Raises
+        TypeError when the value is not a geo set, like pfcount
+        on a plain string, and ValueError for a bad ``unit``: a
+        string that is not one of the four, matched
+        case-insensitively before it is served, so every node
+        measures in the same unit. Pure read: no log entry, no
+        state change."""
+        if not isinstance(unit, str) or unit.lower() not in GEO_UNIT_METRES:
+            raise ValueError(
+                "geodist unit must be m, km, mi, or ft")
+        value = self._data.get(key)
+        if value is None:
+            return None
+        if not is_geo(value):
+            raise TypeError(
+                f"geodist failed: value of {key!r} is not a geo set")
+        members = _geo_members(value)
+        if member1 not in members or member2 not in members:
+            return None
+        lon1, lat1 = members[member1]
+        lon2, lat2 = members[member2]
+        metres = geo_distance(lon1, lat1, lon2, lat2)
+        return metres / GEO_UNIT_METRES[unit.lower()]
 
     def strlen(self, key: str) -> int:
         """Length of the string value at ``key`` — 0 when the key

@@ -172,6 +172,23 @@ HDEL_MAX_FIELDS = 1000
 # nonsense, never a real use — the same scale as the hdel cap
 # above, for the same reason.
 HMGET_MAX_FIELDS = 1000
+# Largest number of members one ``geoadd`` may carry. The members
+# ride in one log entry and one frame, so an unbounded list would
+# let one entry grow without limit (and replicate that growth to
+# every node). 1,000 members is far past a real use of one GEOADD
+# call — a client adding more splits the batch, like an mget client
+# splits a batch past 1000 keys — so it only rejects nonsense,
+# never a real use — the same scale as the pfadd cap above, for the
+# same reason.
+GEOADD_MAX_MEMBERS = 1000
+# Redis's coordinate ranges for a ``geoadd``: longitude -180..180,
+# latitude -85.05112878..85.05112878 (the latitude of the Mercator
+# projection's edge — beyond it the geohash math breaks down, and
+# Redis rejects it, so this does too).
+GEO_LON_MIN = -180.0
+GEO_LON_MAX = 180.0
+GEO_LAT_MIN = -85.05112878
+GEO_LAT_MAX = 85.05112878
 # Default and largest number of fields one ``hscan`` call
 # examines. The count is a hint, like Redis's COUNT — a page
 # examines at most that many fields, matching or not — so the
@@ -1460,7 +1477,7 @@ class RaftNode:
                 # The apply result matters for set, CAS, expire,
                 # expireat, pexpireat, incr, incrbyfloat, setnx,
                 # getset, append, getdel, setrange, getex, setbit,
-                # bitop, pfadd, hset, and hdel:
+                # bitop, pfadd, hset, hdel, and geoadd:
                 # their outcome is decided here, at this exact point
                 # in the log, so the result is recorded in the dedup
                 # table
@@ -1669,11 +1686,25 @@ class RaftNode:
                             self.sm.get(entry["command"]["key"]),
                             "set",
                             index=self.last_applied)
+                elif (op == "geoadd" and result is not None
+                        and result.get("status") == "ok"):
+                    # A successful geoadd fires like a set, with
+                    # the new (geo blob) value: a failed geoadd
+                    # wrote nothing, so it fires nothing, like a
+                    # failed hset — and a geoadd that added no new
+                    # member fires too, like an hset that only
+                    # overwrote a field: the entry still committed
+                    # a (possibly identical) value.
+                    self.watch.notify(entry["command"]["key"],
+                                      self.sm.get(entry["command"]["key"]),
+                                      "set",
+                                      index=self.last_applied)
                 if (op in ("set", "cas", "expire", "expireat",
                            "pexpireat",
                            "incr", "incrbyfloat", "setnx", "getset",
                            "append", "getdel", "setrange", "getex",
-                           "setbit", "bitop", "pfadd", "hset", "hdel")
+                           "setbit", "bitop", "pfadd", "hset", "hdel",
+                           "geoadd")
                         and result is not None
                         and self.role == "leader"):
                     # Record the outcome only when a local waiter is
@@ -1686,7 +1717,8 @@ class RaftNode:
                     # always records: its waiter is identified by
                     # index alone. Set, CAS, expire, expireat, pexpireat,
                     # incr, incrbyfloat, setnx, getset, append,
-                    # getdel, setrange, getex, setbit, bitop, pfadd, and hset are
+                    # getdel, setrange, getex, setbit, bitop, pfadd, hset, and
+                    # geoadd are
                     # the ops whose apply returns a result — a del
                     # returns None and has nothing to record.
                     key = _dedup_key(entry["command"])
@@ -1727,7 +1759,7 @@ class RaftNode:
         for CAS, expire, expireat,
         pexpireat, incr, incrbyfloat, setnx,
         getset, append, getdel, setrange, getex, setbit, bitop,
-        pfadd, hset, and hdel
+        pfadd, hset, hdel, and geoadd
         it is the
         apply-time outcome (success, mismatch, or missing key for a
         CAS; 1 or 0 for an expire; 1 or 0 for an expireat /
@@ -1742,7 +1774,8 @@ class RaftNode:
         length and value, or wrongtype for a bitop; 1 or 0 plus
         the estimate, or wrongtype for a pfadd; the count of
         newly added fields, or wrongtype for an hset; the count
-        of removed fields, or wrongtype for an hdel), so a
+        of removed fields, or wrongtype for an hdel; the count of
+        newly added members, or wrongtype for a geoadd), so a
         retry returns the first
         attempt's exact result. The result also carries the log
         index and term of the entry that produced it: a retried write
@@ -2441,6 +2474,7 @@ class RaftNode:
                       "hset", "hget", "hdel", "hgetall",
                       "hlen", "hexists", "hkeys", "hvals", "hmget",
                       "hscan",
+                      "geoadd", "geodist",
                       "setex") \
                 or key is None:
             return {"type": "client_response", "status": "error",
@@ -2452,6 +2486,7 @@ class RaftNode:
                              "bitop/bitcount/"
                              "pfadd/pfcount/hset/hget/hdel/hgetall/"
                              "hlen/hexists/hkeys/hvals/hmget/hscan/"
+                             "geoadd/geodist/"
                              "setex "
                              "with a key"}
         if self._is_removed():
@@ -2611,6 +2646,49 @@ class RaftNode:
             if error is not None:
                 return error
             return self._serve_read(pfcount_key=key,
+                                    min_index=min_index,
+                                    session_term=session_term,
+                                    stale_ok=bool(msg.get("stale_ok")))
+        if op == "geodist":
+            # A distance between two members of a geo set: the
+            # haversine over the stored coordinates, in ``unit``
+            # — Redis GEODIST. It rides the same ReadIndex/lease
+            # path as a ``get`` — one leadership confirmation, one
+            # apply wait — so the distance reflects the committed
+            # state as of the read index it names, exactly as
+            # linearizable, and a session read carries the same
+            # watermark a get would. A plain string value is a
+            # client error, not a distance: the payload carries its
+            # own "status": "error" (see _serve_read), like
+            # pfcount's wrongtype. The members must be strings —
+            # an empty one names a real member, like Redis — so
+            # only a non-string is rejected here; a member that
+            # is not in the set answers None, not an error, like
+            # a missing key. The unit is matched case-insensitively
+            # and normalized to lower case before it is served,
+            # so every node measures in the same unit.
+            member1 = msg.get("member1")
+            member2 = msg.get("member2")
+            if not isinstance(member1, str):
+                return {"type": "client_response", "status": "error",
+                        "error": "geodist member1 must be a string"}
+            if not isinstance(member2, str):
+                return {"type": "client_response", "status": "error",
+                        "error": "geodist member2 must be a string"}
+            unit = msg.get("unit", "m")
+            if (not isinstance(unit, str)
+                    or unit.lower()
+                    not in ("m", "km", "mi", "ft")):
+                return {"type": "client_response", "status": "error",
+                        "error": "geodist unit must be m, km, mi, "
+                                 "or ft"}
+            min_index, session_term, error = self._parse_read_params(msg)
+            if error is not None:
+                return error
+            return self._serve_read(geodist_key=key,
+                                    geodist_member1=member1,
+                                    geodist_member2=member2,
+                                    geodist_unit=unit.lower(),
                                     min_index=min_index,
                                     session_term=session_term,
                                     stale_ok=bool(msg.get("stale_ok")))
@@ -3022,6 +3100,40 @@ class RaftNode:
                         "error": "hdel fields must be a list of 1 to "
                                  f"{HDEL_MAX_FIELDS} strings"}
             command["fields"] = list(fields)
+        if op == "geoadd":
+            # Add members with positions to a geo set: the members
+            # must be a non-empty list of at most GEOADD_MAX_MEMBERS
+            # [lon, lat, member] triples — longitude a finite number
+            # in -180..180, latitude a finite number in
+            # -85.05112878..85.05112878 (Redis's ranges), the member
+            # a string — so one entry never carries an unbounded
+            # member list and a bad coordinate is a client error,
+            # not a log entry. Whether the key holds a geo set (and
+            # how many members are new) is decided at apply time,
+            # like a CAS, not here.
+            members = msg.get("members")
+            if (not isinstance(members, list) or not members
+                    or len(members) > GEOADD_MAX_MEMBERS
+                    or any(not isinstance(m, (list, tuple))
+                           or len(m) != 3
+                           or not isinstance(m[0], (int, float))
+                           or isinstance(m[0], bool)
+                           or not math.isfinite(m[0])
+                           or m[0] < GEO_LON_MIN or m[0] > GEO_LON_MAX
+                           or not isinstance(m[1], (int, float))
+                           or isinstance(m[1], bool)
+                           or not math.isfinite(m[1])
+                           or m[1] < GEO_LAT_MIN or m[1] > GEO_LAT_MAX
+                           or not isinstance(m[2], str)
+                           for m in members)):
+                return {"type": "client_response", "status": "error",
+                        "error": "geoadd members must be a list of "
+                                 f"1 to {GEOADD_MAX_MEMBERS} "
+                                 "[lon, lat, member] triples with "
+                                 "lon in -180..180 and lat in "
+                                 "-85.05112878..85.05112878"}
+            command["members"] = [[float(m[0]), float(m[1]), m[2]]
+                                  for m in members]
         if op == "setex":
             # Set a key with a wall-clock TTL, Redis SETEX: the
             # value is required, like a set's — a setex with no
@@ -3941,6 +4053,10 @@ class RaftNode:
                     bitcount_end: int | None = None,
                     bitcount_mode: str = "BYTE",
                     pfcount_key: str | None = None,
+                    geodist_key: str | None = None,
+                    geodist_member1: str | None = None,
+                    geodist_member2: str | None = None,
+                    geodist_unit: str = "m",
                     hget_key: str | None = None,
                     hget_field: str | None = None,
                     hgetall_key: str | None = None,
@@ -4002,6 +4118,14 @@ class RaftNode:
         the same way, so it is exactly as linearizable as a
         ``get``; a plain string value is a client error, not an
         estimate.
+        ``geodist_key`` serves a distance instead — the haversine
+        between ``geodist_member1`` and ``geodist_member2`` in the
+        geo set at that key, in ``geodist_unit`` (``m`` by default,
+        or ``km``, ``mi``, ``ft``), Redis GEODIST — read off the
+        applied state machine the same way, so it is exactly as
+        linearizable as a ``get``; a missing key or a member that
+        is not in the set answers None, not an error, and a plain
+        string value is a client error, not a distance.
         ``hget_key`` serves one field of a hash instead — the value
         of ``hget_field`` in the hash at that key, None for a
         missing key or a missing field, Redis HGET — read off the
@@ -4068,7 +4192,7 @@ class RaftNode:
         appear in a later page if it sorts ahead of the cursor.
         Everything else — the lease fast path, the pending-read wait,
         the fallback, the redirect on leadership loss — is identical
-        for all sixteen shapes, so a scan or a TTL query is exactly as
+        for all seventeen shapes, so a scan or a TTL query is exactly as
         linearizable as a single ``get``.
 
         A stale read (``stale_ok``) is the one exception to the
@@ -4232,6 +4356,23 @@ class RaftNode:
                 try:
                     return {"estimate": self.sm.pfcount(pfcount_key)}
                 except TypeError as e:
+                    return {"status": "error", "error": str(e)}
+            if geodist_key is not None:
+                # A distance between two members of a geo set: the
+                # haversine over the stored coordinates, in the
+                # unit the caller named — Redis GEODIST — with the
+                # same wrongtype rule as pfcount: a plain string
+                # value is a client error, not a distance, carried
+                # the same way, overriding the "ok" in the response
+                # literal. A missing key or a member that is not
+                # in the set answers None, not an error, like a
+                # get on a missing key. A bad unit is the same kind
+                # of error, from the store's own validation.
+                try:
+                    return {"distance": self.sm.geodist(
+                        geodist_key, geodist_member1, geodist_member2,
+                        geodist_unit)}
+                except (TypeError, ValueError) as e:
                     return {"status": "error", "error": str(e)}
             if hget_key is not None:
                 # One field of a hash: the value of the field at

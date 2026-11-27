@@ -131,7 +131,8 @@ class Session:
                     "incrbyfloat_failed", "append_failed",
                     "setrange_failed", "setbit_failed",
                     "bitop_failed",
-                    "pfadd_failed", "hset_failed", "hdel_failed")
+                    "pfadd_failed", "hset_failed", "hdel_failed",
+                    "geoadd_failed")
                 and resp.get("index") is not None):
             self.last_write_index = int(resp["index"])
             self.last_write_term = int(resp.get("term") or 0)
@@ -328,6 +329,7 @@ class Session:
             {"op": "setbit", "key": k, "offset": n, "bit": b}
             {"op": "bitop", "key": d, "operation": "AND",
              "keys": [k1, k2, ...]}
+            {"op": "geoadd", "key": k, "members": [[lon, lat, m], ...]}
             {"op": "pfadd", "key": k, "elements": [e1, e2, ...]}
             {"op": "hset", "key": k, "pairs": [[f1, v1], [f2, v2]]}
             {"op": "setex", "key": k, "value": v, "seconds": n}
@@ -412,7 +414,8 @@ class Session:
                             "incrbyfloat_failed",
                             "append_failed", "setrange_failed",
                             "setbit_failed", "bitop_failed",
-                            "pfadd_failed", "hset_failed", "hdel_failed")
+                            "pfadd_failed", "hset_failed", "hdel_failed",
+                            "geoadd_failed")
                         and resp.get("index") is not None):
                     index = int(resp["index"])
                     if index > self.last_write_index:
@@ -738,6 +741,40 @@ class Session:
                 self.last_read_term = int(resp.get("read_term") or 0)
         return resp
 
+    def geodist(self, key: str, member1: str, member2: str,
+                unit: str = "m") -> dict:
+        """Ask for the distance between two members of the geo set
+        at ``key``, Redis GEODIST: the haversine over the stored
+        coordinates, in ``unit`` (``m`` by default, or ``km``,
+        ``mi``, ``ft``) — None when the key does not exist or
+        either member is not in the set, and a client error when
+        the key holds a plain string. It rides the same ReadIndex
+        path as ``get``, so it carries the same session watermark
+        and advances the read watermark from the reply's
+        ``read_index`` exactly the same way: a distance query
+        after your own geoadd sees the members that geoadd added,
+        and a later read never goes backwards past it."""
+        if self.last_read_index > self.last_write_index:
+            min_index = self.last_read_index
+            term = self.last_read_term
+        else:
+            min_index = self.last_write_index
+            term = self.last_write_term
+        msg: dict = {"type": "client", "op": "geodist", "key": key,
+                     "client_id": self.client_id,
+                     "min_commit_index": min_index,
+                     "session_term": term,
+                     "member1": member1, "member2": member2,
+                     "unit": unit}
+        resp = request(self.node_addr, msg, pool=self._pooled)
+        if (resp.get("status") == "ok"
+                and resp.get("read_index") is not None):
+            read_index = int(resp["read_index"])
+            if read_index > self.last_read_index:
+                self.last_read_index = read_index
+                self.last_read_term = int(resp.get("read_term") or 0)
+        return resp
+
     def bitop(self, dest: str, operation: str,
               keys: list[str]) -> dict:
         """Combine the string values at ``keys`` bitwise and store
@@ -761,6 +798,32 @@ class Session:
         return self._write({"type": "client", "op": "bitop",
                             "key": dest, "operation": operation,
                             "keys": list(keys)})
+
+    def geoadd(self, key: str,
+               members: list[tuple[float, float, str]]) -> dict:
+        """Add ``members`` — (longitude, latitude, member) triples —
+        to the geo set at ``key``, Redis GEOADD: longitude in
+        -180..180, latitude in -85.05112878..85.05112878, and the
+        reply carries ``geoadd`` — the number of members that did
+        not exist before (a member whose position is updated is
+        not counted, and a member repeated in one call counts
+        once, at its last position). A missing key is created as
+        an empty geo set; at most 1000 members per call, like an
+        mget batch. The outcome is decided at apply time, at the
+        entry's exact position in the log, so a retry with the
+        same session id returns the first attempt's count instead
+        of adding twice, and a successful geoadd keeps the key's
+        TTL deadline, like an hset. A plain string value fails
+        with ``geoadd_failed`` and reason ``wrongtype`` instead
+        of writing. A successful geoadd advances the write
+        watermark from the reply's index, like any other write —
+        and so does a failed one, since it still committed its
+        entry."""
+        return self._write({"type": "client", "op": "geoadd",
+                            "key": key,
+                            "members": [[lon, lat, member]
+                                        for lon, lat, member
+                                        in members]})
 
     def pfadd(self, key: str, *elements: str) -> dict:
         """Add ``elements`` to the HyperLogLog at ``key``, Redis
@@ -1453,7 +1516,11 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
     operation that is AND, OR, XOR, or NOT, and a non-empty list
     of at most 1000 string source keys (NOT takes exactly one),
     ``pfadd`` a string key and a non-empty list
-    of at most 1000 string elements, ``hset`` a string key and a
+    of at most 1000 string elements, ``geoadd`` a string key and a
+    non-empty list of at most 1000 [lon, lat, member] triples —
+    longitude a finite number in -180..180, latitude a finite
+    number in -85.05112878..85.05112878, the member a string —
+    ``hset`` a string key and a
     non-empty list of at most 1000 [field, value] string pairs,
     ``hdel`` a string key and a non-empty list of at most 1000
     string fields, ``setex`` a string key and
@@ -1471,13 +1538,14 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
                     "setnx", "getset",
                     "append", "getdel", "getex", "setrange", "setbit",
                     "bitop",
-                    "pfadd", "hset", "hdel", "setex", "expireat",
+                    "pfadd", "geoadd", "hset", "hdel", "setex",
+                    "expireat",
                     "pexpireat"):
         return None, {"type": "client_response", "status": "error",
                       "error": "pipeline op must be set, del, cas, "
                                "incr, incrbyfloat, setnx, getset, append, "
                                "getdel, getex, setrange, setbit, bitop, "
-                               "pfadd, hset, hdel, setex, expireat, or "
+                               "pfadd, geoadd, hset, hdel, setex, expireat, or "
                                "pexpireat"}
     key = op.get("key")
     if not isinstance(key, str):
@@ -1715,6 +1783,39 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
                           "error": "pipeline pfadd elements must be "
                                    "a list of 1 to 1000 strings"}
         msg["elements"] = list(elements)
+    if name == "geoadd":
+        # ``members`` rides along with a pipelined geoadd,
+        # validated here so a malformed one never goes on the
+        # wire: a non-empty list of at most 1000 [lon, lat,
+        # member] triples — longitude a finite number in
+        # -180..180, latitude a finite number in
+        # -85.05112878..85.05112878, the member a string — the
+        # same shape the server enforces (the server also caps
+        # it, so a huge list is still a client error there, not
+        # a log entry).
+        members = op.get("members")
+        if (not isinstance(members, list) or not members
+                or len(members) > 1000
+                or any(not isinstance(m, (list, tuple))
+                       or len(m) != 3
+                       or not isinstance(m[0], (int, float))
+                       or isinstance(m[0], bool)
+                       or not math.isfinite(m[0])
+                       or m[0] < -180.0 or m[0] > 180.0
+                       or not isinstance(m[1], (int, float))
+                       or isinstance(m[1], bool)
+                       or not math.isfinite(m[1])
+                       or m[1] < -85.05112878 or m[1] > 85.05112878
+                       or not isinstance(m[2], str)
+                       for m in members)):
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline geoadd members must be "
+                                   "a list of 1 to 1000 [lon, lat, "
+                                   "member] triples with lon in "
+                                   "-180..180 and lat in "
+                                   "-85.05112878..85.05112878"}
+        msg["members"] = [[float(m[0]), float(m[1]), m[2]]
+                          for m in members]
     if name == "hset":
         # ``pairs`` rides along with a pipelined hset, validated
         # here so a malformed one never goes on the wire: a
@@ -2343,6 +2444,50 @@ def bitop(node_addr: tuple[str, int], dest: str, operation: str,
     return request(node_addr, {"type": "client", "op": "bitop",
                                "key": dest, "operation": operation,
                                "keys": list(keys)}, timeout=timeout)
+
+
+def geoadd(node_addr: tuple[str, int], key: str,
+           members: list[tuple[float, float, str]],
+           timeout: float = 12.0) -> dict:
+    """Add ``members`` — (longitude, latitude, member) triples —
+    to the geo set at ``key``, following leader redirects like
+    ``request`` — Redis GEOADD.
+
+    One request appends the geoadd entry, so the count it returns
+    is decided at the entry's position in the log: the reply is the
+    plain geoadd response (``status`` ``ok`` with ``geoadd`` — the
+    number of members that did not exist before — or
+    ``geoadd_failed`` with reason ``wrongtype`` when the current
+    value is a plain string). A missing key is created as an empty
+    geo set; at most 1000 members per call. A successful geoadd
+    keeps the key's TTL deadline, like an hset."""
+    return request(node_addr, {"type": "client", "op": "geoadd",
+                               "key": key,
+                               "members": [[lon, lat, member]
+                                           for lon, lat, member
+                                           in members]},
+                   timeout=timeout)
+
+
+def geodist(node_addr: tuple[str, int], key: str, member1: str,
+            member2: str, unit: str = "m",
+            timeout: float = 12.0) -> dict:
+    """Ask for the distance between two members of the geo set at
+    ``key``, following leader redirects like ``request`` — Redis
+    GEODIST.
+
+    One request serves the distance through the leader's ReadIndex
+    path, so it reflects the committed state as of one read index,
+    exactly as linearizable as a ``get``. The reply is the plain
+    geodist response (``status`` ``ok`` with ``distance`` — the
+    haversine in ``unit``, ``m`` by default, or ``km``, ``mi``,
+    ``ft`` — or None when the key does not exist or either member
+    is not in the set). A plain string value is a client error,
+    not a distance."""
+    return request(node_addr, {"type": "client", "op": "geodist",
+                               "key": key, "member1": member1,
+                               "member2": member2, "unit": unit},
+                   timeout=timeout)
 
 
 def pfadd(node_addr: tuple[str, int], key: str, *elements: str,
@@ -3214,6 +3359,34 @@ def main(argv: list[str] | None = None) -> int:
                               "twice")
     p_bitop.add_argument("--request-id", default=None,
                          help="id of this write within the client session")
+    p_geoadd = sub.add_parser(
+        "geoadd",
+        help="add members with positions to the geo set at key "
+             "and print the number of members that did not exist "
+             "before; a missing key is created as an empty geo set")
+    p_geoadd.add_argument("key")
+    p_geoadd.add_argument("triples", nargs="+",
+                          help="longitude latitude member triples: "
+                               "lon1 lat1 m1 lon2 lat2 m2 ... "
+                               "(at most 1000 members)")
+    p_geoadd.add_argument("--client-id", default=None,
+                          help="session id for at-most-once writes: a retry "
+                               "with the same client id + request id returns "
+                               "the first attempt's result instead of writing "
+                               "twice")
+    p_geoadd.add_argument("--request-id", default=None,
+                          help="id of this write within the client session")
+    p_geodist = sub.add_parser(
+        "geodist",
+        help="print the distance between two members of the geo "
+             "set at key, in metres by default; (nil) when the key "
+             "does not exist or either member is not in the set")
+    p_geodist.add_argument("key")
+    p_geodist.add_argument("member1")
+    p_geodist.add_argument("member2")
+    p_geodist.add_argument("--unit", default="m",
+                           choices=("m", "km", "mi", "ft"),
+                           help="the unit to measure in (default m)")
     p_pfadd = sub.add_parser(
         "pfadd",
         help="add elements to the HyperLogLog at key and print 1 "
@@ -3423,6 +3596,7 @@ def main(argv: list[str] | None = None) -> int:
               "bitop", "bitcount",
               "pfadd", "pfcount", "hset", "hget", "hdel", "hgetall",
               "hlen", "hexists", "hkeys", "hvals", "hmget", "hscan",
+              "geoadd", "geodist",
               "setex", "expireat",
               "pexpireat"):
         msg["key"] = args.key
@@ -3522,6 +3696,24 @@ def main(argv: list[str] | None = None) -> int:
     if op == "bitop":
         msg["operation"] = args.operation
         msg["keys"] = args.keys
+    if op == "geoadd":
+        if len(args.triples) % 3:
+            parser.error("geoadd takes longitude latitude member "
+                         "triples: lon1 lat1 m1 lon2 lat2 m2 ...")
+        members = []
+        for i in range(0, len(args.triples), 3):
+            try:
+                lon = float(args.triples[i])
+                lat = float(args.triples[i + 1])
+            except ValueError:
+                parser.error("geoadd longitude and latitude must be "
+                             "numbers")
+            members.append([lon, lat, args.triples[i + 2]])
+        msg["members"] = members
+    if op == "geodist":
+        msg["member1"] = args.member1
+        msg["member2"] = args.member2
+        msg["unit"] = args.unit
     if op == "pfadd":
         msg["elements"] = args.elements
     if op == "hset":
@@ -3546,7 +3738,8 @@ def main(argv: list[str] | None = None) -> int:
     if op in ("set", "del", "cas", "mset", "expire", "incr",
               "incrbyfloat", "setnx",
               "getset", "append", "getdel", "getex", "setrange",
-              "setbit", "bitop", "pfadd", "hset", "hdel", "setex",
+              "setbit", "bitop", "pfadd", "geoadd", "hset", "hdel",
+              "setex",
               "expireat",
               "pexpireat") \
             and args.request_id:
@@ -3617,6 +3810,11 @@ def main(argv: list[str] | None = None) -> int:
             print(resp.get("bitcount"))
         elif op == "bitop":
             print(resp.get("bitop"))
+        elif op == "geoadd":
+            print(resp.get("geoadd"))
+        elif op == "geodist":
+            dist = resp.get("distance")
+            print(dist if dist is not None else "(nil)")
         elif op == "pfadd":
             print(resp.get("pfadd"))
         elif op == "pfcount":

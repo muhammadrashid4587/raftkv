@@ -689,6 +689,52 @@ logic and the failure handling, not the key-value API on top.
   pipeline op. The honest limit is the same encoding as setbit:
   a value holding a character above U+00FF has no byte form to
   count.
+- **Geo** — since v0.62.0 `geoadd key lon lat member [lon lat
+  member ...]` (`Session.geoadd(k, members)`,
+  `client.geoadd(addr, k, members)`, `geoadd key lon lat member
+  ...` on the CLI) adds members with positions to the geo set at
+  the key and answers with the number of members that did not
+  exist before — Redis GEOADD — and `geodist key member1 member2
+  [unit]` (`Session.geodist(k, m1, m2, unit)`,
+  `client.geodist(addr, k, m1, m2, unit)`, `geodist key m1 m2
+  [--unit m|km|mi|ft]` on the CLI) answers the distance between
+  two members — Redis GEODIST — in metres by default, or km, mi,
+  or ft. Longitude must be in -180..180 and latitude in
+  -85.05112878..85.05112878, Redis's ranges; a member whose
+  position is updated is not counted, and a member repeated in
+  one call counts once, at its last position. A missing key is
+  created as an empty geo set, and a geodist on a missing key or
+  between a member and one that is not in the set answers None,
+  like a get on a missing key. The members ride in the store as
+  a JSON blob with a marker prefix, like a hash — the JSON maps
+  member names to [lon, lat] pairs, dumped with sorted keys and
+  no spaces, so the encoding is a pure function of the members
+  and every node applying the same log computes the same bytes —
+  and the distance is the haversine over the stored coordinates
+  divided by the unit's metres, so every unit agrees on the same
+  underlying distance. The outcome is decided at apply time, at
+  the entry's exact position in the log, like a CAS: a retry with
+  the same session id returns the first attempt's count instead
+  of adding twice. A key holding a plain string fails a geoadd
+  with `geoadd_failed` and reason `wrongtype` instead of writing,
+  and a geodist on one is a client error, not a distance. At most
+  1000 members per geoadd, like a pfadd batch, so one entry never
+  carries an unbounded list. A successful geoadd keeps the key's
+  TTL deadline, like an hset, and fires a `set` watch event with
+  the new value; a failed one fires nothing. A geodist rides the
+  same ReadIndex path as a `get`, so it carries the same session
+  watermark and is exactly as linearizable, and a stale geodist
+  is served from a follower lease exactly like a stale `get`.
+  `{"op": "geoadd", "key": k, "members": [[lon, lat, m], ...]}`
+  is a pipeline op too; like hget and hgetall a geodist is a
+  read, so it is not one. The honest limit is the encoding
+  itself: positions are stored as plain longitude/latitude pairs,
+  not as Redis's 52-bit geohash scores in a sorted set, so there
+  is no radius search yet — GEORADIUS / GEOSEARCH would need the
+  geohash ordering — and a distance computed here is the exact
+  haversine, which can differ from Redis's geohash-quantized
+  answer by a fraction of a metre (Palermo to Catania: 166274.26
+  m here, 166274.15 m in Redis's documentation).
 - **HyperLogLog** — since v0.47.0 `pfadd key element [element ...]`
   (`Session.pfadd(k, *elements)`, `client.pfadd(addr, k, *elements)`,
   `pfadd key element ...` on the CLI) adds elements to the
@@ -1186,7 +1232,7 @@ make test
 # or: python3 -m unittest discover -s tests -v
 ```
 
-705 tests, plus a smoke test for the benchmark script, all passing:
+727 tests, plus a smoke test for the benchmark script, all passing:
 
 | Test | What it proves |
 |---|---|
@@ -3335,3 +3381,56 @@ entries left in `log.jsonl` are dropped by their index on reload.
   The roadmap is exhausted again, so the next real thing is
   a new roadmap item grounded in this project's purpose,
   proposed by the next run — candidates: GEO, or streams.
+- ~~GEO (positions and distance)~~ — done in v0.62.0,
+  Nov 26, 2026: `geoadd key lon lat member [lon lat member ...]`
+  adds members with positions to the geo set at the key and
+  answers with the number of members that did not exist before
+  — Redis GEOADD — and `geodist key member1 member2 [unit]`
+  answers the distance between two members — Redis GEODIST — in
+  metres by default, or km, mi, or ft. Longitude must be in
+  -180..180 and latitude in -85.05112878..85.05112878, Redis's
+  ranges; a member whose position is updated is not counted, and
+  a member repeated in one call counts once, at its last position.
+  A missing key is created as an empty geo set, and a geodist on
+  a missing key or between a member and one that is not in the
+  set answers None. The members ride in the store as a JSON blob
+  with a marker prefix, like a hash — member names to [lon, lat]
+  pairs, dumped with sorted keys and no spaces, so every node
+  applying the same log computes the same bytes — and the distance
+  is the haversine over the stored coordinates divided by the
+  unit's metres, so every unit agrees on the same underlying
+  distance. The outcome is decided at apply time, so a retry with
+  the same session id returns the first attempt's count instead
+  of adding twice; a plain string value fails a geoadd with
+  `geoadd_failed` / `wrongtype`, and a geodist on one is a client
+  error, not a distance. At most 1000 members per geoadd, and a
+  bad coordinate, an empty member list, or a bad unit is a client
+  error that appends nothing. A successful geoadd keeps the key's
+  TTL deadline, like an hset, and fires a `set` watch event with
+  the new value. A geodist is a pure read through the same
+  ReadIndex path as a `get`, so it is exactly as linearizable and
+  a stale geodist is served from a follower lease like a stale
+  `get`. `Session.geoadd` / `Session.geodist`,
+  `client.geoadd` / `client.geodist`, and `geoadd` / `geodist`
+  on the CLI, plus `{"op": "geoadd"}` as a pipeline op; a
+  geodist is a read, so it is not one. `tests/test_geo.py`
+  proves it: store-level adding and counting new members only,
+  updating a position without counting, a repeated member
+  counting once at its last position, TTL kept, the new key
+  joining the sorted index, wrongtype leaving the value
+  untouched, bad members raising, missing keys and members
+  answering None, the four units agreeing with each other and
+  the metre value within a metre of Redis's documented
+  166274.1516, bad units raising, and the scan surviving a
+  snapshot load; cluster-level replication to every node, a
+  redirect from a follower, invalid geoadds and geodists
+  rejected with no log entry, dedup of a geoadd retry returning
+  the first attempt's count, the watch event on leader and
+  follower (and nothing on a failed geoadd), surviving a snapshot
+  + restart, continuing after a leader change, session
+  read-your-writes, pipelined geoadd ops with bad members in
+  position, the module functions from a follower, and the CLI
+  end to end.
+  The roadmap is exhausted again, so the next real thing is
+  a new roadmap item grounded in this project's purpose,
+  proposed by the next run — candidates: streams.
