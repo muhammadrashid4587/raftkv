@@ -234,12 +234,17 @@ def geo_distance(lon1: float, lat1: float, lon2: float,
 # with "$", so every later entry counts as new), and the pending
 # entries list: every entry handed out and not yet acked, with
 # which consumer holds it and how many times it has been
-# delivered. The groups ride in the same blob, so they survive
-# snapshots and replay exactly like the entries — a group created
-# before a snapshot is still there after one — and the blob stays
-# a pure function of (entries, groups), so every node computes
-# the same bytes. A stream created before groups existed carries
-# no "groups" key at all, and reads like one with no groups.
+# delivered. Since v0.69.0 a group may also carry "entries_read",
+# the count an XGROUP SETID ... ENTRIESREAD set — XGROUP SETID
+# moves last_delivered (and optionally entries_read), XGROUP
+# DESTROY drops the whole group, and XGROUP DELCONSUMER drops
+# one consumer and its pending entries. The groups ride in the
+# same blob, so they survive snapshots and replay exactly like
+# the entries — a group created before a snapshot is still there
+# after one — and the blob stays a pure function of (entries,
+# groups), so every node computes the same bytes. A stream
+# created before groups existed carries no "groups" key at all,
+# and reads like one with no groups.
 STREAM_PREFIX = "\x00raftkv-stream\x00"
 
 # Largest number of fields one ``xadd`` may carry. The pairs ride
@@ -367,7 +372,10 @@ def _is_group_map(groups) -> bool:
     pending entries: every entry handed out and not yet acked,
     with which consumer holds it and how many times it has been
     delivered (at least 1 — an entry with 0 deliveries was never
-    handed out). A plain string can only pass this by being
+    handed out). Since v0.69.0 a group may also carry
+    "entries_read" — the count an XGROUP SETID ... ENTRIESREAD
+    set, a non-negative integer, absent when no SETID ever set
+    it. A plain string can only pass this by being
     hand-built to the exact shape — the same class of collision
     the hash check has — so an XREADGROUP trusts the shape."""
     if not isinstance(groups, dict):
@@ -376,13 +384,21 @@ def _is_group_map(groups) -> bool:
         if not isinstance(name, str) or not name:
             return False
         if (not isinstance(group, dict)
-                or set(group) != {"last_delivered", "pending"}):
+                or set(group) not in ({"last_delivered", "pending"},
+                                      {"last_delivered", "pending",
+                                       "entries_read"})):
             return False
         last = group["last_delivered"]
         if last is not None:
             try:
                 _parse_stored_stream_id(last)
             except ValueError:
+                return False
+        if "entries_read" in group:
+            entries_read = group["entries_read"]
+            if (not isinstance(entries_read, int)
+                    or isinstance(entries_read, bool)
+                    or entries_read < 0):
                 return False
         pending = group["pending"]
         if not isinstance(pending, dict):
@@ -731,7 +747,8 @@ class KVStore:
         state at apply time — currently "set", "cas", "expire", "expireat",
         "pexpireat", "incr", "incrbyfloat", "setnx", "getset", "append", "getdel",
         "setrange", "getex", "setbit", "bitop", "pfadd", "hset", "hdel",
-        "geoadd", "xadd", "xtrim", "xgroup_create", "xreadgroup", and "xack" —
+        "geoadd", "xadd", "xtrim", "xgroup_create", "xreadgroup", "xack",
+        "xgroup_setid", "xgroup_destroy", and "xgroup_delconsumer" —
         and None for del, whose outcome is always ok. The result is
         what the leader hands back to the waiting client and what the
         dedup table caches for retries, so it must be a pure function
@@ -2309,6 +2326,234 @@ class KVStore:
                 self._data[key] = _stream_value(stream)
             return {"type": "client_response", "status": "ok",
                     "xack": acked}
+        elif op == "xgroup_setid":
+            # Set a consumer group's last-delivered ID, Redis
+            # XGROUP SETID: ``id`` is "$" (the stream's top, or
+            # None on an empty stream, so every later entry
+            # counts as new — the same resolution a create with
+            # "$" uses) or an explicit "ms-seq" or bare
+            # millisecond, which sets last_delivered to exactly
+            # that ID — even one past the stream's top, so a
+            # later ">" read hands out nothing until entries pass
+            # it, like Redis. An optional ``entries_read`` sets
+            # the group's entries-read count (Redis's ENTRIESREAD
+            # option), a non-negative integer stored alongside
+            # the group in the blob, so it survives snapshots and
+            # replay like the rest of the group. The pending
+            # entries are untouched: a SETID moves the read
+            # position, it does not ack or drop anything. The
+            # reply carries ``xgroup_setid`` 1, and ``changed`` 1
+            # only when the blob actually changed — a SETID to
+            # the ID the group already holds, with no new
+            # entries-read, writes nothing at all, like an xtrim
+            # that removed nothing. A missing key or a missing
+            # group fails with ``xgroup_setid_failed`` /
+            # ``no_group`` — Redis's NOGROUP — and a key holding
+            # a plain string fails with WRONGTYPE, like an xadd.
+            # The outcome is decided here, at this exact point in
+            # the log, like a CAS, so a retry with the same
+            # session id returns the first attempt's result
+            # instead of setting the ID twice. A successful setid
+            # keeps the key's TTL deadline, like an xadd. The
+            # group, ID, and entries-read were validated on the
+            # leader before the entry was logged (a non-empty
+            # string group; "$", "0", a bare millisecond, or a
+            # full "ms-seq" — never "-" or "+", which are range
+            # bounds, not IDs — and a non-negative integer
+            # entries-read), so by apply time they are
+            # well-formed — a hand-built log entry with a bad
+            # group, ID, or count still raises rather than
+            # silently moving the read position.
+            key = command["key"]
+            group = command.get("group")
+            if not isinstance(group, str) or not group:
+                raise ValueError(
+                    "xgroup_setid group must be a non-empty string")
+            id_str = command.get("id", "$")
+            if not isinstance(id_str, str):
+                raise ValueError("xgroup_setid id must be a string")
+            if id_str in ("-", "+"):
+                raise ValueError(
+                    "xgroup_setid id must be \"$\", \"0\", \"ms\", or "
+                    "\"ms-seq\"")
+            entries_read = command.get("entries_read")
+            if entries_read is not None and (
+                    not isinstance(entries_read, int)
+                    or isinstance(entries_read, bool)
+                    or entries_read < 0):
+                raise ValueError(
+                    "xgroup_setid entries_read must be a "
+                    "non-negative integer")
+            current = self._data.get(key)
+            if current is None:
+                return {"type": "client_response",
+                        "status": "xgroup_setid_failed",
+                        "reason": "no_group",
+                        "error": "xgroup_setid failed: no such key "
+                                 f"{key!r} or consumer group "
+                                 f"{group!r}"}
+            if not is_stream(current):
+                return {"type": "client_response",
+                        "status": "xgroup_setid_failed",
+                        "reason": "wrongtype",
+                        "current": current,
+                        "error": "xgroup_setid failed: value of "
+                                 f"{key!r} is not a stream"}
+            stream = _stream_data(current)
+            groups = stream.get("groups", {})
+            if group not in groups:
+                return {"type": "client_response",
+                        "status": "xgroup_setid_failed",
+                        "reason": "no_group",
+                        "error": "xgroup_setid failed: no such key "
+                                 f"{key!r} or consumer group "
+                                 f"{group!r}"}
+            state = groups[group]
+            if id_str == "$":
+                last_delivered = stream["last"]
+            else:
+                set_ms, set_seq = parse_stream_range_bound(id_str)
+                last_delivered = f"{set_ms}-{set_seq}"
+            changed = False
+            if state["last_delivered"] != last_delivered:
+                state["last_delivered"] = last_delivered
+                changed = True
+            if (entries_read is not None
+                    and state.get("entries_read") != entries_read):
+                state["entries_read"] = entries_read
+                changed = True
+            result = {"type": "client_response", "status": "ok",
+                      "xgroup_setid": 1}
+            if changed:
+                self._data[key] = _stream_value(stream)
+                result["changed"] = 1
+            return result
+        elif op == "xgroup_destroy":
+            # Destroy a consumer group, Redis XGROUP DESTROY: the
+            # group leaves the stream blob entirely, pending
+            # entries and all — a consumer holding entries in a
+            # destroyed group holds nothing afterwards, since the
+            # group itself is gone. The reply carries
+            # ``xgroup_destroy`` 1 when the group existed and was
+            # destroyed, 0 when the stream exists but the group
+            # does not — Redis's answer for a group that is not
+            # there, not an error — while a missing key fails
+            # with ``xgroup_destroy_failed`` / ``no_group``,
+            # Redis's NOGROUP, and a key holding a plain string
+            # fails with WRONGTYPE, like an xadd. The outcome is
+            # decided here, at this exact point in the log, like
+            # a CAS, so a retry with the same session id returns
+            # the first attempt's result instead of destroying
+            # the group twice — a retry after a successful
+            # destroy answers 0, the group already gone. A
+            # successful destroy keeps the key's TTL deadline,
+            # like an xadd: the stream itself is still there, a
+            # group lighter. The group was validated on the
+            # leader before the entry was logged (a non-empty
+            # string), so by apply time it is well-formed — a
+            # hand-built log entry with a bad group still raises
+            # rather than silently destroying nonsense.
+            key = command["key"]
+            group = command.get("group")
+            if not isinstance(group, str) or not group:
+                raise ValueError(
+                    "xgroup_destroy group must be a non-empty "
+                    "string")
+            current = self._data.get(key)
+            if current is None:
+                return {"type": "client_response",
+                        "status": "xgroup_destroy_failed",
+                        "reason": "no_group",
+                        "error": "xgroup_destroy failed: no such key "
+                                 f"{key!r} or consumer group "
+                                 f"{group!r}"}
+            if not is_stream(current):
+                return {"type": "client_response",
+                        "status": "xgroup_destroy_failed",
+                        "reason": "wrongtype",
+                        "current": current,
+                        "error": "xgroup_destroy failed: value of "
+                                 f"{key!r} is not a stream"}
+            stream = _stream_data(current)
+            groups = stream.get("groups", {})
+            if group not in groups:
+                return {"type": "client_response", "status": "ok",
+                        "xgroup_destroy": 0}
+            del groups[group]
+            self._data[key] = _stream_value(stream)
+            return {"type": "client_response", "status": "ok",
+                    "xgroup_destroy": 1}
+        elif op == "xgroup_delconsumer":
+            # Delete one consumer from a consumer group, Redis
+            # XGROUP DELCONSUMER: the consumer leaves the group,
+            # and every entry it held pending leaves with it —
+            # the entries themselves stay in the stream, only
+            # their pending record goes, so they are simply no
+            # longer pending, like acked ones (a later ">" read
+            # still will not re-hand them: the group's last
+            # delivery already passed them). The reply carries
+            # ``xgroup_delconsumer`` — how many pending entries
+            # the consumer held, 0 when the consumer held none
+            # or did not exist at all, like Redis. A missing key
+            # or a missing group fails with
+            # ``xgroup_delconsumer_failed`` / ``no_group`` —
+            # Redis's NOGROUP — and a key holding a plain string
+            # fails with WRONGTYPE, like an xadd. The outcome is
+            # decided here, at this exact point in the log, like
+            # a CAS, so a retry with the same session id returns
+            # the first attempt's count instead of deleting the
+            # consumer twice — a retry after a successful delete
+            # answers 0, the consumer already gone. A successful
+            # delete keeps the key's TTL deadline, like an xadd.
+            # The group and consumer were validated on the leader
+            # before the entry was logged (non-empty strings), so
+            # by apply time they are well-formed — a hand-built
+            # log entry with a bad name still raises rather than
+            # silently deleting nonsense.
+            key = command["key"]
+            group = command.get("group")
+            consumer = command.get("consumer")
+            if not isinstance(group, str) or not group:
+                raise ValueError(
+                    "xgroup_delconsumer group must be a non-empty "
+                    "string")
+            if not isinstance(consumer, str) or not consumer:
+                raise ValueError(
+                    "xgroup_delconsumer consumer must be a "
+                    "non-empty string")
+            current = self._data.get(key)
+            if current is None:
+                return {"type": "client_response",
+                        "status": "xgroup_delconsumer_failed",
+                        "reason": "no_group",
+                        "error": "xgroup_delconsumer failed: no such "
+                                 f"key {key!r} or consumer group "
+                                 f"{group!r}"}
+            if not is_stream(current):
+                return {"type": "client_response",
+                        "status": "xgroup_delconsumer_failed",
+                        "reason": "wrongtype",
+                        "current": current,
+                        "error": "xgroup_delconsumer failed: value of "
+                                 f"{key!r} is not a stream"}
+            stream = _stream_data(current)
+            groups = stream.get("groups", {})
+            if group not in groups:
+                return {"type": "client_response",
+                        "status": "xgroup_delconsumer_failed",
+                        "reason": "no_group",
+                        "error": "xgroup_delconsumer failed: no such "
+                                 f"key {key!r} or consumer group "
+                                 f"{group!r}"}
+            pending = groups[group]["pending"]
+            doomed = [eid for eid, info in pending.items()
+                      if info["consumer"] == consumer]
+            for entry_id in doomed:
+                del pending[entry_id]
+            if doomed:
+                self._data[key] = _stream_value(stream)
+            return {"type": "client_response", "status": "ok",
+                    "xgroup_delconsumer": len(doomed)}
         elif op == "setrange":
             # Overwrite part of a string value, Redis SETRANGE:
             # starting at ``offset``, replace as many characters

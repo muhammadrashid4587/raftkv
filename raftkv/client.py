@@ -1244,6 +1244,115 @@ class Session:
                             "key": key, "group": group,
                             "ids": list(ids)})
 
+    def xgroup_setid(self, key: str, group: str, id: str = "$",
+                     entries_read: int | None = None) -> dict:
+        """Set a consumer group's last-delivered ID on the stream
+        at ``key``, Redis XGROUP SETID: ``id`` is "$" (the
+        stream's top at apply time, the default), "0" (from the
+        very first entry), a bare millisecond, or a full "ms-seq"
+        — even one past the stream's top, so a later ">" read
+        hands out nothing until entries pass it — and
+        ``entries_read`` sets the group's entries-read count,
+        Redis's ENTRIESREAD option. The pending entries are
+        untouched: a SETID moves the read position, it does not
+        ack or drop anything. The reply carries
+        ``xgroup_setid`` 1, and ``changed`` 1 only when the
+        group's read position actually moved. A missing key or
+        group fails with ``xgroup_setid_failed`` and reason
+        ``no_group``, and a plain string value fails with reason
+        ``wrongtype``. A bad group, ID, or entries-read never
+        goes on the wire and returns the server's error shape
+        instead. The outcome is decided at apply time, at the
+        entry's position in the log, so a retry with the same
+        session id returns the first attempt's result instead of
+        setting the ID twice, and a successful setid keeps the
+        key's TTL deadline, like an xadd. A successful setid
+        advances the write watermark from the reply's index, like
+        any other write — and so does a failed one, since it
+        still committed its entry."""
+        if not isinstance(group, str) or not group:
+            return {"type": "client_response", "status": "error",
+                    "error": "xgroup_setid group must be a "
+                             "non-empty string"}
+        if not isinstance(id, str):
+            return {"type": "client_response", "status": "error",
+                    "error": "xgroup_setid id must be a string"}
+        if entries_read is not None and (
+                not isinstance(entries_read, int)
+                or isinstance(entries_read, bool)
+                or entries_read < 0):
+            return {"type": "client_response", "status": "error",
+                    "error": "xgroup_setid entries_read must be a "
+                             "non-negative integer"}
+        msg: dict = {"type": "client", "op": "xgroup_setid",
+                     "key": key, "group": group, "id": id}
+        if entries_read is not None:
+            msg["entries_read"] = entries_read
+        return self._write(msg)
+
+    def xgroup_destroy(self, key: str, group: str) -> dict:
+        """Destroy a consumer group on the stream at ``key``,
+        Redis XGROUP DESTROY: the group leaves the stream
+        entirely, pending entries and all, and the reply carries
+        ``xgroup_destroy`` 1 when the group existed and was
+        destroyed, 0 when the stream exists but the group does
+        not. A missing key fails with
+        ``xgroup_destroy_failed`` and reason ``no_group``, and a
+        plain string value fails with reason ``wrongtype``. A bad
+        group never goes on the wire and returns the server's
+        error shape instead. The outcome is decided at apply
+        time, at the entry's position in the log, so a retry with
+        the same session id returns the first attempt's result
+        instead of destroying the group twice — a retry after a
+        successful destroy answers 0, the group already gone —
+        and a successful destroy keeps the key's TTL deadline,
+        like an xadd. A successful destroy advances the write
+        watermark from the reply's index, like any other write
+        — and so does a failed one, since it still committed its
+        entry."""
+        if not isinstance(group, str) or not group:
+            return {"type": "client_response", "status": "error",
+                    "error": "xgroup_destroy group must be a "
+                             "non-empty string"}
+        return self._write({"type": "client", "op": "xgroup_destroy",
+                            "key": key, "group": group})
+
+    def xgroup_delconsumer(self, key: str, group: str,
+                           consumer: str) -> dict:
+        """Delete one consumer from a consumer group on the
+        stream at ``key``, Redis XGROUP DELCONSUMER: the consumer
+        leaves the group, and every entry it held pending leaves
+        with it — the entries themselves stay in the stream, only
+        their pending record goes — and the reply carries
+        ``xgroup_delconsumer`` — how many pending entries the
+        consumer held, 0 when the consumer held none or did not
+        exist at all. A missing key or group fails with
+        ``xgroup_delconsumer_failed`` and reason ``no_group``,
+        and a plain string value fails with reason
+        ``wrongtype``. A bad group or consumer never goes on the
+        wire and returns the server's error shape instead. The
+        outcome is decided at apply time, at the entry's position
+        in the log, so a retry with the same session id returns
+        the first attempt's count instead of deleting the
+        consumer twice — a retry after a successful delete
+        answers 0, the consumer already gone — and a successful
+        delete keeps the key's TTL deadline, like an xadd. A
+        successful delete advances the write watermark from the
+        reply's index, like any other write — and so does a
+        failed one, since it still committed its entry."""
+        if not isinstance(group, str) or not group:
+            return {"type": "client_response", "status": "error",
+                    "error": "xgroup_delconsumer group must be a "
+                             "non-empty string"}
+        if not isinstance(consumer, str) or not consumer:
+            return {"type": "client_response", "status": "error",
+                    "error": "xgroup_delconsumer consumer must be "
+                             "a non-empty string"}
+        return self._write({"type": "client",
+                            "op": "xgroup_delconsumer",
+                            "key": key, "group": group,
+                            "consumer": consumer})
+
     def xpending(self, key: str, group: str) -> dict:
         """Ask for the pending-entries summary for ``group`` on the
         stream at ``key``, Redis XPENDING, summary form: the reply
@@ -2000,7 +2109,13 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
     a blocking readgroup goes as its own request), ``xack`` a
     string key, a
     non-empty string group, and a non-empty list of at most 1000
-    explicit "ms-seq" IDs,
+    explicit "ms-seq" IDs, ``xgroup_setid`` a string key, a
+    non-empty string group, and an ID — "$" (the stream's top),
+    "0", a bare millisecond, or a full "ms-seq" — plus an optional
+    non-negative integer ``entries_read``, ``xgroup_destroy`` a
+    string key and a non-empty string group, ``xgroup_delconsumer``
+    a string key, a non-empty string group, and a non-empty string
+    consumer,
     ``hset`` a string key and a
     non-empty list of at most 1000 [field, value] string pairs,
     ``hdel`` a string key and a non-empty list of at most 1000
@@ -2021,6 +2136,8 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
                     "bitop",
                     "pfadd", "geoadd", "xadd", "xtrim",
                     "xgroup_create", "xreadgroup", "xack",
+                    "xgroup_setid", "xgroup_destroy",
+                    "xgroup_delconsumer",
                     "hset", "hdel",
                     "setex",
                     "expireat",
@@ -2030,7 +2147,9 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
                                "incr, incrbyfloat, setnx, getset, append, "
                                "getdel, getex, setrange, setbit, bitop, "
                                "pfadd, geoadd, xadd, xtrim, xgroup_create, "
-                               "xreadgroup, xack, hset, hdel, setex, expireat, or "
+                               "xreadgroup, xack, xgroup_setid, "
+                               "xgroup_destroy, xgroup_delconsumer, hset, "
+                               "hdel, setex, expireat, or "
                                "pexpireat"}
     key = op.get("key")
     if not isinstance(key, str):
@@ -2538,6 +2657,78 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
                                        "explicit \"ms-seq\" stream IDs "
                                        "greater than 0-0"}
         msg["ids"] = list(ids)
+    if name == "xgroup_setid":
+        # ``group``, ``id``, and ``entries_read`` ride along with
+        # a pipelined xgroup_setid, validated here so a malformed
+        # one never goes on the wire: a non-empty string group,
+        # an ID of "$", "0", a bare millisecond, or a full
+        # "ms-seq", and a non-negative integer entries-read when
+        # one is given — the same shapes the server enforces.
+        group = op.get("group")
+        if not isinstance(group, str) or not group:
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline xgroup_setid group "
+                                   "must be a non-empty string"}
+        msg["group"] = group
+        id_str = op.get("id", "$")
+        if not isinstance(id_str, str):
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline xgroup_setid id must be "
+                                   "a string"}
+        if id_str != "$":
+            parts = id_str.split("-")
+            if (id_str in ("-", "+")
+                    or len(parts) not in (1, 2)
+                    or not parts[0].isdigit()
+                    or int(parts[0]) > 2 ** 64 - 1
+                    or (len(parts) == 2
+                        and (not parts[1].isdigit()
+                             or int(parts[1]) > 2 ** 64 - 1))):
+                return None, {"type": "client_response",
+                              "status": "error",
+                              "error": "pipeline xgroup_setid id "
+                                       "must be \"$\", \"0\", \"ms\", "
+                                       "or \"ms-seq\""}
+        msg["id"] = id_str
+        entries_read = op.get("entries_read")
+        if entries_read is not None and (
+                not isinstance(entries_read, int)
+                or isinstance(entries_read, bool) or entries_read < 0):
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline xgroup_setid "
+                                   "entries_read must be a "
+                                   "non-negative integer"}
+        if entries_read is not None:
+            msg["entries_read"] = entries_read
+    if name == "xgroup_destroy":
+        # ``group`` rides along with a pipelined xgroup_destroy,
+        # validated here so a malformed one never goes on the
+        # wire: a non-empty string group — the same shape the
+        # server enforces.
+        group = op.get("group")
+        if not isinstance(group, str) or not group:
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline xgroup_destroy group "
+                                   "must be a non-empty string"}
+        msg["group"] = group
+    if name == "xgroup_delconsumer":
+        # ``group`` and ``consumer`` ride along with a pipelined
+        # xgroup_delconsumer, validated here so a malformed one
+        # never goes on the wire: non-empty string group and
+        # consumer — the same shapes the server enforces.
+        group = op.get("group")
+        if not isinstance(group, str) or not group:
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline xgroup_delconsumer group "
+                                   "must be a non-empty string"}
+        msg["group"] = group
+        consumer = op.get("consumer")
+        if not isinstance(consumer, str) or not consumer:
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline xgroup_delconsumer "
+                                   "consumer must be a non-empty "
+                                   "string"}
+        msg["consumer"] = consumer
     if name == "hset":
         # ``pairs`` rides along with a pipelined hset, validated
         # here so a malformed one never goes on the wire: a
@@ -3535,6 +3726,108 @@ def xack(node_addr: tuple[str, int], key: str, group: str,
     return request(node_addr, {"type": "client", "op": "xack",
                                "key": key, "group": group,
                                "ids": list(ids)},
+                   timeout=timeout)
+
+
+def xgroup_setid(node_addr: tuple[str, int], key: str, group: str,
+                 id: str = "$", entries_read: int | None = None,
+                 timeout: float = 12.0) -> dict:
+    """Set a consumer group's last-delivered ID on the stream at
+    ``key``, following leader redirects like ``request`` — Redis
+    XGROUP SETID.
+
+    One request appends the setid entry, so the new read position
+    is decided at the entry's position in the log: the reply is
+    the plain xgroup_setid response (``status`` ``ok`` with
+    ``xgroup_setid`` 1 — or ``xgroup_setid_failed`` with reason
+    ``no_group`` when the key or the group does not exist, or
+    ``wrongtype`` when the current value is a plain string). The
+    ID is "$" (the stream's top at apply time), "0" (from the
+    very first entry), a bare millisecond, or a full "ms-seq" —
+    even one past the stream's top — and ``entries_read`` sets
+    the group's entries-read count, Redis's ENTRIESREAD option.
+    The pending entries are untouched. A bad group, ID, or
+    entries-read never goes on the wire and returns the server's
+    error shape instead. A successful setid keeps the key's TTL
+    deadline, like an xadd."""
+    if not isinstance(group, str) or not group:
+        return {"type": "client_response", "status": "error",
+                "error": "xgroup_setid group must be a non-empty "
+                         "string"}
+    if not isinstance(id, str):
+        return {"type": "client_response", "status": "error",
+                "error": "xgroup_setid id must be a string"}
+    if entries_read is not None and (
+            not isinstance(entries_read, int)
+            or isinstance(entries_read, bool) or entries_read < 0):
+        return {"type": "client_response", "status": "error",
+                "error": "xgroup_setid entries_read must be a "
+                         "non-negative integer"}
+    msg: dict = {"type": "client", "op": "xgroup_setid",
+                 "key": key, "group": group, "id": id}
+    if entries_read is not None:
+        msg["entries_read"] = entries_read
+    return request(node_addr, msg, timeout=timeout)
+
+
+def xgroup_destroy(node_addr: tuple[str, int], key: str, group: str,
+                   timeout: float = 12.0) -> dict:
+    """Destroy a consumer group on the stream at ``key``,
+    following leader redirects like ``request`` — Redis XGROUP
+    DESTROY.
+
+    One request appends the destroy entry, so whether the group
+    is gone is decided at the entry's position in the log: the
+    reply is the plain xgroup_destroy response (``status``
+    ``ok`` with ``xgroup_destroy`` 1 when the group existed and
+    was destroyed, 0 when the stream exists but the group does
+    not — or ``xgroup_destroy_failed`` with reason ``no_group``
+    when the key does not exist, or ``wrongtype`` when the
+    current value is a plain string). A bad group never goes on
+    the wire and returns the server's error shape instead. A
+    successful destroy keeps the key's TTL deadline, like an
+    xadd."""
+    if not isinstance(group, str) or not group:
+        return {"type": "client_response", "status": "error",
+                "error": "xgroup_destroy group must be a "
+                         "non-empty string"}
+    return request(node_addr, {"type": "client",
+                               "op": "xgroup_destroy",
+                               "key": key, "group": group},
+                   timeout=timeout)
+
+
+def xgroup_delconsumer(node_addr: tuple[str, int], key: str,
+                       group: str, consumer: str,
+                       timeout: float = 12.0) -> dict:
+    """Delete one consumer from a consumer group on the stream at
+    ``key``, following leader redirects like ``request`` — Redis
+    XGROUP DELCONSUMER.
+
+    One request appends the delete entry, so how many pending
+    entries the consumer held is decided at the entry's position
+    in the log: the reply is the plain xgroup_delconsumer
+    response (``status`` ``ok`` with ``xgroup_delconsumer`` —
+    how many pending entries the consumer held, 0 when the
+    consumer held none or did not exist at all — or
+    ``xgroup_delconsumer_failed`` with reason ``no_group`` when
+    the key or the group does not exist, or ``wrongtype`` when
+    the current value is a plain string). A bad group or
+    consumer never goes on the wire and returns the server's
+    error shape instead. A successful delete keeps the key's TTL
+    deadline, like an xadd."""
+    if not isinstance(group, str) or not group:
+        return {"type": "client_response", "status": "error",
+                "error": "xgroup_delconsumer group must be a "
+                         "non-empty string"}
+    if not isinstance(consumer, str) or not consumer:
+        return {"type": "client_response", "status": "error",
+                "error": "xgroup_delconsumer consumer must be a "
+                         "non-empty string"}
+    return request(node_addr, {"type": "client",
+                               "op": "xgroup_delconsumer",
+                               "key": key, "group": group,
+                               "consumer": consumer},
                    timeout=timeout)
 
 
@@ -4652,6 +4945,65 @@ def main(argv: list[str] | None = None) -> int:
                              "twice")
     p_xack.add_argument("--request-id", default=None,
                         help="id of this write within the client session")
+    p_xgroup_setid = sub.add_parser(
+        "xgroup_setid",
+        help="set a consumer group's last-delivered ID on the "
+             "stream at key and print OK; the group reads from "
+             "the new ID on its next \">\" read")
+    p_xgroup_setid.add_argument("key")
+    p_xgroup_setid.add_argument("group")
+    p_xgroup_setid.add_argument("id", nargs="?", default="$",
+                                help="\"$\" (the stream's top), "
+                                     "\"0\" (from the very first "
+                                     "entry), a bare millisecond, or "
+                                     "\"ms-seq\" (default $)")
+    p_xgroup_setid.add_argument("--entries-read", type=int,
+                                default=None,
+                                help="set the group's entries-read "
+                                     "count (Redis ENTRIESREAD)")
+    p_xgroup_setid.add_argument("--client-id", default=None,
+                                help="session id for at-most-once writes: "
+                                     "a retry with the same client id + "
+                                     "request id returns the first "
+                                     "attempt's result instead of writing "
+                                     "twice")
+    p_xgroup_setid.add_argument("--request-id", default=None,
+                                help="id of this write within the client "
+                                     "session")
+    p_xgroup_destroy = sub.add_parser(
+        "xgroup_destroy",
+        help="destroy a consumer group on the stream at key and "
+             "print 1 when the group existed and was destroyed, "
+             "0 when it did not exist")
+    p_xgroup_destroy.add_argument("key")
+    p_xgroup_destroy.add_argument("group")
+    p_xgroup_destroy.add_argument("--client-id", default=None,
+                                  help="session id for at-most-once "
+                                       "writes: a retry with the same "
+                                       "client id + request id returns "
+                                       "the first attempt's result "
+                                       "instead of writing twice")
+    p_xgroup_destroy.add_argument("--request-id", default=None,
+                                  help="id of this write within the "
+                                       "client session")
+    p_xgroup_delconsumer = sub.add_parser(
+        "xgroup_delconsumer",
+        help="delete a consumer from a consumer group on the "
+             "stream at key and print how many pending entries "
+             "the consumer held (0 when it held none or did not "
+             "exist)")
+    p_xgroup_delconsumer.add_argument("key")
+    p_xgroup_delconsumer.add_argument("group")
+    p_xgroup_delconsumer.add_argument("consumer")
+    p_xgroup_delconsumer.add_argument("--client-id", default=None,
+                                      help="session id for at-most-once "
+                                           "writes: a retry with the same "
+                                           "client id + request id returns "
+                                           "the first attempt's result "
+                                           "instead of writing twice")
+    p_xgroup_delconsumer.add_argument("--request-id", default=None,
+                                      help="id of this write within the "
+                                           "client session")
     p_xpending = sub.add_parser(
         "xpending",
         help="print the pending-entries summary for a consumer "
@@ -4871,6 +5223,7 @@ def main(argv: list[str] | None = None) -> int:
               "geoadd", "geodist",
               "xadd", "xtrim", "xlen", "xrange",
               "xgroup_create", "xreadgroup", "xack", "xpending",
+              "xgroup_setid", "xgroup_destroy", "xgroup_delconsumer",
               "setex", "expireat",
               "pexpireat"):
         msg["key"] = args.key
@@ -5046,6 +5399,16 @@ def main(argv: list[str] | None = None) -> int:
     if op == "xack":
         msg["group"] = args.group
         msg["ids"] = args.ids
+    if op == "xgroup_setid":
+        msg["group"] = args.group
+        msg["id"] = args.id
+        if args.entries_read is not None:
+            msg["entries_read"] = args.entries_read
+    if op == "xgroup_destroy":
+        msg["group"] = args.group
+    if op == "xgroup_delconsumer":
+        msg["group"] = args.group
+        msg["consumer"] = args.consumer
     if op == "xpending":
         msg["group"] = args.group
     if op == "pfadd":
@@ -5076,7 +5439,8 @@ def main(argv: list[str] | None = None) -> int:
               "setex",
               "expireat",
               "pexpireat", "xadd", "xtrim", "xgroup_create",
-              "xreadgroup", "xack") \
+              "xreadgroup", "xack", "xgroup_setid",
+              "xgroup_destroy", "xgroup_delconsumer") \
             and args.request_id:
         # A request id without an explicit client id still dedups
         # within the default "cli" session; the same id retried from
@@ -5170,6 +5534,10 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(resp.get("entries")))
         elif op == "xack":
             print(resp.get("xack"))
+        elif op == "xgroup_destroy":
+            print(resp.get("xgroup_destroy"))
+        elif op == "xgroup_delconsumer":
+            print(resp.get("xgroup_delconsumer"))
         elif op == "xpending":
             print(json.dumps({"pending": resp.get("pending"),
                               "min_id": resp.get("min_id"),

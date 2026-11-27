@@ -827,7 +827,12 @@ logic and the failure handling, not the key-value API on top.
   stream is one blob, so a read still scans the blob to filter
   it — there is no index over entries — and consumer groups are a
   separate read: XREADGROUP (v0.67.0) hands entries to one
-  consumer of a group instead of reading the stream raw.
+  consumer of a group instead of reading the stream raw. XGROUP
+  SETID / DESTROY / DELCONSUMER (v0.69.0) manage the groups
+  themselves: SETID rewinds or fast-forwards a group's last
+  delivery (and optionally sets its entries-read count), DESTROY
+  drops a whole group, and DELCONSUMER drops one consumer and its
+  pending entries.
 - **Streams (XTRIM)** — since v0.66.0 `xtrim key MAXLEN [~|=]
   threshold [KEEPREF|DELREF|ACKED]` or `xtrim key MINID [~|=]
   threshold [KEEPREF|DELREF|ACKED]` (`Session.xtrim(k, strategy,
@@ -943,10 +948,61 @@ logic and the failure handling, not the key-value API on top.
   and `{"op": "xack", ...}` are pipeline ops too; like other reads,
   XPENDING is not one. The honest limits are the same growth as
   xadd — the whole stream is one blob, so a readgroup still scans
-  the blob — and the scope: no XGROUP SETID / DESTROY /
-  DELCONSUMER, and XPENDING answers the summary form only, not
-  the per-entry form — and XTRIM's ACKED mode behaves like KEEPREF
-  in this version.
+  the blob — and the scope: XPENDING answers the summary form only,
+  not the per-entry form — and XTRIM's ACKED mode behaves like
+  KEEPREF in this version.
+- **Streams (XGROUP SETID / DESTROY / DELCONSUMER)** — since
+  v0.69.0 `xgroup_setid key group [id] [--entries-read n]`,
+  `xgroup_destroy key group`, and `xgroup_delconsumer key group
+  consumer` (`Session.xgroup_setid(k, group, id, entries_read)`,
+  `Session.xgroup_destroy(k, group)`,
+  `Session.xgroup_delconsumer(k, group, consumer)`,
+  `client.xgroup_setid(addr, k, group, id, entries_read)`,
+  `client.xgroup_destroy(addr, k, group)`,
+  `client.xgroup_delconsumer(addr, k, group, consumer)`, and the
+  same three on the CLI) manage consumer groups — Redis XGROUP
+  SETID / DESTROY / DELCONSUMER. SETID moves a group's
+  last-delivered ID — "$" (the stream's top at apply time), "0"
+  (from the very first entry), a bare millisecond, or a full
+  "ms-seq", even one past the stream's top, so a later ">" read
+  hands out nothing until entries pass it — so a group can be
+  rewound to re-read entries or fast-forwarded past them, and the
+  pending entries are untouched: a SETID moves the read position,
+  it does not ack or drop anything. An optional ENTRIESREAD sets
+  the group's entries-read count, stored alongside the group in
+  the blob, so it survives snapshots and replay like the rest of
+  the group. A SETID to the ID the group already holds, with no
+  new entries-read, writes nothing at all, like an xtrim that
+  removed nothing, and fires no watch event. DESTROY drops the
+  whole group — pending entries and all — and answers 1 when the
+  group existed and was destroyed, 0 when the stream exists but
+  the group does not, while a missing key fails with
+  `xgroup_destroy_failed` / `no_group`; the stream itself and its
+  entries are untouched, so a group can be created again from
+  scratch. DELCONSUMER drops one consumer and every entry it held
+  pending — the entries themselves stay in the stream, only their
+  pending record goes — and answers how many pending entries the
+  consumer held, 0 when it held none or did not exist at all. All
+  three are writes, not reads: the mutation replicates through the
+  log like any other, so every node agrees on the groups, and the
+  outcome is decided at apply time, at the entry's exact position
+  in the log, like a CAS, so a retry with the same session id
+  returns the first attempt's result instead of managing twice —
+  a retry after a successful destroy answers 0, the group already
+  gone. A missing key or group fails a setid or a delconsumer
+  with `no_group`, and a plain string value fails all three with
+  `wrongtype`. A setid that moves the read position, a destroy
+  that removes a group, and a delete that drops pending entries
+  each fire a `set` watch event with the new blob value; a no-op
+  one fires nothing. `{"op": "xgroup_setid", ...}`,
+  `{"op": "xgroup_destroy", ...}`, and
+  `{"op": "xgroup_delconsumer", ...}` are pipeline ops too. The
+  honest limits are the same growth as xadd — the whole stream is
+  one blob, so a SETID still rewrites the blob whole — and the
+  scope: the entries-read count is stored but never reported back
+  (there is no XINFO to read it with), and there is still no way
+  to list the groups on a stream — that is what XINFO would be
+  for.
 - **HyperLogLog** — since v0.47.0 `pfadd key element [element ...]`
   (`Session.pfadd(k, *elements)`, `client.pfadd(addr, k, *elements)`,
   `pfadd key element ...` on the CLI) adds elements to the
@@ -1444,7 +1500,7 @@ make test
 # or: python3 -m unittest discover -s tests -v
 ```
 
-813 tests, plus a smoke test for the benchmark script, all passing:
+831 tests, plus a smoke test for the benchmark script, all passing:
 
 | Test | What it proves |
 |---|---|
@@ -3899,3 +3955,51 @@ entries left in `log.jsonl` are dropped by their index on reload.
   a new roadmap item grounded in this project's purpose,
   proposed by the next run — candidates: XGROUP SETID / DESTROY /
   DELCONSUMER, or XPENDING in per-entry form.
+- ~~Streams (XGROUP SETID / DESTROY / DELCONSUMER)~~ — done in
+  v0.69.0, Nov 27, 2026: `xgroup_setid key group [id]
+  [--entries-read n]`, `xgroup_destroy key group`, and
+  `xgroup_delconsumer key group consumer` are consumer-group
+  management — Redis XGROUP SETID / DESTROY / DELCONSUMER. SETID
+  moves a group's last-delivered ID — "$" (the stream's top), "0"
+  (from the very first entry), a bare millisecond, or a full
+  "ms-seq", even one past the stream's top — so a group can be
+  rewound to re-read entries or fast-forwarded past them, and the
+  pending entries are untouched; ENTRIESREAD sets the group's
+  entries-read count, stored alongside the group in the blob, so
+  it survives snapshots and replay like the rest of the group. A
+  SETID to the ID the group already holds, with no new
+  entries-read, writes nothing at all. DESTROY drops the whole
+  group, pending entries and all, answering 1 when the group
+  existed and 0 when it did not, while a missing key fails as
+  `no_group`; the stream itself is untouched, so a group can be
+  created again from scratch. DELCONSUMER drops one consumer and
+  every entry it held pending, answering how many it held, 0 when
+  it held none or did not exist. All three are writes, so the
+  mutation replicates through the log like any other, and the
+  outcome is decided at apply time, so a retry with the same
+  session id returns the first attempt's result instead of
+  managing twice — a retry after a successful destroy answers 0,
+  the group already gone. A missing key or group fails a setid or
+  a delconsumer as `no_group`, and a plain string value fails all
+  three as `wrongtype`. A setid that moves, a destroy that
+  removes, and a delete that drops pending entries each fire a
+  `set` watch event with the new blob value; a no-op one fires
+  nothing. `Session` methods, `client` module functions, and the
+  three commands on the CLI; all three are pipeline ops.
+  `tests/test_xgroup_manage.py` proves it: store-level a SETID
+  rewinding and fast-forwarding the read position, "$" moving to
+  the top, ENTRIESREAD stored, kept, and replaced, a no-op SETID
+  writing nothing, a destroy removing the group whole and
+  answering 0 the second time, a delconsumer dropping only its
+  own pending entries, missing keys and groups, and wrongtype;
+  the managed groups surviving a snapshot load; and cluster-level
+  the full flow replicated to every node, dedup retries managing
+  once, bad arguments as client errors with no log entry, session
+  methods, the module functions from a follower, pipelined manage
+  ops in position, snapshot + restart survival, watch events for
+  a move, a destroy, and a drop — and none for a no-op — and the
+  CLI end to end.
+  The roadmap is exhausted again, so the next real thing is
+  a new roadmap item grounded in this project's purpose,
+  proposed by the next run — candidates: XPENDING in per-entry
+  form, or XINFO for streams and groups.

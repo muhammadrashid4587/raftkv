@@ -1496,7 +1496,8 @@ class RaftNode:
                 # expireat, pexpireat, incr, incrbyfloat, setnx,
                 # getset, append, getdel, setrange, getex, setbit,
                 # bitop, pfadd, hset, hdel, geoadd, xadd, xtrim,
-                # xgroup_create, xreadgroup, and xack:
+                # xgroup_create, xreadgroup, xack, xgroup_setid,
+                # xgroup_destroy, and xgroup_delconsumer:
                 # their outcome is decided here, at this exact point
                 # in the log, so the result is recorded in the dedup
                 # table
@@ -1789,13 +1790,54 @@ class RaftNode:
                                       self.sm.get(entry["command"]["key"]),
                                       "set",
                                       index=self.last_applied)
+                elif (op == "xgroup_setid" and result is not None
+                        and result.get("status") == "ok"
+                        and result.get("changed")):
+                    # A setid that moved the group's read position
+                    # (or its entries-read count) fires like a set,
+                    # with the new (stream blob) value: a setid to
+                    # the ID the group already held changed
+                    # nothing, so it fires nothing, like an xtrim
+                    # that removed nothing — and a failed setid
+                    # wrote nothing either.
+                    self.watch.notify(entry["command"]["key"],
+                                      self.sm.get(entry["command"]["key"]),
+                                      "set",
+                                      index=self.last_applied)
+                elif (op == "xgroup_destroy" and result is not None
+                        and result.get("status") == "ok"
+                        and result.get("xgroup_destroy", 0) > 0):
+                    # A destroy that removed the group fires like
+                    # a set, with the new (stream blob) value: a
+                    # destroy of a group that was not there
+                    # changed nothing, so it fires nothing, like
+                    # a failed xadd — and a failed destroy wrote
+                    # nothing either.
+                    self.watch.notify(entry["command"]["key"],
+                                      self.sm.get(entry["command"]["key"]),
+                                      "set",
+                                      index=self.last_applied)
+                elif (op == "xgroup_delconsumer" and result is not None
+                        and result.get("status") == "ok"
+                        and result.get("xgroup_delconsumer", 0) > 0):
+                    # A delete that dropped a consumer's pending
+                    # entries fires like a set, with the new
+                    # (stream blob) value: a delete of a consumer
+                    # that held nothing changed nothing, so it
+                    # fires nothing, like a failed xadd — and a
+                    # failed delete wrote nothing either.
+                    self.watch.notify(entry["command"]["key"],
+                                      self.sm.get(entry["command"]["key"]),
+                                      "set",
+                                      index=self.last_applied)
                 if (op in ("set", "cas", "expire", "expireat",
                            "pexpireat",
                            "incr", "incrbyfloat", "setnx", "getset",
                            "append", "getdel", "setrange", "getex",
                            "setbit", "bitop", "pfadd", "hset", "hdel",
                            "geoadd", "xadd", "xtrim", "xgroup_create",
-                           "xreadgroup", "xack")
+                           "xreadgroup", "xack", "xgroup_setid",
+                           "xgroup_destroy", "xgroup_delconsumer")
                         and result is not None
                         and self.role == "leader"):
                     # Record the outcome only when a local waiter is
@@ -1809,8 +1851,8 @@ class RaftNode:
                     # index alone. Set, CAS, expire, expireat, pexpireat,
                     # incr, incrbyfloat, setnx, getset, append,
                     # getdel, setrange, getex, setbit, bitop, pfadd, hset, and
-                    # geoadd, xadd, xtrim, xgroup_create, xreadgroup, and
-                    # xack are
+                    # geoadd, xadd, xtrim, xgroup_create, xreadgroup, xack,
+                    # xgroup_setid, xgroup_destroy, and xgroup_delconsumer are
                     # the ops whose apply returns a result — a del
                     # returns None and has nothing to record.
                     key = _dedup_key(entry["command"])
@@ -1869,7 +1911,14 @@ class RaftNode:
         of removed fields, or wrongtype for an hdel; the count of
         newly added members, or wrongtype for a geoadd; the entry
         ID, or wrongtype / id_not_greater for an xadd; the count
-        of removed entries, or wrongtype for an xtrim), so a
+        of removed entries, or wrongtype for an xtrim; 1, or
+        group_exists / no_group / wrongtype for an xgroup_create;
+        the entries, or no_group / wrongtype for an xreadgroup;
+        the count of acked entries, or no_group / wrongtype for
+        an xack; 1, or no_group / wrongtype for an xgroup_setid;
+        1 or 0, or no_group / wrongtype for an xgroup_destroy;
+        the count of dropped pending entries, or no_group /
+        wrongtype for an xgroup_delconsumer), so a
         retry returns the first
         attempt's exact result. The result also carries the log
         index and term of the entry that produced it: a retried write
@@ -2682,6 +2731,8 @@ class RaftNode:
                       "geoadd", "geodist",
                       "xadd", "xtrim", "xlen", "xrange",
                       "xgroup_create", "xreadgroup", "xack",
+                      "xgroup_setid", "xgroup_destroy",
+                      "xgroup_delconsumer",
                       "setex") \
                 or key is None:
             return {"type": "client_response", "status": "error",
@@ -2696,6 +2747,8 @@ class RaftNode:
                              "geoadd/geodist/"
                              "xadd/xtrim/xlen/xrange/"
                              "xgroup_create/xreadgroup/xack/"
+                             "xgroup_setid/xgroup_destroy/"
+                             "xgroup_delconsumer/"
                              "setex "
                              "with a key"}
         if self._is_removed():
@@ -3723,6 +3776,87 @@ class RaftNode:
                                      "\"ms-seq\" stream IDs greater "
                                      "than 0-0"}
             command["ids"] = list(ids)
+        if op == "xgroup_setid":
+            # Set a consumer group's last-delivered ID, Redis
+            # XGROUP SETID: the group must be a non-empty string,
+            # and the ID "$" (the stream's top at apply time), "0"
+            # (from the very first entry), a bare millisecond, or
+            # a full "ms-seq" — "-" and "+" are range bounds, not
+            # IDs, so they are client errors here, like a bad
+            # start ID on a create. An optional ``entries_read``
+            # is a non-negative integer — Redis's ENTRIESREAD
+            # option — and rides in the command so every replica
+            # stores the same count. Whether the key or the group
+            # exists is decided at apply time, like a CAS, not
+            # here.
+            group = msg.get("group")
+            if not isinstance(group, str) or not group:
+                return {"type": "client_response", "status": "error",
+                        "error": "xgroup_setid group must be a "
+                                 "non-empty string"}
+            command["group"] = group
+            id_str = msg.get("id", "$")
+            if not isinstance(id_str, str):
+                return {"type": "client_response", "status": "error",
+                        "error": "xgroup_setid id must be a string"}
+            if id_str != "$":
+                parts = id_str.split("-")
+                if (id_str in ("-", "+")
+                        or len(parts) not in (1, 2)
+                        or not parts[0].isdigit()
+                        or int(parts[0]) > STREAM_ID_MAX
+                        or (len(parts) == 2
+                            and (not parts[1].isdigit()
+                                 or int(parts[1]) > STREAM_ID_MAX))):
+                    return {"type": "client_response",
+                            "status": "error",
+                            "error": "xgroup_setid id must be "
+                                     "\"$\", \"0\", \"ms\", or "
+                                     "\"ms-seq\""}
+            command["id"] = id_str
+            entries_read = msg.get("entries_read")
+            if entries_read is not None and (
+                    not isinstance(entries_read, int)
+                    or isinstance(entries_read, bool)
+                    or entries_read < 0):
+                return {"type": "client_response", "status": "error",
+                        "error": "xgroup_setid entries_read must be "
+                                 "a non-negative integer"}
+            if entries_read is not None:
+                command["entries_read"] = entries_read
+        if op == "xgroup_destroy":
+            # Destroy a consumer group, Redis XGROUP DESTROY: the
+            # group must be a non-empty string, so a malformed
+            # group is a client error, not a log entry. Whether
+            # the key holds a stream, and whether the group exists
+            # on it, is decided at apply time, like a CAS, not
+            # here.
+            group = msg.get("group")
+            if not isinstance(group, str) or not group:
+                return {"type": "client_response", "status": "error",
+                        "error": "xgroup_destroy group must be a "
+                                 "non-empty string"}
+            command["group"] = group
+        if op == "xgroup_delconsumer":
+            # Delete one consumer from a consumer group, Redis
+            # XGROUP DELCONSUMER: the group and the consumer must
+            # both be non-empty strings, so a malformed name is a
+            # client error, not a log entry. Whether the key or
+            # the group exists (and how many pending entries the
+            # consumer held) is decided at apply time, like a CAS,
+            # not here.
+            group = msg.get("group")
+            if not isinstance(group, str) or not group:
+                return {"type": "client_response", "status": "error",
+                        "error": "xgroup_delconsumer group must be "
+                                 "a non-empty string"}
+            command["group"] = group
+            consumer = msg.get("consumer")
+            if not isinstance(consumer, str) or not consumer:
+                return {"type": "client_response", "status": "error",
+                        "error": "xgroup_delconsumer consumer must "
+                                 "be a non-empty string"}
+            command["consumer"] = consumer
         if op == "setex":
             # Set a key with a wall-clock TTL, Redis SETEX: the
             # value is required, like a set's — a setex with no
