@@ -2574,13 +2574,15 @@ class KVStore:
             # on that stream there too, so XINFO CONSUMERS can
             # report the consumer's lag per stream; only a stream
             # that handed out nothing records nothing on it,
-            # since it writes nothing at all. This version takes
-            # new entries and pending re-reads only: there is no
-            # BLOCK — a multi-stream wait would have to watch
-            # every stream at once — and no CLAIM — the claim
-            # rides the single-stream readgroup — so a reaper
-            # that needs either still uses the single-stream
-            # readgroup or XAUTOCLAIM.
+            # since it writes nothing at all. Since v0.78.0 the
+            # call may also carry BLOCK — the leader waits, before
+            # logging the delivery, for a new entry on any of its
+            # ">" streams (see RaftNode._on_client); the wait is
+            # not part of this apply, which still decides the
+            # delivery at this exact point in the log. There is
+            # still no CLAIM — the claim rides the single-stream
+            # readgroup — so a reaper that needs one still uses
+            # the single-stream readgroup or XAUTOCLAIM.
             group = command.get("group")
             consumer = command.get("consumer")
             if not isinstance(group, str) or not group:
@@ -4081,6 +4083,83 @@ class KVStore:
         if remaining is not None:
             new = new[:remaining]
         return chosen + new
+
+    def xreadgroup_multi_peek(self, streams, group: str,
+                              consumer: str,
+                              count: int | None = None,
+                              noack: bool = False) -> list | None:
+        """The streams a multi-stream xreadgroup would hand out
+        right now — the [key, [[id, {field: value}], ...]] pairs
+        for every stream that would hand out at least one entry,
+        in the order the streams were given, sharing one count
+        budget across them, exactly as the apply path hands them
+        out. None when any stream's key does not exist, holds a
+        plain string, or has no such group: nothing to wait for,
+        since the write itself answers the error at apply time.
+        An empty list when every stream exists and has its group
+        but none has anything for this consumer. Raises
+        ValueError for a bad group, consumer, stream list, or
+        count. Pure read: no log entry, no state change — the
+        delivery step runs against freshly parsed stream blobs
+        that are never written back, so a peek can never hand
+        anything out, and a key named twice reads the first
+        pass's would-be delivery on the second, like the apply
+        path re-resolving it. The leader's blocking multi-stream
+        wait uses it to decide whether there is anything to hand
+        out yet, and the delivery itself is still decided at
+        apply time, so the peek never hands anything out."""
+        if not isinstance(group, str) or not group:
+            raise ValueError(
+                "xreadgroup_multi group must be a non-empty string")
+        if not isinstance(consumer, str) or not consumer:
+            raise ValueError(
+                "xreadgroup_multi consumer must be a non-empty "
+                "string")
+        if (not isinstance(streams, list) or not streams
+                or len(streams) > XREADGROUP_MULTI_MAX_STREAMS
+                or any(not isinstance(pair, (list, tuple))
+                       or len(pair) != 2
+                       or not isinstance(pair[0], str)
+                       or not pair[0]
+                       or not isinstance(pair[1], str)
+                       for pair in streams)):
+            raise ValueError(
+                "xreadgroup_multi streams must be a non-empty "
+                "list of at most "
+                f"{XREADGROUP_MULTI_MAX_STREAMS} [key, id] pairs "
+                "of non-empty string key and string id")
+        if count is not None and (
+                not isinstance(count, int) or isinstance(count, bool)
+                or count < 0):
+            raise ValueError(
+                "xreadgroup_multi count must be a non-negative "
+                "integer")
+        # Resolve every stream first, before peeking any of
+        # them: a failure on any stream fails the whole call,
+        # so there is nothing to wait for.
+        for key, _id_str in streams:
+            current = self._data.get(key)
+            if current is None or not is_stream(current):
+                return None
+            if group not in _stream_data(current).get("groups", {}):
+                return None
+        remaining = count
+        parsed: dict[str, dict] = {}
+        out: list = []
+        for key, id_str in streams:
+            if key not in parsed:
+                parsed[key] = _stream_data(self._data[key])
+            stream = parsed[key]
+            state = stream["groups"][group]
+            handed = _xreadgroup_deliver(
+                stream["entries"], state, consumer, id_str,
+                remaining, noack, None)
+            if remaining is not None:
+                remaining = max(0, remaining - len(handed))
+            if handed:
+                out.append([key, [[eid, dict(fields)]
+                                  for eid, fields in handed]])
+        return out
 
     def hexists(self, key: str, field: str) -> int:
         """1 when ``field`` is set in the hash at ``key``, 0

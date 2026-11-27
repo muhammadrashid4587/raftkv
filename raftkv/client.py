@@ -1241,7 +1241,8 @@ class Session:
 
     def xreadgroup_multi(self, streams: list, group: str,
                          consumer: str, count: int | None = None,
-                         noack: bool = False) -> dict:
+                         noack: bool = False,
+                         block: int | None = None) -> dict:
         """Read entries for one consumer of one group across
         several streams in a single call, Redis XREADGROUP with
         STREAMS: ``streams`` is a list of [key, id] pairs — one
@@ -1255,8 +1256,15 @@ class Session:
         streams, in the order they were given, so a stream early
         in the list can take the whole budget. With ``noack`` the
         entries are delivered without being recorded pending,
-        though each stream's last delivery still advances. The
-        reply carries ``streams`` — the [key, [[id, {field:
+        though each stream's last delivery still advances. With
+        ``block`` the call waits that many milliseconds for a new
+        entry on any of its ">" streams when no stream has
+        anything to hand out yet — 0 waits up to the server's 25s
+        cap, like a watch — and the reply then carries
+        ``timed_out`` when the wait expired with no new entry;
+        with explicit IDs only the block is ignored and the read
+        answers at once, like a single-stream explicit-ID read.
+        The reply carries ``streams`` — the [key, [[id, {field:
         value}], ...]] pairs for every stream that handed out at
         least one entry, in the order the streams were given, like
         XREAD — so a stream with nothing for this consumer is
@@ -1274,10 +1282,11 @@ class Session:
         twice. A successful read keeps every key's TTL deadline,
         like an xadd, and advances the write watermark from the
         reply's index, like any other write — and so does a failed
-        one, since it still committed its entry. There is no BLOCK
-        and no CLAIM on the multi-stream read in this version: a
-        multi-stream wait would have to watch every stream at
-        once, and the claim rides the single-stream readgroup."""
+        one, since it still committed its entry. There is no CLAIM
+        on the multi-stream read in this version: the claim rides
+        the single-stream readgroup. A blocking multi-stream read
+        goes one-shot, not over a pooled connection, so a long wait
+        never pins one — like a blocking readgroup."""
         if not isinstance(group, str) or not group:
             return {"type": "client_response", "status": "error",
                     "error": "xreadgroup_multi group must be a "
@@ -1303,6 +1312,13 @@ class Session:
             return {"type": "client_response", "status": "error",
                     "error": "xreadgroup_multi count must be a "
                              "non-negative integer"}
+        if block is not None and (
+                not isinstance(block, int) or isinstance(block, bool)
+                or block < 0):
+            return {"type": "client_response", "status": "error",
+                    "error": "xreadgroup_multi block must be a "
+                             "non-negative integer number of "
+                             "milliseconds"}
         msg: dict = {"type": "client", "op": "xreadgroup_multi",
                      "streams": [[k, i] for k, i in streams],
                      "group": group, "consumer": consumer}
@@ -1310,7 +1326,17 @@ class Session:
             msg["count"] = count
         if noack:
             msg["noack"] = True
-        return self._write(msg)
+        if block is not None:
+            msg["block"] = block
+        # A blocking multi-stream readgroup waits on the server up
+        # to block ms (0 waits up to the server's 25s cap), so the
+        # request timeout must outlast the wait — plus headroom for
+        # the commit and the reply.
+        timeout = 12.0
+        if block is not None:
+            timeout = min(block / 1000.0, 25.0) + 10.0
+        return self._write(msg, timeout=timeout,
+                           pooled=block is None)
 
     def xack(self, key: str, group: str, *ids: str) -> dict:
         """Acknowledge entries for a consumer group on the stream
@@ -4302,7 +4328,8 @@ def xreadgroup_multi(node_addr: tuple[str, int], streams: list,
                      group: str, consumer: str,
                      count: int | None = None,
                      noack: bool = False,
-                     timeout: float = 12.0) -> dict:
+                     block: int | None = None,
+                     timeout: float | None = None) -> dict:
     """Read entries for one consumer of one group across several
     streams in a single call, following leader redirects like
     ``request`` — Redis XREADGROUP with STREAMS.
@@ -4323,13 +4350,18 @@ def xreadgroup_multi(node_addr: tuple[str, int], streams: list,
     budget across all the streams, in the order they were given.
     With ``noack`` the entries are delivered without being recorded
     pending, though each stream's last delivery still advances.
-    A bad group, consumer, stream list, or count never goes on the
+    With ``block`` the call waits that many milliseconds for a new
+    entry on any of its ">" streams when no stream has anything to
+    hand out yet — 0 waits up to the server's 25s cap, like a watch
+    — and the reply then carries ``timed_out``; with explicit IDs
+    only the block is ignored and the read answers at once. A bad
+    group, consumer, stream list, count, or block never goes on the
     wire and returns the server's error shape instead. This is a
     write, not a read: the whole call is one log entry, so the
     deliveries across streams are atomic, and a retry with the same
     session id returns the first attempt's streams instead of
-    delivering them twice. There is no BLOCK and no CLAIM on the
-    multi-stream read in this version."""
+    delivering them twice. There is no CLAIM on the multi-stream
+    read in this version."""
     if not isinstance(group, str) or not group:
         return {"type": "client_response", "status": "error",
                 "error": "xreadgroup_multi group must be a "
@@ -4355,6 +4387,13 @@ def xreadgroup_multi(node_addr: tuple[str, int], streams: list,
         return {"type": "client_response", "status": "error",
                 "error": "xreadgroup_multi count must be a "
                          "non-negative integer"}
+    if block is not None and (
+            not isinstance(block, int) or isinstance(block, bool)
+            or block < 0):
+        return {"type": "client_response", "status": "error",
+                "error": "xreadgroup_multi block must be a "
+                         "non-negative integer number of "
+                         "milliseconds"}
     msg: dict = {"type": "client", "op": "xreadgroup_multi",
                  "streams": [[k, i] for k, i in streams],
                  "group": group, "consumer": consumer}
@@ -4362,6 +4401,12 @@ def xreadgroup_multi(node_addr: tuple[str, int], streams: list,
         msg["count"] = count
     if noack:
         msg["noack"] = True
+    if block is not None:
+        msg["block"] = block
+    if timeout is None:
+        timeout = 12.0
+        if block is not None:
+            timeout = min(block / 1000.0, 25.0) + 10.0
     return request(node_addr, msg, timeout=timeout)
 
 
@@ -5878,6 +5923,13 @@ def main(argv: list[str] | None = None) -> int:
     p_xreadgroup_multi.add_argument("--noack", action="store_true",
                                     help="deliver without recording "
                                          "the entries pending")
+    p_xreadgroup_multi.add_argument("--block", type=int, default=None,
+                                    help="wait up to this many "
+                                         "milliseconds for a new entry "
+                                         "on any \">\" stream when no "
+                                         "stream has anything to hand "
+                                         "out yet (0 waits up to the "
+                                         "server's 25s cap)")
     p_xreadgroup_multi.add_argument("--client-id", default=None,
                                     help="session id for at-most-once "
                                          "writes: a retry with the same "
@@ -6470,6 +6522,8 @@ def main(argv: list[str] | None = None) -> int:
             msg["count"] = args.count
         if args.noack:
             msg["noack"] = True
+        if args.block is not None:
+            msg["block"] = args.block
     if op == "xack":
         msg["group"] = args.group
         msg["ids"] = args.ids
@@ -6584,9 +6638,11 @@ def main(argv: list[str] | None = None) -> int:
     # outlast the wait — plus headroom for the leadership
     # confirmation and the reply — or the CLI would cut its own
     # read off. A blocking xreadgroup waits the same way, plus
-    # the commit wait for its delivery entry.
+    # the commit wait for its delivery entry, and a blocking
+    # multi-stream readgroup waits the same way too.
     timeout = args.timeout
-    if op in ("xread", "xreadgroup") and args.block is not None:
+    if op in ("xread", "xreadgroup", "xreadgroup_multi") \
+            and args.block is not None:
         timeout = max(timeout, min(args.block / 1000.0, 25.0) + 10.0)
     resp = request((host, int(port)), msg, timeout=timeout)
     status = resp.get("status")

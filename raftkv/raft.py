@@ -3466,9 +3466,12 @@ class RaftNode:
         # A blocking xreadgroup's wait, when one is given: the
         # milliseconds to wait and the ID it waits on. Only a ">"
         # read can block (see the xreadgroup branch below); both
-        # stay unset for every other op.
+        # stay unset for every other op. A blocking multi-stream
+        # readgroup waits the same way, on every ">" stream at
+        # once (see the xreadgroup_multi branch below).
         xreadgroup_block_ms: int | None = None
         xreadgroup_id = ">"
+        xreadgroup_multi_block_ms: int | None = None
         if op in ("set", "setnx", "getset", "append", "setrange",
                   "setex"):
             command["value"] = msg.get("value")
@@ -3975,8 +3978,17 @@ class RaftNode:
             # streams, and ``noack`` is a bare flag: deliver
             # without recording the entries pending. Whether the
             # keys or the group exist is decided at apply time,
-            # like a CAS, not here. There is no BLOCK and no CLAIM
-            # on the multi-stream read in this version.
+            # like a CAS, not here. ``block`` waits that many
+            # milliseconds for a new entry on any of the call's
+            # ">" streams when no stream has anything to hand out
+            # yet — 0 waits up to the server's WATCH_MAX_TIMEOUT
+            # cap, like a watch — and is only honoured when at
+            # least one stream reads ">": a call with explicit
+            # IDs only re-reads pending entries that already
+            # exist, so there is nothing new to wait for and it
+            # answers at once, like a single-stream explicit-ID
+            # read. There is no CLAIM on the multi-stream read in
+            # this version.
             group = msg.get("group")
             if not isinstance(group, str) or not group:
                 return {"type": "client_response", "status": "error",
@@ -4036,6 +4048,25 @@ class RaftNode:
                             "error": "xreadgroup_multi NOACK takes "
                                      "no argument"}
                 command["noack"] = True
+            block = msg.get("block")
+            if block is not None and (
+                    not isinstance(block, int)
+                    or isinstance(block, bool) or block < 0):
+                return {"type": "client_response", "status": "error",
+                        "error": "xreadgroup_multi block must be a "
+                                 "non-negative integer number of "
+                                 "milliseconds"}
+            if block is not None:
+                # BLOCK rides in the message, not in the log entry:
+                # it is a wait instruction for this leader, not
+                # part of the deterministic apply — every replica
+                # applies the same delivery without ever knowing
+                # how long the leader waited for it. It is only
+                # honoured when at least one stream reads ">"
+                # (see the wait below); with explicit IDs only it
+                # is validated here and then ignored, so the read
+                # still answers at once.
+                xreadgroup_multi_block_ms = block
         if op == "xack":
             # Acknowledge entries for a consumer group, Redis
             # XACK: the group must be a non-empty string, and the
@@ -4699,6 +4730,35 @@ class RaftNode:
                     command.get("claim_min_idle_ms"))
                 if timed_out is None:
                     return self._redirect()
+        if (op == "xreadgroup_multi"
+                and xreadgroup_multi_block_ms is not None
+                and any(id_str == ">"
+                        for _key, id_str in command["streams"])):
+            # A blocking multi-stream readgroup with nothing to
+            # hand out yet waits for a new entry on any of its
+            # ">" streams before the delivery is logged: the wait
+            # happens here, on the leader, before the entry is
+            # appended — the delivery itself is still decided at
+            # apply time, at the entry's exact position in the
+            # log, like any other xreadgroup_multi, so every node
+            # still agrees on who holds what. A retry whose first
+            # attempt already applied (or is still in flight)
+            # skips the wait: the submit below returns the first
+            # attempt's result instead of waiting out a block for
+            # an answer that is already known.
+            dedup_key = _dedup_key(command)
+            with self.lock:
+                already = (dedup_key is not None
+                           and (dedup_key in self._dedup
+                                or dedup_key in self._dedup_inflight))
+            if not already:
+                timed_out = self._wait_for_xreadgroup_multi_block(
+                    command["streams"], group, consumer,
+                    command.get("count"),
+                    xreadgroup_multi_block_ms,
+                    command.get("noack", False))
+                if timed_out is None:
+                    return self._redirect()
         result = self._submit_write(command)
         if timed_out is not None and result.get("status") == "ok":
             # A copy, not a mutation: the result may be the cached
@@ -4792,6 +4852,98 @@ class RaftNode:
             return timed_out
         finally:
             self.watch.cancel(watch_id)
+
+    def _wait_for_xreadgroup_multi_block(
+            self, streams: list, group: str, consumer: str,
+            count: int | None, block_ms: int,
+            noack: bool = False) -> bool | None:
+        """Wait for a multi-stream ``">"`` xreadgroup to have
+        something to hand out — the entries appended after the
+        group's last delivery on any of its streams, or the
+        consumer's own pending entries an explicit-ID stream
+        would re-read — so a blocked multi-stream read answers
+        at once when any stream already has something, and waits
+        for a new entry on any ">" stream when none does. Only
+        the ">" streams are watched: a new entry on an
+        explicit-ID stream cannot make its re-read deliverable —
+        a re-read only returns pending entries, which a new entry
+        never creates — so a change there is not something to
+        wake for. (A pending entry claimed over to this consumer
+        mid-BLOCK on an explicit-ID stream does not wake the wait
+        either; the next call sees it.)
+
+        Returns True when the wait expired with no change to any
+        ">" stream (the caller still submits the write, which
+        answers empty), False when a change arrived, when entries
+        were already there, or when a key or group does not exist
+        on some stream at all — no entry can ever make a missing
+        group deliverable, so the caller submits at once and the
+        write itself answers the error at apply time — and None
+        when this node stopped being the leader mid-wait (the
+        caller redirects instead of submitting). The wait holds
+        no lock: it long-polls the watched stream keys, the same
+        watch/condition pattern a watch RPC and a blocking
+        single-stream readgroup use, so it cannot stall the apply
+        path — and every watch is cancelled before returning
+        either way, so a timed-out wait leaves nothing registered
+        behind. BLOCK 0 (wait forever) is capped at
+        WATCH_MAX_TIMEOUT, like a watch: the transport socket
+        times out at 30s, so no reply could be sent after that
+        anyway.
+        """
+        wait_s = (WATCH_MAX_TIMEOUT if block_ms == 0
+                  else min(block_ms / 1000.0, WATCH_MAX_TIMEOUT))
+        gt_keys = [key for key, id_str in streams
+                   if id_str == ">"]
+        with self.lock:
+            term = self.current_term
+            if self.role != "leader":
+                return None
+            peeked = self.sm.xreadgroup_multi_peek(
+                streams, group, consumer, count, noack)
+            if peeked is None or peeked:
+                # No such key or group on some stream (or a plain
+                # string): no entry can ever make this group
+                # deliverable — the write itself answers the
+                # error at apply time — and entries already there
+                # need no wait at all.
+                return False
+        cond = threading.Condition()
+        arrived: list[dict] = []
+
+        def _wake(event: dict) -> None:
+            with cond:
+                arrived.append(event)
+                cond.notify_all()
+
+        watch_ids = [self.watch.watch(key, _wake) for key in gt_keys]
+        try:
+            # Re-check under the lock before waiting: an entry may
+            # have committed between the peek above and the watch
+            # registration, and the watches only fire on changes
+            # after they were registered.
+            with self.lock:
+                if self.role != "leader" or self.current_term != term:
+                    return None
+                peeked = self.sm.xreadgroup_multi_peek(
+                    streams, group, consumer, count, noack)
+                if peeked is None or peeked:
+                    return False
+            deadline = time.monotonic() + wait_s
+            with cond:
+                while not arrived:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    cond.wait(remaining)
+            timed_out = not arrived
+            with self.lock:
+                if self.role != "leader" or self.current_term != term:
+                    return None
+            return timed_out
+        finally:
+            for watch_id in watch_ids:
+                self.watch.cancel(watch_id)
 
     def _on_watch(self, msg: dict) -> dict:
         """Serve a watch RPC by long-polling the local WatchManager.

@@ -1016,11 +1016,42 @@ logic and the failure handling, not the key-value API on top.
   streams instead of delivering them twice), the response's log
   index advancing a session's watermark. At most 1000 streams per
   call, like an xack batch, so one entry never carries an unbounded
-  list. The honest limits are the scope: there is no BLOCK — a
-  multi-stream wait would have to watch every stream at once — and
-  no CLAIM — the claim rides the single-stream readgroup — and no
-  pipeline op, so a multi-stream read goes as its own request, like
-  a blocking readgroup.
+  list. The honest limits are the scope: there is no CLAIM — the
+  claim rides the single-stream readgroup — and no pipeline op, so
+  a multi-stream read goes as its own request, like a blocking
+  readgroup. BLOCK landed in v0.78.0.
+- **Streams (BLOCK for multi-stream XREADGROUP)** — since v0.78.0
+  `xreadgroup_multi [[key, id], ...] group consumer [--count n]
+  [--noack] [--block ms]` (`Session.xreadgroup_multi(streams,
+  group, consumer, count, noack, block)`,
+  `client.xreadgroup_multi(addr, streams, group, consumer, count,
+  noack, block)`, `xreadgroup-multi group consumer k1 id1 k2 id2
+  ... [--block ms]` on the CLI) waits on a multi-stream read: when
+  no stream has anything to hand out yet, the call blocks until a
+  new entry lands on any of its ">" streams, or the block expires
+  — Redis XREADGROUP BLOCK with STREAMS. The leader watches every
+  ">" stream key at once, so an entry on the second stream wakes a
+  wait that started on the first, and the reply carries
+  `timed_out` when the wait expired with nothing delivered; BLOCK
+  0 waits up to the server's 25s cap, like a watch. A call with
+  entries already waiting on any stream — new entries on a ">"
+  stream, or the consumer's own pending entries on an explicit-ID
+  stream — answers at once, and so does a call whose key or group
+  is missing on some stream: the failure comes back immediately
+  instead of after the block expires. With explicit IDs only the
+  block is ignored, like a single-stream explicit-ID read. The
+  wait happens on the leader before the delivery is logged, so the
+  delivery itself is still decided at apply time, at the entry's
+  exact position in the log, like any other multi-stream read —
+  and a retry whose first attempt already applied skips the wait
+  and returns the first attempt's streams. The honest limit is
+  the watch itself: only the ">" streams are watched, so a pending
+  entry claimed over to this consumer mid-BLOCK on an explicit-ID
+  stream does not wake the wait — the next call sees it — and a
+  change on a ">" stream that hands out nothing (an ack, a trim)
+  wakes the wait all the same, which then answers empty with
+  `timed_out` false, like a single-stream wake on a
+  non-delivery change.
 - **Streams (XAUTOCLAIM)** — since v0.73.0
   `xautoclaim key group consumer min-idle-ms [start] [--count n]
   [--justid]` is XAUTOCLAIM — claiming pending entries in bulk
@@ -4549,9 +4580,50 @@ entries left in `log.jsonl` are dropped by their index on reload.
   scope: no BLOCK — a multi-stream wait would have to watch every
   stream at once — and no CLAIM, and no pipeline op, so a
   multi-stream read goes as its own request, like a blocking
-  readgroup. The roadmap is exhausted again, so the next real
-  thing is a new roadmap item grounded in this project's purpose,
-  proposed by the next run — candidate: BLOCK for the
-  multi-stream XREADGROUP, waiting on any of its streams for a
-  new entry, which is the remaining gap between this read and
-  Redis's.
+  readgroup.
+- ~~Streams (BLOCK for multi-stream XREADGROUP)~~ — done in
+  v0.78.0, Nov 27, 2026: a multi-stream read may carry BLOCK —
+  `xreadgroup_multi [[key, id], ...] group consumer [--block ms]`
+  — which waits on the leader for a new entry on any of its ">"
+  streams when no stream has anything to hand out yet, watching
+  every ">" stream key at once, so an entry on the second stream
+  wakes a wait that started on the first; the reply carries
+  `timed_out` when the wait expired with nothing delivered, and
+  BLOCK 0 waits up to the server's 25s cap, like a watch. A call
+  with entries already waiting on any stream answers at once, as
+  does a call whose key or group is missing on some stream, and
+  with explicit IDs only the block is ignored, like a
+  single-stream explicit-ID read. The wait happens on the leader
+  before the delivery is logged, so the delivery is still decided
+  at apply time, and a retry whose first attempt already applied
+  skips the wait and returns the first attempt's streams. The
+  peek behind the wait — `KVStore.xreadgroup_multi_peek` — runs
+  the shared delivery step against freshly parsed stream blobs
+  that are never written back, so it can never hand anything out,
+  and a key named twice reads the first pass's would-be delivery
+  on the second, like the apply path. `Session`, `client`, and
+  the CLI (`xreadgroup-multi ... [--block ms]`) expose it.
+  `tests/test_xreadgroup_multi_block.py` proves it: store-level
+  the peek across two streams with the shared COUNT budget,
+  explicit-ID re-reads peeking the consumer's own pending
+  entries, a stream with nothing new absent, a missing key, a
+  missing group, and a wrongtype each peeking None, bad arguments
+  raising, and a key named twice reading the first pass's
+  would-be delivery on the second; and cluster-level the block
+  waiting for a new entry on the second stream, timing out with
+  empty streams and `timed_out` true, BLOCK 0 waiting until an
+  entry arrives, the block ignored for explicit IDs only, a
+  missing group failing at once, a dedup retry delivering once
+  without waiting, bad block arguments as client errors with no
+  log entry, the module function from a follower, and the CLI end
+  to end. The honest limit is the watch itself: only the ">"
+  streams are watched, so a pending entry claimed over to this
+  consumer mid-BLOCK on an explicit-ID stream does not wake the
+  wait, and a change on a ">" stream that hands out nothing wakes
+  it all the same, answering empty with `timed_out` false, like a
+  single-stream wake on a non-delivery change. The roadmap is
+  exhausted again, so the next real thing is a new roadmap item
+  grounded in this project's purpose, proposed by the next run —
+  candidate: CLAIM for the multi-stream XREADGROUP, claiming idle
+  pending entries inline during a multi-stream read, which is the
+  remaining gap between this read and Redis 8.4's.
