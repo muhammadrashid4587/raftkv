@@ -3207,6 +3207,12 @@ class RaftNode:
                                     session_term=session_term,
                                     stale_ok=bool(msg.get("stale_ok")))
         command = {"op": op, "key": key}
+        # A blocking xreadgroup's wait, when one is given: the
+        # milliseconds to wait and the ID it waits on. Only a ">"
+        # read can block (see the xreadgroup branch below); both
+        # stay unset for every other op.
+        xreadgroup_block_ms: int | None = None
+        xreadgroup_id = ">"
         if op in ("set", "setnx", "getset", "append", "setrange",
                   "setex"):
             command["value"] = msg.get("value")
@@ -3605,9 +3611,15 @@ class RaftNode:
             # nothing to re-read. The count, when one is given, is
             # a non-negative integer (a bool is not one), and
             # ``noack`` is a bare flag: deliver without recording
-            # the entries pending. Whether the key or the group
-            # exists is decided at apply time, like a CAS, not
-            # here.
+            # the entries pending. ``block`` waits that many
+            # milliseconds for a new entry when the group has
+            # nothing to hand out yet — 0 waits up to the server's
+            # WATCH_MAX_TIMEOUT cap, like a watch — and is only
+            # honoured for a ">" read: an explicit-ID read re-reads
+            # pending entries that already exist, so there is
+            # nothing new to wait for and it answers at once, like
+            # Redis. Whether the key or the group exists is decided
+            # at apply time, like a CAS, not here.
             group = msg.get("group")
             if not isinstance(group, str) or not group:
                 return {"type": "client_response", "status": "error",
@@ -3654,6 +3666,25 @@ class RaftNode:
                             "error": "xreadgroup NOACK takes no "
                                      "argument"}
                 command["noack"] = True
+            block = msg.get("block")
+            if block is not None and (
+                    not isinstance(block, int)
+                    or isinstance(block, bool) or block < 0):
+                return {"type": "client_response", "status": "error",
+                        "error": "xreadgroup block must be a "
+                                 "non-negative integer number of "
+                                 "milliseconds"}
+            if block is not None:
+                # BLOCK rides in the message, not in the log entry:
+                # it is a wait instruction for this leader, not
+                # part of the deterministic apply — every replica
+                # applies the same delivery without ever knowing
+                # how long the leader waited for it. It is only
+                # honoured for a ">" read (see the wait below);
+                # with any other ID it is validated here and then
+                # ignored, so the read still answers at once.
+                xreadgroup_block_ms = block
+                xreadgroup_id = id_str
         if op == "xack":
             # Acknowledge entries for a consumer group, Redis
             # XACK: the group must be a non-empty string, and the
@@ -4035,7 +4066,108 @@ class RaftNode:
         for field in ("client_id", "request_id"):
             if msg.get(field):
                 command[field] = msg[field]
-        return self._submit_write(command)
+        timed_out: bool | None = None
+        if (op == "xreadgroup" and xreadgroup_block_ms is not None
+                and xreadgroup_id == ">"):
+            # A blocking ">" readgroup with nothing to hand out yet
+            # waits for a new entry before the delivery is logged:
+            # the wait happens here, on the leader, before the entry
+            # is appended — the delivery itself is still decided at
+            # apply time, at the entry's exact position in the log,
+            # like any other xreadgroup, so every node still agrees
+            # on who holds what. A retry whose first attempt already
+            # applied (or is still in flight) skips the wait: the
+            # submit below returns the first attempt's result
+            # instead of waiting out a block for an answer that is
+            # already known.
+            dedup_key = _dedup_key(command)
+            with self.lock:
+                already = (dedup_key is not None
+                           and (dedup_key in self._dedup
+                                or dedup_key in self._dedup_inflight))
+            if not already:
+                timed_out = self._wait_for_xreadgroup_block(
+                    key, group, count, xreadgroup_block_ms)
+                if timed_out is None:
+                    return self._redirect()
+        result = self._submit_write(command)
+        if timed_out is not None and result.get("status") == "ok":
+            # A copy, not a mutation: the result may be the cached
+            # first attempt's dict, shared with the dedup table.
+            result = {**result, "timed_out": timed_out}
+        return result
+
+    def _wait_for_xreadgroup_block(self, key: str, group: str,
+                                   count: int | None,
+                                   block_ms: int) -> bool | None:
+        """Wait for a ``">"`` xreadgroup to have something to hand
+        out — the entries appended after the group's last delivery.
+
+        Returns True when the wait expired with no change to the
+        stream (the caller still submits the write, which answers
+        empty), False when a change arrived, when entries were
+        already there, or when the key or group does not exist at
+        all — no entry can ever make a missing group deliverable,
+        so the caller submits at once and the write itself answers
+        the error at apply time — and None when this node stopped
+        being the leader mid-wait (the caller redirects instead of
+        submitting). The wait holds no lock: it long-polls the
+        watched stream key, the same watch/condition pattern a
+        watch RPC and a blocking XREAD use, so it cannot stall the
+        apply path — and the watch is cancelled before returning
+        either way, so a timed-out wait leaves nothing registered
+        behind. BLOCK 0 (wait forever) is capped at
+        WATCH_MAX_TIMEOUT, like a watch: the transport socket
+        times out at 30s, so no reply could be sent after that
+        anyway.
+        """
+        wait_s = (WATCH_MAX_TIMEOUT if block_ms == 0
+                  else min(block_ms / 1000.0, WATCH_MAX_TIMEOUT))
+        with self.lock:
+            term = self.current_term
+            if self.role != "leader":
+                return None
+            peeked = self.sm.xreadgroup_peek(key, group, count)
+            if peeked is None or peeked:
+                # No such key or group (or a plain string): no entry
+                # can ever make this group deliverable — the write
+                # itself answers the error at apply time — and
+                # entries already there need no wait at all.
+                return False
+        cond = threading.Condition()
+        arrived: list[dict] = []
+
+        def _wake(event: dict) -> None:
+            with cond:
+                arrived.append(event)
+                cond.notify_all()
+
+        watch_id = self.watch.watch(key, _wake)
+        try:
+            # Re-check under the lock before waiting: an entry may
+            # have committed between the peek above and the watch
+            # registration, and the watch only fires on changes
+            # after it.
+            with self.lock:
+                if self.role != "leader" or self.current_term != term:
+                    return None
+                peeked = self.sm.xreadgroup_peek(key, group, count)
+                if peeked is None or peeked:
+                    return False
+            deadline = time.monotonic() + wait_s
+            with cond:
+                while not arrived:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    cond.wait(remaining)
+            timed_out = not arrived
+            with self.lock:
+                if self.role != "leader" or self.current_term != term:
+                    return None
+            return timed_out
+        finally:
+            self.watch.cancel(watch_id)
 
     def _on_watch(self, msg: dict) -> dict:
         """Serve a watch RPC by long-polling the local WatchManager.

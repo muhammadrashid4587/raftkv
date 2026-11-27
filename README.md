@@ -867,12 +867,13 @@ logic and the failure handling, not the key-value API on top.
   rewrites the blob whole — there is no index over entries.
 - **Streams (XREADGROUP)** — since v0.67.0 `xgroup_create key group
   [start] [--mkstream]`, `xreadgroup key group consumer [id]
-  [--count n] [--noack]`, `xack key group id ...`, and `xpending key
+  [--count n] [--noack] [--block ms]`, `xack key group id ...`, and `xpending key
   group` (`Session.xgroup_create(k, group, start_id, mkstream)`,
-  `Session.xreadgroup(k, group, consumer, id, count, noack)`,
+  `Session.xreadgroup(k, group, consumer, id, count, noack, block)`,
   `Session.xack(k, group, *ids)`, `Session.xpending(k, group)`,
   `client.xgroup_create(addr, k, group, start_id, mkstream)`,
-  `client.xreadgroup(addr, k, group, consumer, id, count, noack)`,
+  `client.xreadgroup(addr, k, group, consumer, id, count, noack,
+  block)`,
   `client.xack(addr, k, group, ids)`,
   `client.xpending(addr, k, group)`, and the same four on the CLI)
   are consumer groups — Redis XGROUP CREATE / XREADGROUP / XACK /
@@ -890,7 +891,28 @@ logic and the failure handling, not the key-value API on top.
   and each re-read raises that entry's delivery count by one, so a
   consumer can tell a first delivery from a retry. NOACK delivers
   without recording the entries pending, though the last delivery
-  still advances. XACK acknowledges pending entries — for any
+  still advances. Since v0.68.0 a ">" readgroup may carry BLOCK:
+  when the group has nothing to hand out yet it waits up to that
+  many milliseconds for a new entry — the leader long-polls the
+  watched stream key, the same watch/condition pattern a watch RPC
+  and a blocking XREAD use, so the wait holds no lock — and the
+  reply carries `timed_out` when the wait expired with no new entry;
+  BLOCK 0 (wait forever) is capped at 25s, like a watch, since the
+  transport socket times out at 30s. The wait happens on the leader
+  before the delivery is logged, so the delivery itself is still
+  decided at apply time, at the entry's exact position in the log,
+  like any other readgroup — a blocked delivery still replicates
+  through the log and still marks its entries pending on every
+  node. BLOCK is only honoured for a ">" read: an explicit-ID read
+  re-reads pending entries that already exist, so there is nothing
+  new to wait for and it answers at once, like Redis — and a
+  missing key or group fails at once too, instead of waiting out
+  the block for a group that no entry could make deliverable. A
+  retry with the same session id skips the wait and returns the
+  first attempt's entries instead of delivering twice, and BLOCK
+  is not a pipeline op — a blocking readgroup goes as its own
+  request, since a block would stall the whole pipeline batch.
+  XACK acknowledges pending entries — for any
   consumer, since an ack names the entry, not its holder — and
   answers how many actually left the pending list. XPENDING
   answers the summary: the pending count, the smallest and largest
@@ -921,8 +943,7 @@ logic and the failure handling, not the key-value API on top.
   and `{"op": "xack", ...}` are pipeline ops too; like other reads,
   XPENDING is not one. The honest limits are the same growth as
   xadd — the whole stream is one blob, so a readgroup still scans
-  the blob — and the scope: no BLOCK yet (a readgroup with nothing
-  to hand out answers empty at once), no XGROUP SETID / DESTROY /
+  the blob — and the scope: no XGROUP SETID / DESTROY /
   DELCONSUMER, and XPENDING answers the summary form only, not
   the per-entry form — and XTRIM's ACKED mode behaves like KEEPREF
   in this version.
@@ -1423,7 +1444,7 @@ make test
 # or: python3 -m unittest discover -s tests -v
 ```
 
-727 tests, plus a smoke test for the benchmark script, all passing:
+813 tests, plus a smoke test for the benchmark script, all passing:
 
 | Test | What it proves |
 |---|---|
@@ -3830,8 +3851,51 @@ entries left in `log.jsonl` are dropped by their index on reload.
   read-your-writes, the module functions from a follower, pipelined
   group ops in position, snapshot + restart survival, and the CLI
   end to end.
+- ~~Streams (XREADGROUP BLOCK)~~ — done in v0.68.0,
+  Nov 27, 2026: `xreadgroup key group consumer ">" [--count n]
+  [--noack] [--block ms]` waits up to `block` milliseconds for a
+  new entry when the group has nothing to hand out yet — Redis
+  XREADGROUP BLOCK. The wait happens on the leader, before the
+  delivery is logged: the leader peeks at the applied state (a
+  read-only `xreadgroup_peek` on the store, which answers the
+  entries a ">" read would hand out, or None when the key or group
+  does not exist) and, when there is nothing to hand out, long-polls
+  the watched stream key — the same watch/condition pattern a watch
+  RPC and a blocking XREAD use, so the wait holds no lock — until an
+  entry lands or the block expires, then submits the readgroup as
+  usual. The delivery itself is still decided at apply time, at the
+  entry's exact position in the log, so a blocked delivery still
+  replicates through the log and still marks its entries pending on
+  every node, and a retry with the same session id returns the first
+  attempt's entries instead of delivering twice — and the retry
+  skips the wait, since the answer is already known. The reply
+  carries `timed_out` when the wait expired with no new entry;
+  BLOCK 0 (wait forever) is capped at 25s, like a watch, since the
+  transport socket times out at 30s. BLOCK is only honoured for a
+  ">" read — an explicit-ID read re-reads pending entries that
+  already exist, so there is nothing new to wait for and it answers
+  at once, like Redis — and a missing key or group fails at once
+  too, instead of waiting out the block for a group that no entry
+  could make deliverable. A bad block is a client error and appends
+  no log entry, and BLOCK is not a pipeline op — a blocking
+  readgroup goes as its own request, since a block would stall the
+  whole pipeline batch. `Session.xreadgroup`, `client.xreadgroup`,
+  and `xreadgroup` on the CLI all carry it; a blocking session
+  readgroup goes one-shot, not over a pooled connection, so a long
+  wait never pins one, like a blocking xread.
+  `tests/test_xreadgroup.py` proves it: store-level the peek
+  answering the entries a ">" read would hand out — capped by
+  count — without handing anything out, None for a missing key, a
+  plain string, or a missing group, and a bad count raising; and
+  cluster-level a BLOCK that returns as soon as an entry lands
+  (and marks it pending on every node), a BLOCK that times out
+  empty with `timed_out`, a BLOCK 0 that waits until an entry
+  arrives, a BLOCK on an explicit-ID re-read answering at once
+  with no `timed_out`, a BLOCK on a missing group failing at once
+  with `no_group`, a blocked retry returning the first attempt's
+  entries without waiting, bad blocks as client errors with no log
+  entry, BLOCK rejected as a pipeline op, and the CLI end to end.
   The roadmap is exhausted again, so the next real thing is
   a new roadmap item grounded in this project's purpose,
-  proposed by the next run — candidates: XREADGROUP BLOCK (blocking
-  consumer-group reads), XGROUP SETID / DESTROY / DELCONSUMER, or
-  XPENDING in per-entry form.
+  proposed by the next run — candidates: XGROUP SETID / DESTROY /
+  DELCONSUMER, or XPENDING in per-entry form.

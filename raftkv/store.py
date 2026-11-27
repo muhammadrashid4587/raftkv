@@ -2780,6 +2780,42 @@ class KVStore:
                 "max_id": ids[-1] if ids else None,
                 "consumers": [[c, counts[c]] for c in sorted(counts)]}
 
+    def xreadgroup_peek(self, key: str, group: str,
+                        count: int | None = None) -> list | None:
+        """The entries a ``">"`` xreadgroup would hand out right
+        now — the entries appended after the group's last delivery,
+        in ID order, at most ``count`` of them when a count is
+        given — as [id, {field: value}] pairs. None when the key
+        does not exist, holds a plain string, or has no such group:
+        nothing to wait for, since the write itself answers the
+        error at apply time. Raises ValueError for a bad count.
+        Pure read: no log entry, no state change — the leader's
+        blocking wait uses it to decide whether there is anything
+        to hand out yet, and the delivery itself is still decided
+        at apply time, so the peek never hands anything out."""
+        if count is not None and (
+                not isinstance(count, int) or isinstance(count, bool)
+                or count < 0):
+            raise ValueError(
+                "xreadgroup count must be a non-negative integer")
+        value = self._data.get(key)
+        if value is None or not is_stream(value):
+            return None
+        stream = _stream_data(value)
+        groups = stream.get("groups", {})
+        if group not in groups:
+            return None
+        state = groups[group]
+        last = state["last_delivered"]
+        after = ((0, 0) if last is None
+                 else _parse_stored_stream_id(last))
+        chosen = [[eid, dict(fields)]
+                  for eid, fields in stream["entries"]
+                  if parse_stream_id(eid) > after]
+        if count is not None:
+            chosen = chosen[:count]
+        return chosen
+
     def hexists(self, key: str, field: str) -> int:
         """1 when ``field`` is set in the hash at ``key``, 0
         otherwise — 0 when the key does not exist or the field

@@ -115,11 +115,20 @@ class Session:
                 "last_read_index": self.last_read_index,
                 "last_read_term": self.last_read_term}
 
-    def _write(self, msg: dict) -> dict:
+    def _write(self, msg: dict, timeout: float = 12.0,
+               pooled: bool = True) -> dict:
+        """Send one write, following leader redirects, and advance
+        the write watermark from any reply that names a committed
+        entry. ``timeout`` must outlast any server-side wait the
+        write carries — a blocking xreadgroup passes the block
+        plus headroom — and ``pooled`` False sends it one-shot
+        instead of over a pooled connection, so a long wait never
+        pins one, like a blocking xread."""
         self._next_request += 1
         msg["client_id"] = self.client_id
         msg["request_id"] = str(self._next_request)
-        resp = request(self.node_addr, msg, pool=self._pooled)
+        resp = request(self.node_addr, msg, timeout=timeout,
+                       pool=self._pooled if pooled else None)
         # Any response that names a committed entry advances the
         # watermark — a failed CAS still committed its entry, so its
         # index is a valid watermark too. Timeouts and errors carry no
@@ -1121,7 +1130,8 @@ class Session:
 
     def xreadgroup(self, key: str, group: str, consumer: str,
                    id: str = ">", count: int | None = None,
-                   noack: bool = False) -> dict:
+                   noack: bool = False,
+                   block: int | None = None) -> dict:
         """Read entries for one consumer of one group on the
         stream at ``key``, Redis XREADGROUP: with ``id`` ">" (the
         default) the group hands the consumer the entries appended
@@ -1135,24 +1145,31 @@ class Session:
         ID — and each re-read raises that entry's delivery count
         by one. With ``noack`` the entries are delivered without
         being recorded pending, though the last delivery still
-        advances. The reply carries ``entries`` — the [id, {field:
-        value}] pairs in ID order, an empty list when the group
-        has nothing for this consumer. A missing key or group
-        fails with ``xreadgroup_failed`` and reason ``no_group``,
-        and a plain string value fails with reason ``wrongtype``.
-        A bad group, consumer, ID, or count never goes on the wire
-        and returns the server's error shape instead. This is a
-        write, not a read: handing entries out mutates the pending
-        list and the last delivery, and the mutation replicates
-        through the log like any other, so a retry with the same
-        session id returns the first attempt's entries instead of
+        advances. ``block`` waits that many milliseconds for a new
+        entry when a ">" read has nothing to hand out yet — 0
+        waits up to the server's 25s cap, like a watch — and the
+        reply then carries ``timed_out`` when the wait expired
+        with no new entry; with any other ID the block is ignored
+        and the read answers at once, like Redis. The reply
+        carries ``entries`` — the [id, {field: value}] pairs in ID
+        order, an empty list when the group has nothing for this
+        consumer. A missing key or group fails with
+        ``xreadgroup_failed`` and reason ``no_group``, and a plain
+        string value fails with reason ``wrongtype``. A bad group,
+        consumer, ID, count, or block never goes on the wire and
+        returns the server's error shape instead. This is a write,
+        not a read: handing entries out mutates the pending list
+        and the last delivery, and the mutation replicates through
+        the log like any other, so a retry with the same session
+        id returns the first attempt's entries instead of
         delivering them twice — a redelivery only ever comes from
         a fresh explicit-ID read, never from a retry. A successful
         read keeps the key's TTL deadline, like an xadd, and
         advances the write watermark from the reply's index, like
         any other write — and so does a failed one, since it still
-        committed its entry. There is no BLOCK yet: a readgroup
-        with nothing to hand out answers empty at once."""
+        committed its entry. A blocking readgroup goes one-shot,
+        not over a pooled connection, so a long wait never pins
+        one — like a watch."""
         if not isinstance(group, str) or not group:
             return {"type": "client_response", "status": "error",
                     "error": "xreadgroup group must be a non-empty "
@@ -1170,6 +1187,13 @@ class Session:
             return {"type": "client_response", "status": "error",
                     "error": "xreadgroup count must be a "
                              "non-negative integer"}
+        if block is not None and (
+                not isinstance(block, int) or isinstance(block, bool)
+                or block < 0):
+            return {"type": "client_response", "status": "error",
+                    "error": "xreadgroup block must be a "
+                             "non-negative integer number of "
+                             "milliseconds"}
         msg: dict = {"type": "client", "op": "xreadgroup",
                      "key": key, "group": group,
                      "consumer": consumer, "id": id}
@@ -1177,7 +1201,17 @@ class Session:
             msg["count"] = count
         if noack:
             msg["noack"] = True
-        return self._write(msg)
+        if block is not None:
+            msg["block"] = block
+        # A blocking readgroup waits on the server up to block ms
+        # (0 waits up to the server's 25s cap), so the request
+        # timeout must outlast the wait — plus headroom for the
+        # commit and the reply.
+        timeout = 12.0
+        if block is not None:
+            timeout = min(block / 1000.0, 25.0) + 10.0
+        return self._write(msg, timeout=timeout,
+                           pooled=block is None)
 
     def xack(self, key: str, group: str, *ids: str) -> dict:
         """Acknowledge entries for a consumer group on the stream
@@ -1962,7 +1996,9 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
     non-empty string consumer, and an ID — ">" (new entries, past
     the group's last delivery), "0", a bare millisecond, or a full
     "ms-seq" — plus an optional non-negative integer ``count``
-    and an optional ``noack`` flag, ``xack`` a string key, a
+    and an optional ``noack`` flag (BLOCK is not a pipeline op:
+    a blocking readgroup goes as its own request), ``xack`` a
+    string key, a
     non-empty string group, and a non-empty list of at most 1000
     explicit "ms-seq" IDs,
     ``hset`` a string key and a
@@ -2412,7 +2448,11 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
         # string group and consumer, an ID of ">", "0", a bare
         # millisecond, or a full "ms-seq", a non-negative integer
         # count when one is given, and a bare ``noack`` flag —
-        # the same shapes the server enforces.
+        # the same shapes the server enforces. ``block`` does not
+        # ride along: a blocking read would stall the whole
+        # pipeline batch waiting on one op, so a pipelined
+        # xreadgroup with a block is an error here, not a wait —
+        # send a blocking readgroup as its own request instead.
         group = op.get("group")
         if not isinstance(group, str) or not group:
             return None, {"type": "client_response", "status": "error",
@@ -2461,6 +2501,11 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
                               "error": "pipeline xreadgroup NOACK "
                                        "takes no argument"}
             msg["noack"] = True
+        if op.get("block") is not None:
+            return None, {"type": "client_response",
+                          "status": "error",
+                          "error": "pipeline xreadgroup does not "
+                                   "support BLOCK"}
     if name == "xack":
         # ``group`` and ``ids`` ride along with a pipelined xack,
         # validated here so a malformed one never goes on the wire:
@@ -3389,7 +3434,8 @@ def xgroup_create(node_addr: tuple[str, int], key: str, group: str,
 def xreadgroup(node_addr: tuple[str, int], key: str, group: str,
                consumer: str, id: str = ">",
                count: int | None = None, noack: bool = False,
-               timeout: float = 12.0) -> dict:
+               block: int | None = None,
+               timeout: float | None = None) -> dict:
     """Read entries for one consumer of one group on the stream at
     ``key``, following leader redirects like ``request`` — Redis
     XREADGROUP.
@@ -3410,13 +3456,19 @@ def xreadgroup(node_addr: tuple[str, int], key: str, group: str,
     ``noack`` the entries are delivered without being recorded
     pending, though the last delivery still advances. ``count``
     caps how many entries one call returns, like Redis's COUNT —
-    None means no cap, 0 answers an empty list. A bad group,
-    consumer, ID, or count never goes on the wire and returns the
-    server's error shape instead. This is a write, not a read: a
-    retry with the same session id returns the first attempt's
-    entries instead of delivering them twice. There is no BLOCK
-    yet: a readgroup with nothing to hand out answers empty at
-    once."""
+    None means no cap, 0 answers an empty list. ``block`` waits
+    that many milliseconds for a new entry when a ">" read has
+    nothing to hand out yet — 0 waits up to the server's 25s cap,
+    like a watch — and the reply then carries ``timed_out`` when
+    the wait expired with no new entry; with any other ID the
+    block is ignored and the read answers at once. A bad group,
+    consumer, ID, count, or block never goes on the wire and
+    returns the server's error shape instead. This is a write, not
+    a read: a retry with the same session id returns the first
+    attempt's entries instead of delivering them twice.
+    ``timeout`` defaults to 12s, or the block plus 10s headroom
+    when a block is given, so a blocking readgroup is never cut
+    off by its own client timeout."""
     if not isinstance(group, str) or not group:
         return {"type": "client_response", "status": "error",
                 "error": "xreadgroup group must be a non-empty "
@@ -3434,6 +3486,12 @@ def xreadgroup(node_addr: tuple[str, int], key: str, group: str,
         return {"type": "client_response", "status": "error",
                 "error": "xreadgroup count must be a "
                          "non-negative integer"}
+    if block is not None and (
+            not isinstance(block, int) or isinstance(block, bool)
+            or block < 0):
+        return {"type": "client_response", "status": "error",
+                "error": "xreadgroup block must be a non-negative "
+                         "integer number of milliseconds"}
     msg: dict = {"type": "client", "op": "xreadgroup",
                  "key": key, "group": group, "consumer": consumer,
                  "id": id}
@@ -3441,6 +3499,12 @@ def xreadgroup(node_addr: tuple[str, int], key: str, group: str,
         msg["count"] = count
     if noack:
         msg["noack"] = True
+    if block is not None:
+        msg["block"] = block
+    if timeout is None:
+        timeout = 12.0
+        if block is not None:
+            timeout = min(block / 1000.0, 25.0) + 10.0
     return request(node_addr, msg, timeout=timeout)
 
 
@@ -4558,6 +4622,11 @@ def main(argv: list[str] | None = None) -> int:
     p_xreadgroup.add_argument("--noack", action="store_true",
                               help="deliver without recording the "
                                    "entries pending")
+    p_xreadgroup.add_argument("--block", type=int, default=None,
+                              help="wait up to this many milliseconds "
+                                   "for a new entry when a \">\" read "
+                                   "has nothing to hand out yet (0 "
+                                   "waits up to the server's 25s cap)")
     p_xreadgroup.add_argument("--client-id", default=None,
                               help="session id for at-most-once writes: a "
                                    "retry with the same client id + request "
@@ -4972,6 +5041,8 @@ def main(argv: list[str] | None = None) -> int:
             msg["count"] = args.count
         if args.noack:
             msg["noack"] = True
+        if args.block is not None:
+            msg["block"] = args.block
     if op == "xack":
         msg["group"] = args.group
         msg["ids"] = args.ids
@@ -5034,9 +5105,10 @@ def main(argv: list[str] | None = None) -> int:
     # up to the server's 25s cap), so the request timeout must
     # outlast the wait — plus headroom for the leadership
     # confirmation and the reply — or the CLI would cut its own
-    # read off.
+    # read off. A blocking xreadgroup waits the same way, plus
+    # the commit wait for its delivery entry.
     timeout = args.timeout
-    if op == "xread" and args.block is not None:
+    if op in ("xread", "xreadgroup") and args.block is not None:
         timeout = max(timeout, min(args.block / 1000.0, 25.0) + 10.0)
     resp = request((host, int(port)), msg, timeout=timeout)
     status = resp.get("status")

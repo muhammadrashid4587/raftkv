@@ -20,6 +20,8 @@ rest of the suite.
 import contextlib
 import io
 import json
+import threading
+import time
 import unittest
 
 from harness import Cluster, client_request, wait_for_key
@@ -60,13 +62,15 @@ def xgroup_create(addr, key="events", group="workers",
 
 def xreadgroup(addr, key="events", group="workers",
                consumer="c1", id=">", count=None, noack=None,
-               client_id=None, request_id=None):
+               block=None, client_id=None, request_id=None):
     msg = {"type": "client", "op": "xreadgroup", "key": key,
            "group": group, "consumer": consumer, "id": id}
     if count is not None:
         msg["count"] = count
     if noack is not None:
         msg["noack"] = noack
+    if block is not None:
+        msg["block"] = block
     if client_id is not None:
         msg["client_id"] = client_id
     if request_id is not None:
@@ -504,6 +508,36 @@ class TestXReadGroupStore(unittest.TestCase):
                                   "group": "g", "ids": ["100-5"]})
             self.assertEqual(result["xack"], 1, result)
 
+    def test_xreadgroup_peek_is_read_only(self):
+        """The peek behind a blocking readgroup answers the entries
+        a ">" read would hand out right now — capped by count —
+        without handing anything out: the last delivery does not
+        move and nothing goes pending. A missing key, a plain
+        string, or a missing group answers None (nothing to wait
+        for), and a bad count raises instead of peeking."""
+        store = KVStore()
+        self.assertIsNone(store.xreadgroup_peek("s", "g"))
+        store.apply({"op": "set", "key": "plain", "value": "v"})
+        self.assertIsNone(store.xreadgroup_peek("plain", "g"))
+        for entry_id in ("100-5", "100-6", "101-0"):
+            store.apply({"op": "xadd", "key": "s",
+                         "pairs": [["a", entry_id]], "id": entry_id})
+        self.assertIsNone(store.xreadgroup_peek("s", "nope"))
+        store.apply({"op": "xgroup_create", "key": "s",
+                     "group": "g", "start_id": "0"})
+        self.assertEqual(store.xreadgroup_peek("s", "g"),
+                         [["100-5", {"a": "100-5"}],
+                          ["100-6", {"a": "100-6"}],
+                          ["101-0", {"a": "101-0"}]])
+        self.assertEqual(store.xreadgroup_peek("s", "g", count=1),
+                         [["100-5", {"a": "100-5"}]])
+        self.assertEqual(store.xreadgroup_peek("s", "g", count=0), [])
+        self.assertEqual(
+            groups_of(store.get("s"))["g"]["last_delivered"], "0-0")
+        self.assertEqual(store.xpending("s", "g")["pending"], 0)
+        with self.assertRaises(ValueError):
+            store.xreadgroup_peek("s", "g", count=-1)
+
 
 class TestXReadGroupCluster(unittest.TestCase):
     def test_full_flow_replicates_to_every_node(self):
@@ -581,6 +615,178 @@ class TestXReadGroupCluster(unittest.TestCase):
         finally:
             cluster.stop_all()
 
+    def test_block_waits_for_new_entry(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            xadd(addr, id="100-5")
+            self.assertEqual(
+                xgroup_create(addr, start_id="$").get("status"), "ok")
+            # Nothing new to hand out: a blocking ">" read waits.
+            results: list[dict] = []
+            thread = threading.Thread(
+                target=lambda: results.append(
+                    client_xreadgroup(addr, "events", "workers", "c1",
+                                      block=5000)))
+            started = time.monotonic()
+            thread.start()
+            time.sleep(0.5)
+            resp = xadd(addr, pairs=(("a", "2"),), id="100-6")
+            self.assertEqual(resp.get("status"), "ok", resp)
+            thread.join(timeout=10.0)
+            self.assertFalse(thread.is_alive())
+            elapsed = time.monotonic() - started
+            self.assertEqual(len(results), 1, results)
+            resp = results[0]
+            self.assertEqual(resp.get("status"), "ok", resp)
+            self.assertEqual(resp.get("entries"),
+                             [["100-6", {"a": "2"}]], resp)
+            self.assertIs(resp.get("timed_out"), False, resp)
+            # The wait really waited for the entry, and the
+            # delivery went through the log: the entry is pending
+            # for c1 on every node.
+            self.assertGreaterEqual(elapsed, 0.4)
+            self.assertLess(elapsed, 8.0)
+            self.assertEqual(xpending(addr).get("pending"), 1)
+            self.assertEqual(
+                groups_of(leader.sm.get("events"))["workers"]
+                ["pending"]["100-6"]["consumer"], "c1")
+        finally:
+            cluster.stop_all()
+
+    def test_block_times_out_with_empty_entries(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            xadd(addr, id="100-5")
+            self.assertEqual(
+                xgroup_create(addr, start_id="$").get("status"), "ok")
+            started = time.monotonic()
+            resp = client_xreadgroup(addr, "events", "workers", "c1",
+                                     block=1000)
+            elapsed = time.monotonic() - started
+            self.assertEqual(resp.get("status"), "ok", resp)
+            self.assertEqual(resp.get("entries"), [], resp)
+            self.assertIs(resp.get("timed_out"), True, resp)
+            self.assertGreaterEqual(elapsed, 0.9)
+            self.assertLess(elapsed, 8.0)
+        finally:
+            cluster.stop_all()
+
+    def test_block_zero_waits_until_entry_arrives(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            self.assertEqual(
+                xgroup_create(addr, start_id="$",
+                              mkstream=True).get("status"), "ok")
+            results: list[dict] = []
+            thread = threading.Thread(
+                target=lambda: results.append(
+                    client_xreadgroup(addr, "events", "workers", "c1",
+                                      block=0)))
+            started = time.monotonic()
+            thread.start()
+            time.sleep(0.5)
+            resp = xadd(addr, pairs=(("a", "1"),), id="100-5")
+            self.assertEqual(resp.get("status"), "ok", resp)
+            thread.join(timeout=10.0)
+            self.assertFalse(thread.is_alive())
+            elapsed = time.monotonic() - started
+            self.assertEqual(len(results), 1, results)
+            self.assertEqual(results[0].get("entries"),
+                             [["100-5", {"a": "1"}]], results[0])
+            self.assertIs(results[0].get("timed_out"), False,
+                          results[0])
+            self.assertGreaterEqual(elapsed, 0.4)
+            self.assertLess(elapsed, 8.0)
+        finally:
+            cluster.stop_all()
+
+    def test_block_ignored_for_explicit_id_read(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            xadd(addr, id="100-5")
+            xadd(addr, id="100-6")
+            self.assertEqual(
+                xgroup_create(addr, start_id="0").get("status"), "ok")
+            first = xreadgroup(addr, consumer="c1")
+            self.assertEqual([e[0] for e in first.get("entries")],
+                             ["100-5", "100-6"])
+            # A block on an explicit-ID re-read answers at once
+            # with the consumer's pending entries: there is nothing
+            # new to wait for, and the reply carries no timed_out.
+            started = time.monotonic()
+            resp = client_xreadgroup(addr, "events", "workers", "c1",
+                                     id="0", block=5000)
+            elapsed = time.monotonic() - started
+            self.assertEqual(resp.get("status"), "ok", resp)
+            self.assertEqual([e[0] for e in resp.get("entries")],
+                             ["100-5", "100-6"], resp)
+            self.assertNotIn("timed_out", resp)
+            self.assertLess(elapsed, 3.0)
+        finally:
+            cluster.stop_all()
+
+    def test_block_missing_group_fails_immediately(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            # No stream at all: the wait is skipped and the
+            # no_group failure comes back at once, not after the
+            # block expires.
+            started = time.monotonic()
+            resp = client_xreadgroup(addr, "events", "workers", "c1",
+                                     block=5000)
+            elapsed = time.monotonic() - started
+            self.assertEqual(resp.get("status"), "xreadgroup_failed",
+                             resp)
+            self.assertEqual(resp.get("reason"), "no_group", resp)
+            self.assertLess(elapsed, 3.0)
+        finally:
+            cluster.stop_all()
+
+    def test_blocked_readgroup_retry_returns_first_result(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            xadd(addr, id="100-5")
+            self.assertEqual(
+                xgroup_create(addr, start_id="0").get("status"), "ok")
+            first = xreadgroup(addr, block=5000,
+                               client_id="c1", request_id="r1")
+            self.assertEqual(first.get("status"), "ok", first)
+            self.assertEqual(first.get("entries"),
+                             [["100-5", {"type": "login"}]], first)
+            self.assertIs(first.get("timed_out"), False, first)
+            # The retry skips the wait: the first attempt already
+            # applied, so its result comes back at once and the
+            # entry is delivered exactly once.
+            started = time.monotonic()
+            second = xreadgroup(addr, block=5000,
+                                client_id="c1", request_id="r1")
+            elapsed = time.monotonic() - started
+            self.assertEqual(second.get("entries"),
+                             first.get("entries"), second)
+            self.assertEqual(count_entries(leader, "r1"), 1)
+            self.assertEqual(xpending(addr).get("pending"), 1)
+            self.assertLess(elapsed, 2.0)
+        finally:
+            cluster.stop_all()
+
     def test_invalid_args_rejected_with_no_log_entry(self):
         cluster = Cluster(3)
         try:
@@ -621,6 +827,12 @@ class TestXReadGroupCluster(unittest.TestCase):
                     {"type": "client", "op": "xreadgroup",
                      "key": "events", "group": "g", "consumer": "c1",
                      "id": ">", "noack": "yes"},
+                    {"type": "client", "op": "xreadgroup",
+                     "key": "events", "group": "g", "consumer": "c1",
+                     "id": ">", "block": -1},
+                    {"type": "client", "op": "xreadgroup",
+                     "key": "events", "group": "g", "consumer": "c1",
+                     "id": ">", "block": "x"},
                     {"type": "client", "op": "xack",
                      "key": "events", "group": "g", "ids": []},
                     {"type": "client", "op": "xack",
@@ -670,6 +882,12 @@ class TestXReadGroupCluster(unittest.TestCase):
                 resp = session.xgroup_create("events", "")
                 self.assertEqual(resp.get("status"), "error", resp)
                 resp = session.xreadgroup("events", "workers", "")
+                self.assertEqual(resp.get("status"), "error", resp)
+                resp = session.xreadgroup("events", "workers", "c1",
+                                          block=-1)
+                self.assertEqual(resp.get("status"), "error", resp)
+                resp = session.xreadgroup("events", "workers", "c1",
+                                          block="x")
                 self.assertEqual(resp.get("status"), "error", resp)
                 resp = session.xack("events", "workers")
                 self.assertEqual(resp.get("status"), "error", resp)
@@ -749,6 +967,18 @@ class TestXReadGroupCluster(unittest.TestCase):
             self.assertEqual(len(results), 3, results)
             for resp in results:
                 self.assertEqual(resp.get("status"), "error", resp)
+            # BLOCK is not a pipeline op: a blocking readgroup
+            # would stall the whole batch, so it is a per-op
+            # error here too.
+            with Session(addr) as session:
+                results = session.pipeline([
+                    {"op": "xreadgroup", "key": "events",
+                     "group": "workers", "consumer": "c1",
+                     "id": ">", "block": 1000},
+                ])
+            self.assertEqual(len(results), 1, results)
+            self.assertEqual(results[0].get("status"), "error",
+                             results[0])
         finally:
             cluster.stop_all()
 
