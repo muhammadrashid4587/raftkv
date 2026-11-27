@@ -238,13 +238,21 @@ def geo_distance(lon1: float, lat1: float, lon2: float,
 # the count an XGROUP SETID ... ENTRIESREAD set — XGROUP SETID
 # moves last_delivered (and optionally entries_read), XGROUP
 # DESTROY drops the whole group, and XGROUP DELCONSUMER drops
-# one consumer and its pending entries. The groups ride in the
-# same blob, so they survive snapshots and replay exactly like
-# the entries — a group created before a snapshot is still there
-# after one — and the blob stays a pure function of (entries,
-# groups), so every node computes the same bytes. A stream
-# created before groups existed carries no "groups" key at all,
-# and reads like one with no groups.
+# one consumer and its pending entries. Since v0.70.0 a group may
+# also carry "consumers", a map of consumer name to
+# {"last_seen_ms": n} — the wall-clock millisecond of the last
+# delivery that consumer was handed, fixed by the leader at log
+# time (like an xadd auto ID), so XINFO CONSUMERS can report how
+# long each consumer has been idle. A consumer only appears there
+# once it has been handed at least one entry: a readgroup that
+# hands out nothing writes nothing at all, so a consumer that
+# only ever polled an empty group is not listed. The groups ride
+# in the same blob, so they survive snapshots and replay exactly
+# like the entries — a group created before a snapshot is still
+# there after one — and the blob stays a pure function of
+# (entries, groups), so every node computes the same bytes. A
+# stream created before groups existed carries no "groups" key at
+# all, and reads like one with no groups.
 STREAM_PREFIX = "\x00raftkv-stream\x00"
 
 # Largest number of fields one ``xadd`` may carry. The pairs ride
@@ -375,18 +383,23 @@ def _is_group_map(groups) -> bool:
     handed out). Since v0.69.0 a group may also carry
     "entries_read" — the count an XGROUP SETID ... ENTRIESREAD
     set, a non-negative integer, absent when no SETID ever set
-    it. A plain string can only pass this by being
-    hand-built to the exact shape — the same class of collision
-    the hash check has — so an XREADGROUP trusts the shape."""
+    it. Since v0.70.0 a group may also carry "consumers" — a map
+    of consumer name to {"last_seen_ms": n}, the wall-clock
+    millisecond of that consumer's last delivery, a
+    non-negative integer, absent for a consumer that has never
+    been handed an entry. A plain string can only pass this by
+    being hand-built to the exact shape — the same class of
+    collision the hash check has — so an XREADGROUP trusts the
+    shape."""
     if not isinstance(groups, dict):
         return False
     for name, group in groups.items():
         if not isinstance(name, str) or not name:
             return False
         if (not isinstance(group, dict)
-                or set(group) not in ({"last_delivered", "pending"},
-                                      {"last_delivered", "pending",
-                                       "entries_read"})):
+                or not {"last_delivered", "pending"} <= set(group)
+                or not set(group) <= {"last_delivered", "pending",
+                                      "entries_read", "consumers"}):
             return False
         last = group["last_delivered"]
         if last is not None:
@@ -400,6 +413,21 @@ def _is_group_map(groups) -> bool:
                     or isinstance(entries_read, bool)
                     or entries_read < 0):
                 return False
+        if "consumers" in group:
+            consumers = group["consumers"]
+            if not isinstance(consumers, dict):
+                return False
+            for consumer, seen in consumers.items():
+                if not isinstance(consumer, str) or not consumer:
+                    return False
+                if (not isinstance(seen, dict)
+                        or set(seen) != {"last_seen_ms"}):
+                    return False
+                last_seen = seen["last_seen_ms"]
+                if (not isinstance(last_seen, int)
+                        or isinstance(last_seen, bool)
+                        or last_seen < 0):
+                    return False
         pending = group["pending"]
         if not isinstance(pending, dict):
             return False
@@ -2156,7 +2184,19 @@ class KVStore:
             # a non-negative integer count), so by apply time
             # they are well-formed — a hand-built log entry with
             # a bad name, ID, or count still raises rather than
-            # silently delivering nonsense.
+            # silently delivering nonsense. A delivery also
+            # stamps the consumer's last-seen time — the
+            # wall-clock millisecond the leader fixed at log time
+            # (command "seen_ms", like an xadd auto ID) — in the
+            # group's "consumers" map, so XINFO CONSUMERS can
+            # report how long each consumer has been idle; an
+            # entry logged before v0.70.0 carries no seen_ms, so
+            # replaying one simply records no sighting instead
+            # of failing, and a hand-built entry with a bad one
+            # still raises. A NOACK delivery stamps it too — the
+            # consumer interacted and received entries — and so
+            # does a re-read; only a read that hands out nothing
+            # records nothing, since it writes nothing at all.
             key = command["key"]
             group = command.get("group")
             consumer = command.get("consumer")
@@ -2177,6 +2217,13 @@ class KVStore:
                 raise ValueError(
                     "xreadgroup count must be a non-negative "
                     "integer")
+            seen_ms = command.get("seen_ms")
+            if seen_ms is not None and (
+                    not isinstance(seen_ms, int)
+                    or isinstance(seen_ms, bool) or seen_ms < 0):
+                raise ValueError(
+                    "xreadgroup seen_ms must be a non-negative "
+                    "integer number of milliseconds")
             current = self._data.get(key)
             if current is None:
                 return {"type": "client_response",
@@ -2247,6 +2294,9 @@ class KVStore:
                     chosen.append((eid, by_id[eid]))
                     info["deliveries"] += 1
             if chosen:
+                if seen_ms is not None:
+                    state.setdefault("consumers", {})[consumer] = {
+                        "last_seen_ms": seen_ms}
                 self._data[key] = _stream_value(stream)
             return {"type": "client_response", "status": "ok",
                     "entries": [[eid, dict(fields)]
@@ -2491,7 +2541,12 @@ class KVStore:
             # their pending record goes, so they are simply no
             # longer pending, like acked ones (a later ">" read
             # still will not re-hand them: the group's last
-            # delivery already passed them). The reply carries
+            # delivery already passed them). The consumer's
+            # last-seen record goes too, so XINFO CONSUMERS stops
+            # listing it — and the reply carries
+            # ``consumer_dropped`` 1 when a record went, so a
+            # watcher can tell a delete that only dropped a
+            # sighting from one that changed nothing at all. The reply carries
             # ``xgroup_delconsumer`` — how many pending entries
             # the consumer held, 0 when the consumer held none
             # or did not exist at all, like Redis. A missing key
@@ -2550,10 +2605,19 @@ class KVStore:
                       if info["consumer"] == consumer]
             for entry_id in doomed:
                 del pending[entry_id]
-            if doomed:
+            consumers = groups[group].get("consumers", {})
+            consumer_dropped = consumer in consumers
+            if consumer_dropped:
+                del consumers[consumer]
+                if not consumers:
+                    del groups[group]["consumers"]
+            if doomed or consumer_dropped:
                 self._data[key] = _stream_value(stream)
-            return {"type": "client_response", "status": "ok",
-                    "xgroup_delconsumer": len(doomed)}
+            result = {"type": "client_response", "status": "ok",
+                      "xgroup_delconsumer": len(doomed)}
+            if consumer_dropped:
+                result["consumer_dropped"] = 1
+            return result
         elif op == "setrange":
             # Overwrite part of a string value, Redis SETRANGE:
             # starting at ``offset``, replace as many characters
@@ -3024,6 +3088,140 @@ class KVStore:
                 "min_id": ids[0] if ids else None,
                 "max_id": ids[-1] if ids else None,
                 "consumers": [[c, counts[c]] for c in sorted(counts)]}
+
+    def xinfo_stream(self, key: str) -> dict:
+        """The stream at ``key`` itself — Redis XINFO STREAM:
+        ``length`` the number of entries, ``last_generated_id``
+        the top ID ("0-0" when the stream holds no entries yet,
+        as a group created with MKSTREAM on an empty stream
+        does), ``groups`` how many consumer groups the stream
+        has, and ``first_entry`` / ``last_entry`` the [id,
+        {field: value}] pairs at the ends of the stream, None
+        when it holds no entries. Raises TypeError when the value
+        is a plain string: an XINFO reads a stream, not bytes, so
+        a string key is WRONGTYPE, like an xlen on a plain
+        string. Raises ValueError when the key does not exist:
+        Redis's "no such key", a missing stream is an error, not
+        an empty summary — a typo'd key must not read as an empty
+        stream. Pure read: no log entry, no state change. The
+        entries come back as fresh copies, so the caller cannot
+        mutate the stored blob's parse."""
+        value = self._data.get(key)
+        if value is None:
+            raise ValueError(
+                f"xinfo failed: no such key {key!r}")
+        if not is_stream(value):
+            raise TypeError(
+                f"xinfo failed: value of {key!r} is not a stream")
+        stream = _stream_data(value)
+        entries = stream["entries"]
+        return {"length": len(entries),
+                "last_generated_id": (stream["last"]
+                                      if stream["last"] is not None
+                                      else "0-0"),
+                "groups": len(stream.get("groups", {})),
+                "first_entry": ([entries[0][0], dict(entries[0][1])]
+                                if entries else None),
+                "last_entry": ([entries[-1][0], dict(entries[-1][1])]
+                               if entries else None)}
+
+    def xinfo_groups(self, key: str) -> list[dict]:
+        """The consumer groups on the stream at ``key`` — Redis
+        XINFO GROUPS: one dict per group, sorted by group name,
+        carrying ``name``, ``last_delivered_id`` — the last entry
+        the group was handed, None when it was created on an empty
+        stream with "$" and nothing has been handed out yet —
+        ``entries_read`` — the count an XGROUP SETID ...
+        ENTRIESREAD set, None when no SETID ever set it —
+        ``lag`` — the entries appended after the group's last
+        delivery that it has not read yet, counted from the
+        entries still in the stream — and ``pending`` — the
+        entries handed out and not yet acked. Raises TypeError
+        when the value is a plain string: an XINFO reads a stream,
+        not bytes, so a string key is WRONGTYPE, like an xlen on
+        a plain string. Raises ValueError when the key does not
+        exist: a missing stream is an error, not an empty list.
+        Pure read: no log entry, no state change."""
+        value = self._data.get(key)
+        if value is None:
+            raise ValueError(
+                f"xinfo failed: no such key {key!r}")
+        if not is_stream(value):
+            raise TypeError(
+                f"xinfo failed: value of {key!r} is not a stream")
+        stream = _stream_data(value)
+        entries = stream["entries"]
+        groups: list[dict] = []
+        for name in sorted(stream.get("groups", {})):
+            state = stream["groups"][name]
+            last = state["last_delivered"]
+            after = ((0, 0) if last is None
+                     else _parse_stored_stream_id(last))
+            lag = sum(1 for eid, _fields in entries
+                      if parse_stream_id(eid) > after)
+            groups.append({"name": name,
+                           "last_delivered_id": last,
+                           "entries_read": state.get("entries_read"),
+                           "lag": lag,
+                           "pending": len(state["pending"])})
+        return groups
+
+    def xinfo_consumers(self, key: str, group: str,
+                        now_ms: int) -> list[dict]:
+        """The consumers of ``group`` on the stream at ``key`` —
+        Redis XINFO CONSUMERS: one dict per consumer, sorted by
+        consumer name, carrying ``name``, ``pending`` — the
+        entries handed out to that consumer and not yet acked —
+        and ``idle`` — the milliseconds since that consumer was
+        last handed an entry, None when the consumer was never
+        handed one through a delivery this version stamped (a
+        group created before v0.70.0, or a consumer whose entries
+        all came from replays of pre-v0.70.0 log entries). A
+        consumer only appears once it has been handed at least
+        one entry: a readgroup that hands out nothing writes
+        nothing at all, so a consumer that only ever polled an
+        empty group is not listed — and a consumer whose pending
+        entries were all acked is still listed, with pending 0,
+        until XGROUP DELCONSUMER drops it. ``now_ms`` is the
+        wall-clock millisecond the idle is measured against, so
+        the store itself never reads a clock: the caller passes
+        its own now, and the idle is clamped at 0, so a stamp
+        from a leader whose clock runs ahead never reads as a
+        negative idle. Raises TypeError when the value is a plain
+        string: an XINFO reads a stream, not bytes, so a string
+        key is WRONGTYPE, like an xlen on a plain string. Raises
+        ValueError when the key does not exist or the group does
+        not exist on it: Redis's NOGROUP, a missing group is an
+        error, not an empty list. Pure read: no log entry, no
+        state change."""
+        value = self._data.get(key)
+        if value is None:
+            raise ValueError(
+                f"xinfo failed: no such key {key!r} or consumer "
+                f"group {group!r}")
+        if not is_stream(value):
+            raise TypeError(
+                f"xinfo failed: value of {key!r} is not a stream")
+        groups = _stream_data(value).get("groups", {})
+        if group not in groups:
+            raise ValueError(
+                f"xinfo failed: no such key {key!r} or consumer "
+                f"group {group!r}")
+        state = groups[group]
+        counts: dict[str, int] = {}
+        for info in state["pending"].values():
+            consumer = info["consumer"]
+            counts[consumer] = counts.get(consumer, 0) + 1
+        seen = state.get("consumers", {})
+        consumers: list[dict] = []
+        for name in sorted(set(counts) | set(seen)):
+            record = seen.get(name)
+            idle = (None if record is None
+                    else max(0, now_ms - record["last_seen_ms"]))
+            consumers.append({"name": name,
+                              "pending": counts.get(name, 0),
+                              "idle": idle})
+        return consumers
 
     def xreadgroup_peek(self, key: str, group: str,
                         count: int | None = None) -> list | None:

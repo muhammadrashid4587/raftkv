@@ -1819,13 +1819,16 @@ class RaftNode:
                                       index=self.last_applied)
                 elif (op == "xgroup_delconsumer" and result is not None
                         and result.get("status") == "ok"
-                        and result.get("xgroup_delconsumer", 0) > 0):
+                        and (result.get("xgroup_delconsumer", 0) > 0
+                             or result.get("consumer_dropped"))):
                     # A delete that dropped a consumer's pending
-                    # entries fires like a set, with the new
-                    # (stream blob) value: a delete of a consumer
-                    # that held nothing changed nothing, so it
-                    # fires nothing, like a failed xadd — and a
-                    # failed delete wrote nothing either.
+                    # entries — or its last-seen record, even when
+                    # it held nothing pending — fires like a set,
+                    # with the new (stream blob) value: a delete of
+                    # a consumer that held nothing and was never
+                    # seen changed nothing, so it fires nothing,
+                    # like a failed xadd — and a failed delete
+                    # wrote nothing either.
                     self.watch.notify(entry["command"]["key"],
                                       self.sm.get(entry["command"]["key"]),
                                       "set",
@@ -2714,6 +2717,54 @@ class RaftNode:
                 return error
             return self._serve_read(xpending_key=msg.get("key"),
                                     xpending_group=group,
+                                    min_index=min_index,
+                                    session_term=session_term,
+                                    stale_ok=bool(msg.get("stale_ok")))
+        if op == "xinfo":
+            # Stream introspection: XINFO STREAM (the stream
+            # itself: length, top ID, group count, first / last
+            # entry), XINFO GROUPS (one dict per consumer group:
+            # last delivery, entries-read, lag, pending), or
+            # XINFO CONSUMERS (one dict per consumer of one group:
+            # pending count, idle time). It rides the same
+            # ReadIndex/lease path as a ``get`` — one leadership
+            # confirmation, one apply wait — so the report
+            # reflects the committed state as of the read index it
+            # names, exactly as linearizable, and a session read
+            # carries the same watermark a get would. The subcommand
+            # is matched case-insensitively and normalized to upper
+            # case before it is served, so every node reports the
+            # same spelling. Whether the key or the group exists is
+            # decided at serve time, like xlen's wrongtype: a
+            # missing key or group is an error in the payload (see
+            # _serve_read), not an empty report — a typo'd group
+            # name must not read as "nothing there".
+            if self._is_removed():
+                return {"type": "client_response", "status": "error",
+                        "error": "this node was removed from the cluster"}
+            sub = msg.get("sub")
+            if not isinstance(sub, str) or sub.upper() not in (
+                    "STREAM", "GROUPS", "CONSUMERS"):
+                return {"type": "client_response", "status": "error",
+                        "error": "xinfo sub must be STREAM, GROUPS, "
+                                 "or CONSUMERS"}
+            if (not isinstance(msg.get("key"), str)
+                    or not msg.get("key")):
+                return {"type": "client_response", "status": "error",
+                        "error": "xinfo key must be a non-empty "
+                                 "string"}
+            group = msg.get("group")
+            if sub.upper() == "CONSUMERS" and (
+                    not isinstance(group, str) or not group):
+                return {"type": "client_response", "status": "error",
+                        "error": "xinfo group must be a non-empty "
+                                 "string"}
+            min_index, session_term, error = self._parse_read_params(msg)
+            if error is not None:
+                return error
+            return self._serve_read(xinfo_key=msg.get("key"),
+                                    xinfo_sub=sub.upper(),
+                                    xinfo_group=group,
                                     min_index=min_index,
                                     session_term=session_term,
                                     stale_ok=bool(msg.get("stale_ok")))
@@ -4200,6 +4251,21 @@ class RaftNode:
         for field in ("client_id", "request_id"):
             if msg.get(field):
                 command[field] = msg[field]
+        if op == "xreadgroup":
+            # The wall-clock millisecond this delivery is stamped
+            # with, fixed here on the leader just before the entry
+            # is appended — after any BLOCK wait, so the stamp is
+            # the delivery's time, not the time the wait started —
+            # and stored in the command itself, so every replica
+            # records the same last-seen time and a replay or a
+            # snapshot restores it exactly: fixing it at log time
+            # (rather than at apply time, when followers would each
+            # read their own clock) is what keeps the stamp
+            # identical across nodes, the same fix-at-log-time as
+            # an xadd auto ID. A retry whose first attempt already
+            # applied never logs again, so the stamp is harmless
+            # there.
+            command["seen_ms"] = int(time.time() * 1000)
         timed_out: bool | None = None
         if (op == "xreadgroup" and xreadgroup_block_ms is not None
                 and xreadgroup_id == ">"):
@@ -4906,6 +4972,9 @@ class RaftNode:
                     xread_block_ms: int | None = None,
                     xpending_key: str | None = None,
                     xpending_group: str | None = None,
+                    xinfo_key: str | None = None,
+                    xinfo_sub: str = "STREAM",
+                    xinfo_group: str | None = None,
                     scan_prefix: str | None = None,
                     scan_limit: int = MAX_KEYS_SCAN,
                     scan_start_after: str | None = None) -> dict:
@@ -5064,6 +5133,20 @@ class RaftNode:
         client error, not a summary, and a missing key or group
         is one too — a typo'd group name must not read as
         "nothing pending".
+        ``xinfo_key`` serves stream introspection instead —
+        ``xinfo_sub`` naming which: STREAM reports the stream
+        itself (``length``, ``last_generated_id``, ``groups``
+        the group count, ``first_entry`` / ``last_entry``),
+        GROUPS reports one dict per consumer group
+        (``name``, ``last_delivered_id``, ``entries_read``,
+        ``lag``, ``pending``), and CONSUMERS reports one dict per
+        consumer of ``xinfo_group`` (``name``, ``pending``,
+        ``idle`` the milliseconds since that consumer was last
+        handed an entry) — Redis XINFO — read off the applied
+        state machine the same way, so it is exactly as
+        linearizable as a ``get``; a plain string value is a
+        client error, not a report, and a missing key — or a
+        missing group for CONSUMERS — is one too.
         ``scan_prefix`` serves a key enumeration instead — every key
         in the applied state machine starting with the prefix,
         sorted, at most ``scan_limit`` of them, with ``truncated``
@@ -5430,6 +5513,33 @@ class RaftNode:
                 try:
                     return self.sm.xpending(xpending_key,
                                             xpending_group)
+                except (TypeError, ValueError) as e:
+                    return {"status": "error", "error": str(e)}
+            if xinfo_key is not None:
+                # Stream introspection — Redis XINFO: STREAM
+                # reports the stream itself, GROUPS one dict per
+                # consumer group, CONSUMERS one dict per consumer
+                # of the group — with the same wrongtype rule as
+                # xlen: a plain string value is a client error,
+                # not a report, carried the same way, overriding
+                # the "ok" in the response literal. A missing key
+                # — or a missing group for CONSUMERS — is the
+                # same kind of error, from the store's own
+                # validation. The idle times are measured against
+                # this node's wall clock at serve time, clamped
+                # at 0 in the store, so a stamp from a leader
+                # whose clock runs ahead never reads as a
+                # negative idle.
+                try:
+                    if xinfo_sub == "GROUPS":
+                        return {"groups": self.sm.xinfo_groups(
+                            xinfo_key)}
+                    if xinfo_sub == "CONSUMERS":
+                        return {"consumers":
+                                self.sm.xinfo_consumers(
+                                    xinfo_key, xinfo_group,
+                                    int(time.time() * 1000))}
+                    return self.sm.xinfo_stream(xinfo_key)
                 except (TypeError, ValueError) as e:
                     return {"status": "error", "error": str(e)}
             if keys is not None:

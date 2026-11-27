@@ -1000,9 +1000,66 @@ logic and the failure handling, not the key-value API on top.
   honest limits are the same growth as xadd — the whole stream is
   one blob, so a SETID still rewrites the blob whole — and the
   scope: the entries-read count is stored but never reported back
-  (there is no XINFO to read it with), and there is still no way
-  to list the groups on a stream — that is what XINFO would be
-  for.
+  without XINFO, and there is no way to list the groups on a stream
+  without it — that is what XINFO (v0.70.0) is for.
+- **Streams (XINFO)** — since v0.70.0 `xinfo STREAM key`,
+  `xinfo GROUPS key`, and `xinfo CONSUMERS key group`
+  (`Session.xinfo_stream(k)`, `Session.xinfo_groups(k)`,
+  `Session.xinfo_consumers(k, group)`,
+  `client.xinfo_stream(addr, k)`,
+  `client.xinfo_groups(addr, k)`,
+  `client.xinfo_consumers(addr, k, group)`, and `xinfo STREAM|GROUPS|
+  CONSUMERS key [group]` on the CLI) are stream introspection —
+  Redis XINFO. STREAM reports the stream itself: `length` the
+  number of entries, `last_generated_id` the top ID ("0-0" when
+  the stream holds no entries yet, as a group created with
+  MKSTREAM on an empty stream does), `groups` how many consumer
+  groups the stream has, and `first_entry` / `last_entry` the [id,
+  {field: value}] pairs at the ends of the stream, None when it
+  holds no entries. GROUPS reports one dict per group, sorted by
+  group name: `name`, `last_delivered_id` — the last entry the
+  group was handed, None when it was created on an empty stream
+  with "$" and nothing has been handed out yet — `entries_read` —
+  the count an XGROUP SETID ... ENTRIESREAD set, None when no
+  SETID ever set it — `lag` — the entries appended after the
+  group's last delivery that it has not read yet — and `pending` —
+  the entries handed out and not yet acked. CONSUMERS reports one
+  dict per consumer of the group, sorted by consumer name: `name`,
+  `pending` — the entries handed out to that consumer and not yet
+  acked — and `idle` — the milliseconds since that consumer was
+  last handed an entry, None when it was never handed one through
+  a delivery this version stamped. The idle time is tracked, not
+  guessed: every xreadgroup stamps the consumer's last-seen
+  millisecond — fixed by the leader at log time, like an xadd auto
+  ID, so every replica records the same stamp and a replay or a
+  snapshot restores it exactly — in the group's `consumers` map in
+  the stream blob, so it survives snapshots and replay like the
+  rest of the group. A NOACK delivery stamps it too, and so does a
+  re-read; only a read that hands out nothing records nothing,
+  since it writes nothing at all — so a consumer only appears once
+  it has been handed at least one entry, and a consumer whose
+  pending entries were all acked is still listed, with pending 0,
+  until XGROUP DELCONSUMER drops it, record and all (the reply
+  carries `consumer_dropped` 1 when a last-seen record went, so a
+  delete that only dropped a sighting still fires its watch
+  event). All three are pure reads through the same ReadIndex path
+  as a `get`, so they are exactly as linearizable and a stale
+  read from a follower lease is served like a stale `get`; like
+  other reads, none is a pipeline op. A missing key fails all
+  three as a client error, not an empty report, a missing group
+  fails CONSUMERS the same way, and a plain string value fails all
+  three with `wrongtype`. The subcommand is matched
+  case-insensitively and normalized to upper case before it is
+  served, so every node reports the same spelling. The honest
+  limits are the same growth as xadd — the whole stream is one
+  blob, so a report still reads the blob whole — and the scope:
+  the lag is counted from the entries still in the stream, so a
+  trim makes it undercount the entries a group never read; there
+  is no entries-added counter, so STREAM reports no `entries-added`
+  and no `max-deleted-entry-id`, and no radix tree, so no
+  `radix-tree-keys` / `radix-tree-nodes`; and an idle of None is
+  the honest answer for a consumer whose deliveries all came from
+  replays of pre-v0.70.0 log entries, which carry no stamp.
 - **HyperLogLog** — since v0.47.0 `pfadd key element [element ...]`
   (`Session.pfadd(k, *elements)`, `client.pfadd(addr, k, *elements)`,
   `pfadd key element ...` on the CLI) adds elements to the
@@ -4003,3 +4060,43 @@ entries left in `log.jsonl` are dropped by their index on reload.
   a new roadmap item grounded in this project's purpose,
   proposed by the next run — candidates: XPENDING in per-entry
   form, or XINFO for streams and groups.
+- ~~Streams (XINFO)~~ — done in v0.70.0, Nov 27, 2026:
+  `xinfo STREAM key`, `xinfo GROUPS key`, and
+  `xinfo CONSUMERS key group` are stream introspection — Redis
+  XINFO. STREAM reports the stream itself — its length, top ID,
+  group count, and first / last entry; GROUPS reports one dict per
+  group — its last-delivered ID, entries-read count, lag, and
+  pending count; CONSUMERS reports one dict per consumer — its
+  pending count and idle time. The idle time is tracked, not
+  guessed: every xreadgroup stamps the consumer's last-seen
+  millisecond — fixed by the leader at log time, like an xadd auto
+  ID — in the group's "consumers" map in the stream blob, so it
+  survives snapshots and replay like the rest of the group, and a
+  NOACK delivery and a re-read stamp it too; a read that hands out
+  nothing records nothing, so a consumer only appears once it has
+  been handed at least one entry. DELCONSUMER drops the last-seen
+  record with the consumer, and the reply carries
+  `consumer_dropped` 1 when a record went, so a delete that only
+  dropped a sighting still fires its watch event. All three are
+  pure reads through the same ReadIndex path as a `get`, so they
+  are exactly as linearizable, and a missing key or group — or a
+  plain string value — fails as a client error, not an empty
+  report. `Session` methods, `client` module functions, and the
+  `xinfo` command on the CLI; like other reads, none is a pipeline
+  op.
+  `tests/test_xinfo.py` proves it: store-level the stream report
+  on a full and an empty stream, the groups report with lag and
+  entries-read after a SETID, the consumers report with exact idle
+  times from fixed stamps and None for an unstamped delivery, a
+  consumer that only polled an empty group unlisted, missing keys
+  and groups, and wrongtype; a delconsumer dropping the last-seen
+  record; the reports surviving a snapshot load; and cluster-level
+  the full flow replicated to every node, idle times that grow as
+  time passes, bad arguments as client errors with no log entry,
+  session methods, the module functions from a follower, a
+  pipelined readgroup stamping its consumer, snapshot + restart
+  survival, and the CLI end to end.
+  The roadmap is exhausted again, so the next real thing is
+  a new roadmap item grounded in this project's purpose,
+  proposed by the next run — candidates: XPENDING in per-entry
+  form.

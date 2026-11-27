@@ -1394,6 +1394,124 @@ class Session:
                 self.last_read_term = int(resp.get("read_term") or 0)
         return resp
 
+    def xinfo_stream(self, key: str) -> dict:
+        """Ask for the stream at ``key`` itself, Redis XINFO STREAM:
+        the reply carries ``length`` — the number of entries —
+        ``last_generated_id`` — the top ID, "0-0" when the stream
+        holds no entries yet — ``groups`` — how many consumer
+        groups the stream has — and ``first_entry`` / ``last_entry``
+        — the [id, {field: value}] pairs at the ends of the stream,
+        None when it holds no entries. A missing key is a client
+        error — not an empty report — and a plain string value is
+        one too. A bad key never goes on the wire and returns the
+        server's error shape instead. It rides the same ReadIndex
+        path as ``get``, so it carries the same session watermark
+        and advances the read watermark from the reply's
+        ``read_index`` exactly the same way: a report queried
+        after your own xadd counts the entry that xadd appended,
+        and a later read never goes backwards past it."""
+        if self.last_read_index > self.last_write_index:
+            min_index = self.last_read_index
+            term = self.last_read_term
+        else:
+            min_index = self.last_write_index
+            term = self.last_write_term
+        msg: dict = {"type": "client", "op": "xinfo", "sub": "STREAM",
+                     "key": key,
+                     "client_id": self.client_id,
+                     "min_commit_index": min_index,
+                     "session_term": term}
+        resp = request(self.node_addr, msg, pool=self._pooled)
+        if (resp.get("status") == "ok"
+                and resp.get("read_index") is not None):
+            read_index = int(resp["read_index"])
+            if read_index > self.last_read_index:
+                self.last_read_index = read_index
+                self.last_read_term = int(resp.get("read_term") or 0)
+        return resp
+
+    def xinfo_groups(self, key: str) -> dict:
+        """Ask for the consumer groups on the stream at ``key``,
+        Redis XINFO GROUPS: the reply carries ``groups`` — one
+        dict per group, sorted by group name, each with ``name``,
+        ``last_delivered_id`` — the last entry the group was
+        handed, None when nothing has been handed out yet —
+        ``entries_read`` — the count an XGROUP SETID ...
+        ENTRIESREAD set, None when no SETID ever set it —
+        ``lag`` — the entries appended after the group's last
+        delivery that it has not read yet — and ``pending`` — the
+        entries handed out and not yet acked. A missing key is a
+        client error — not an empty list — and a plain string
+        value is one too. A bad key never goes on the wire and
+        returns the server's error shape instead. It rides the
+        same ReadIndex path as ``get``, so it carries the same
+        session watermark and advances the read watermark from the
+        reply's ``read_index`` exactly the same way: a report
+        queried after your own xgroup_create lists the group
+        that create made, and a later read never goes backwards
+        past it."""
+        if self.last_read_index > self.last_write_index:
+            min_index = self.last_read_index
+            term = self.last_read_term
+        else:
+            min_index = self.last_write_index
+            term = self.last_write_term
+        msg: dict = {"type": "client", "op": "xinfo", "sub": "GROUPS",
+                     "key": key,
+                     "client_id": self.client_id,
+                     "min_commit_index": min_index,
+                     "session_term": term}
+        resp = request(self.node_addr, msg, pool=self._pooled)
+        if (resp.get("status") == "ok"
+                and resp.get("read_index") is not None):
+            read_index = int(resp["read_index"])
+            if read_index > self.last_read_index:
+                self.last_read_index = read_index
+                self.last_read_term = int(resp.get("read_term") or 0)
+        return resp
+
+    def xinfo_consumers(self, key: str, group: str) -> dict:
+        """Ask for the consumers of ``group`` on the stream at
+        ``key``, Redis XINFO CONSUMERS: the reply carries
+        ``consumers`` — one dict per consumer, sorted by consumer
+        name, each with ``name``, ``pending`` — the entries handed
+        out to that consumer and not yet acked — and ``idle`` —
+        the milliseconds since that consumer was last handed an
+        entry, None when it was never handed one through a
+        delivery this version stamped. A missing key or group is
+        a client error — not an empty list — and a plain string
+        value is one too. A bad group never goes on the wire and
+        returns the server's error shape instead. It rides the
+        same ReadIndex path as ``get``, so it carries the same
+        session watermark and advances the read watermark from the
+        reply's ``read_index`` exactly the same way: a report
+        queried after your own xreadgroup lists the consumer that
+        read handed entries to, and a later read never goes
+        backwards past it."""
+        if not isinstance(group, str) or not group:
+            return {"type": "client_response", "status": "error",
+                    "error": "xinfo group must be a non-empty "
+                             "string"}
+        if self.last_read_index > self.last_write_index:
+            min_index = self.last_read_index
+            term = self.last_read_term
+        else:
+            min_index = self.last_write_index
+            term = self.last_write_term
+        msg: dict = {"type": "client", "op": "xinfo",
+                     "sub": "CONSUMERS", "key": key, "group": group,
+                     "client_id": self.client_id,
+                     "min_commit_index": min_index,
+                     "session_term": term}
+        resp = request(self.node_addr, msg, pool=self._pooled)
+        if (resp.get("status") == "ok"
+                and resp.get("read_index") is not None):
+            read_index = int(resp["read_index"])
+            if read_index > self.last_read_index:
+                self.last_read_index = read_index
+                self.last_read_term = int(resp.get("read_term") or 0)
+        return resp
+
     def pfadd(self, key: str, *elements: str) -> dict:
         """Add ``elements`` to the HyperLogLog at ``key``, Redis
         PFADD: each element hashes into one of 16384 registers
@@ -3859,6 +3977,76 @@ def xpending(node_addr: tuple[str, int], key: str, group: str,
                    timeout=timeout)
 
 
+def xinfo_stream(node_addr: tuple[str, int], key: str,
+                 timeout: float = 12.0) -> dict:
+    """Ask for the stream at ``key`` itself, following leader
+    redirects like ``request`` — Redis XINFO STREAM.
+
+    One request serves the report through the leader's ReadIndex
+    path, so it reflects the committed state as of one read index,
+    exactly as linearizable as a ``get``. The reply is the plain
+    xinfo response (``status`` ``ok`` with ``length`` — the number
+    of entries — ``last_generated_id`` — the top ID, "0-0" when
+    the stream holds no entries yet — ``groups`` — how many
+    consumer groups the stream has — and ``first_entry`` /
+    ``last_entry`` — the [id, {field: value}] pairs at the ends of
+    the stream, None when it holds no entries — plus the
+    ``read_index`` / ``read_term`` they were measured at). A
+    missing key is a client error, not an empty report, and a
+    plain string value is one too."""
+    return request(node_addr, {"type": "client", "op": "xinfo",
+                               "sub": "STREAM", "key": key},
+                   timeout=timeout)
+
+
+def xinfo_groups(node_addr: tuple[str, int], key: str,
+                 timeout: float = 12.0) -> dict:
+    """Ask for the consumer groups on the stream at ``key``,
+    following leader redirects like ``request`` — Redis XINFO
+    GROUPS.
+
+    One request serves the report through the leader's ReadIndex
+    path, so it reflects the committed state as of one read index,
+    exactly as linearizable as a ``get``. The reply is the plain
+    xinfo response (``status`` ``ok`` with ``groups`` — one dict
+    per group, sorted by group name, each with ``name``,
+    ``last_delivered_id``, ``entries_read``, ``lag``, and
+    ``pending`` — plus the ``read_index`` / ``read_term`` they
+    were measured at). A missing key is a client error, not an
+    empty list, and a plain string value is one too."""
+    return request(node_addr, {"type": "client", "op": "xinfo",
+                               "sub": "GROUPS", "key": key},
+                   timeout=timeout)
+
+
+def xinfo_consumers(node_addr: tuple[str, int], key: str, group: str,
+                    timeout: float = 12.0) -> dict:
+    """Ask for the consumers of ``group`` on the stream at ``key``,
+    following leader redirects like ``request`` — Redis XINFO
+    CONSUMERS.
+
+    One request serves the report through the leader's ReadIndex
+    path, so it reflects the committed state as of one read index,
+    exactly as linearizable as a ``get``. The reply is the plain
+    xinfo response (``status`` ``ok`` with ``consumers`` — one
+    dict per consumer, sorted by consumer name, each with
+    ``name``, ``pending``, and ``idle`` the milliseconds since
+    that consumer was last handed an entry — plus the
+    ``read_index`` / ``read_term`` they were measured at). A
+    missing key or group is a client error, not an empty list,
+    and a plain string value is one too. A bad group never goes
+    on the wire and returns the server's error shape
+    instead."""
+    if not isinstance(group, str) or not group:
+        return {"type": "client_response", "status": "error",
+                "error": "xinfo group must be a non-empty "
+                         "string"}
+    return request(node_addr, {"type": "client", "op": "xinfo",
+                               "sub": "CONSUMERS", "key": key,
+                               "group": group},
+                   timeout=timeout)
+
+
 def geodist(node_addr: tuple[str, int], key: str, member1: str,
             member2: str, unit: str = "m",
             timeout: float = 12.0) -> dict:
@@ -5011,6 +5199,20 @@ def main(argv: list[str] | None = None) -> int:
              "({pending, min_id, max_id, consumers})")
     p_xpending.add_argument("key")
     p_xpending.add_argument("group")
+    p_xinfo = sub.add_parser(
+        "xinfo",
+        help="print stream introspection as JSON: STREAM reports "
+             "the stream itself ({length, last_generated_id, "
+             "groups, first_entry, last_entry}), GROUPS one dict "
+             "per consumer group, CONSUMERS one dict per consumer "
+             "of the group")
+    p_xinfo.add_argument("sub", choices=["STREAM", "GROUPS",
+                                         "CONSUMERS"],
+                         help="which report: STREAM, GROUPS, or "
+                              "CONSUMERS")
+    p_xinfo.add_argument("key")
+    p_xinfo.add_argument("group", nargs="?",
+                         help="consumer group, for CONSUMERS only")
     p_pfadd = sub.add_parser(
         "pfadd",
         help="add elements to the HyperLogLog at key and print 1 "
@@ -5223,6 +5425,7 @@ def main(argv: list[str] | None = None) -> int:
               "geoadd", "geodist",
               "xadd", "xtrim", "xlen", "xrange",
               "xgroup_create", "xreadgroup", "xack", "xpending",
+              "xinfo",
               "xgroup_setid", "xgroup_destroy", "xgroup_delconsumer",
               "setex", "expireat",
               "pexpireat"):
@@ -5411,6 +5614,12 @@ def main(argv: list[str] | None = None) -> int:
         msg["consumer"] = args.consumer
     if op == "xpending":
         msg["group"] = args.group
+    if op == "xinfo":
+        msg["sub"] = args.sub
+        if args.sub == "CONSUMERS":
+            if args.group is None:
+                parser.error("xinfo CONSUMERS takes a group")
+            msg["group"] = args.group
     if op == "pfadd":
         msg["elements"] = args.elements
     if op == "hset":
@@ -5543,6 +5752,19 @@ def main(argv: list[str] | None = None) -> int:
                               "min_id": resp.get("min_id"),
                               "max_id": resp.get("max_id"),
                               "consumers": resp.get("consumers")}))
+        elif op == "xinfo":
+            if args.sub == "GROUPS":
+                print(json.dumps(resp.get("groups")))
+            elif args.sub == "CONSUMERS":
+                print(json.dumps(resp.get("consumers")))
+            else:
+                print(json.dumps({
+                    "length": resp.get("length"),
+                    "last_generated_id":
+                        resp.get("last_generated_id"),
+                    "groups": resp.get("groups"),
+                    "first_entry": resp.get("first_entry"),
+                    "last_entry": resp.get("last_entry")}))
         elif op == "geodist":
             dist = resp.get("distance")
             print(dist if dist is not None else "(nil)")
