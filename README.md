@@ -922,6 +922,11 @@ logic and the failure handling, not the key-value API on top.
   answers how many actually left the pending list. XPENDING
   answers the summary: the pending count, the smallest and largest
   pending ID, and the per-consumer counts sorted by consumer name.
+  Since v0.71.0 it also answers the per-entry form — see the
+  changelog below — one dict per pending entry, in ID order, with
+  who holds it, how many times it has been delivered, and how
+  long it has been idle, bounded by an ID range, capped by a
+  count, and filterable by consumer and by a minimum idle time.
   The groups ride in the stream blob with the entries, so they
   survive snapshots and replay exactly like the entries, and the
   blob stays a pure function of (entries, groups), so every node
@@ -948,8 +953,7 @@ logic and the failure handling, not the key-value API on top.
   and `{"op": "xack", ...}` are pipeline ops too; like other reads,
   XPENDING is not one. The honest limits are the same growth as
   xadd — the whole stream is one blob, so a readgroup still scans
-  the blob — and the scope: XPENDING answers the summary form only,
-  not the per-entry form — and XTRIM's ACKED mode behaves like
+  the blob — and the scope: XTRIM's ACKED mode behaves like
   KEEPREF in this version.
 - **Streams (XGROUP SETID / DESTROY / DELCONSUMER)** — since
   v0.69.0 `xgroup_setid key group [id] [--entries-read n]`,
@@ -4096,7 +4100,50 @@ entries left in `log.jsonl` are dropped by their index on reload.
   session methods, the module functions from a follower, a
   pipelined readgroup stamping its consumer, snapshot + restart
   survival, and the CLI end to end.
+- ~~Streams (XPENDING per-entry)~~ — done in v0.71.0, Nov 27, 2026:
+  `xpending key group start end [count] [--consumer c]
+  [--idle ms]` is XPENDING in per-entry form — Redis XPENDING with
+  a range: one dict per pending entry, in ID order, with `id`,
+  `consumer` — who holds it — `idle` — the milliseconds since it
+  was last delivered — and `deliveries` — how many times it has
+  been handed out. The range bounds the IDs ("-" the start of the
+  stream, "+" the end, a bare millisecond naming that millisecond
+  with sequence 0, like XRANGE), the count caps the list, the
+  consumer keeps only the entries one consumer holds, and the
+  minimum idle keeps only the entries idle at least that long.
+  The idle time is tracked, not guessed: every xreadgroup stamps
+  the wall-clock millisecond of the delivery — fixed by the leader
+  at log time, like an xadd auto ID — on each pending entry it
+  creates or re-delivers, in the stream blob, so it survives
+  snapshots and replay like the rest of the group; a re-read
+  raises the delivery count and re-stamps the idle, so the idle
+  measures since the latest handover. An entry whose deliveries
+  all came from replays of pre-v0.71.0 log entries carries no
+  stamp, so its idle is None rather than a fabricated number, and
+  a minimum idle skips it, since it cannot prove it has been idle
+  that long. It is a pure read through the same ReadIndex path as
+  a `get`, so it is exactly as linearizable, and like other reads
+  it is not a pipeline op; a missing key or group — or a plain
+  string value, or a bad bound, count, consumer, or minimum idle
+  — fails as a client error, not an empty list. `Session` methods,
+  `client` module functions, and the `xpending` command on the
+  CLI, which still answers the summary form with two arguments.
+  `tests/test_xpending_entries.py` proves it: store-level the
+  entry list with exact idle times from fixed stamps, a re-read
+  raising the delivery count and re-stamping the idle, an ack
+  dropping the entry from the list, the range / count / consumer /
+  minimum-idle filters composing, an unstamped entry with an idle
+  of None and skipped by a minimum idle, a clock-ahead stamp
+  clamping at 0, missing keys and groups, wrongtype, and bad
+  arguments; the stamps surviving a snapshot load; and
+  cluster-level the full flow replicated to every node, idle times
+  that grow as time passes, the filters end to end, an ack
+  dropping the entry while the summary form still answers, bad
+  arguments as client errors with no log entry, session methods,
+  the module functions from a follower, snapshot + restart
+  survival, and the CLI end to end.
   The roadmap is exhausted again, so the next real thing is
   a new roadmap item grounded in this project's purpose,
-  proposed by the next run — candidates: XPENDING in per-entry
-  form.
+  proposed by the next run — candidates: XCLAIM, taking over a
+  pending entry from a dead consumer, or XAUTOCLAIM, the same
+  claim in bulk.

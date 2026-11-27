@@ -229,21 +229,23 @@ def geo_distance(lon1: float, lat1: float, lon2: float,
 # when asked. XREADGROUP (v0.67.0) adds consumer groups to the
 # same blob: an optional "groups" key mapping a group name to
 # {"last_delivered": "ms-seq" or None, "pending": {"ms-seq":
-# {"consumer": name, "deliveries": n}}} — the last entry the
-# group was handed (None when it was created on an empty stream
-# with "$", so every later entry counts as new), and the pending
-# entries list: every entry handed out and not yet acked, with
-# which consumer holds it and how many times it has been
-# delivered. Since v0.69.0 a group may also carry "entries_read",
-# the count an XGROUP SETID ... ENTRIESREAD set — XGROUP SETID
-# moves last_delivered (and optionally entries_read), XGROUP
-# DESTROY drops the whole group, and XGROUP DELCONSUMER drops
-# one consumer and its pending entries. Since v0.70.0 a group may
-# also carry "consumers", a map of consumer name to
-# {"last_seen_ms": n} — the wall-clock millisecond of the last
-# delivery that consumer was handed, fixed by the leader at log
-# time (like an xadd auto ID), so XINFO CONSUMERS can report how
-# long each consumer has been idle. A consumer only appears there
+# {"consumer": name, "deliveries": n, "delivered_ms": ms}}} — the
+# last entry the group was handed (None when it was created on an
+# empty stream with "$", so every later entry counts as new), and
+# the pending entries list: every entry handed out and not yet
+# acked, with which consumer holds it, how many times it has been
+# delivered, and — since v0.71.0 — the wall-clock millisecond of
+# its last delivery, so XPENDING in per-entry form can report how
+# long each entry has been idle. Since v0.69.0 a group may also
+# carry "entries_read", the count an XGROUP SETID ... ENTRIESREAD
+# set — XGROUP SETID moves last_delivered (and optionally
+# entries_read), XGROUP DESTROY drops the whole group, and XGROUP
+# DELCONSUMER drops one consumer and its pending entries. Since
+# v0.70.0 a group may also carry "consumers", a map of consumer
+# name to {"last_seen_ms": n} — the wall-clock millisecond of the
+# last delivery that consumer was handed, fixed by the leader at
+# log time (like an xadd auto ID), so XINFO CONSUMERS can report
+# how long each consumer has been idle. A consumer only appears there
 # once it has been handed at least one entry: a readgroup that
 # hands out nothing writes nothing at all, so a consumer that
 # only ever polled an empty group is not listed. The groups ride
@@ -375,12 +377,15 @@ def _is_group_map(groups) -> bool:
     """Whether ``groups`` is a well-formed consumer-group map:
     a dict of non-empty group name to {"last_delivered": "ms-seq"
     or None, "pending": {"ms-seq": {"consumer": name,
-    "deliveries": n}}} — the last entry handed to the group (None
-    when it was created on an empty stream with "$"), and the
-    pending entries: every entry handed out and not yet acked,
-    with which consumer holds it and how many times it has been
-    delivered (at least 1 — an entry with 0 deliveries was never
-    handed out). Since v0.69.0 a group may also carry
+    "deliveries": n, "delivered_ms": ms}}} — the last entry handed
+    to the group (None when it was created on an empty stream with
+    "$"), and the pending entries: every entry handed out and not
+    yet acked, with which consumer holds it, how many times it has
+    been delivered (at least 1 — an entry with 0 deliveries was
+    never handed out), and — since v0.71.0 — the wall-clock
+    millisecond of its last delivery, absent for an entry whose
+    deliveries all came from replays of pre-v0.71.0 log entries,
+    which carry no stamp. Since v0.69.0 a group may also carry
     "entries_read" — the count an XGROUP SETID ... ENTRIESREAD
     set, a non-negative integer, absent when no SETID ever set
     it. Since v0.70.0 a group may also carry "consumers" — a map
@@ -437,7 +442,9 @@ def _is_group_map(groups) -> bool:
             except ValueError:
                 return False
             if (not isinstance(info, dict)
-                    or set(info) != {"consumer", "deliveries"}):
+                    or not {"consumer", "deliveries"} <= set(info)
+                    or not set(info) <= {"consumer", "deliveries",
+                                         "delivered_ms"}):
                 return False
             if (not isinstance(info["consumer"], str)
                     or not info["consumer"]):
@@ -447,6 +454,12 @@ def _is_group_map(groups) -> bool:
                     or isinstance(deliveries, bool)
                     or deliveries < 1):
                 return False
+            if "delivered_ms" in info:
+                delivered_ms = info["delivered_ms"]
+                if (not isinstance(delivered_ms, int)
+                        or isinstance(delivered_ms, bool)
+                        or delivered_ms < 0):
+                    return False
     return True
 
 
@@ -2189,13 +2202,18 @@ class KVStore:
             # wall-clock millisecond the leader fixed at log time
             # (command "seen_ms", like an xadd auto ID) — in the
             # group's "consumers" map, so XINFO CONSUMERS can
-            # report how long each consumer has been idle; an
-            # entry logged before v0.70.0 carries no seen_ms, so
-            # replaying one simply records no sighting instead
-            # of failing, and a hand-built entry with a bad one
-            # still raises. A NOACK delivery stamps it too — the
-            # consumer interacted and received entries — and so
-            # does a re-read; only a read that hands out nothing
+            # report how long each consumer has been idle, and
+            # stamps the same millisecond on each pending entry
+            # it creates or re-delivers — its "delivered_ms" —
+            # so XPENDING in per-entry form can report how long
+            # each entry has been idle; an entry logged before
+            # v0.71.0 carries no stamp on the entry itself, so
+            # replaying one simply records no delivery time
+            # instead of failing, and a hand-built entry with a
+            # bad one still raises. A NOACK delivery stamps the
+            # consumer's last-seen time too — the consumer
+            # interacted and received entries — and so does a
+            # re-read; only a read that hands out nothing
             # records nothing, since it writes nothing at all.
             key = command["key"]
             group = command.get("group")
@@ -2267,8 +2285,11 @@ class KVStore:
                 if chosen:
                     if not noack:
                         for eid, _fields in chosen:
-                            state["pending"][eid] = {
-                                "consumer": consumer, "deliveries": 1}
+                            info = {"consumer": consumer,
+                                    "deliveries": 1}
+                            if seen_ms is not None:
+                                info["delivered_ms"] = seen_ms
+                            state["pending"][eid] = info
                     state["last_delivered"] = chosen[-1][0]
             else:
                 # Pending entries: the consumer's own unacked
@@ -2293,6 +2314,8 @@ class KVStore:
                         break
                     chosen.append((eid, by_id[eid]))
                     info["deliveries"] += 1
+                    if seen_ms is not None:
+                        info["delivered_ms"] = seen_ms
             if chosen:
                 if seen_ms is not None:
                     state.setdefault("consumers", {})[consumer] = {
@@ -3088,6 +3111,97 @@ class KVStore:
                 "min_id": ids[0] if ids else None,
                 "max_id": ids[-1] if ids else None,
                 "consumers": [[c, counts[c]] for c in sorted(counts)]}
+
+    def xpending_entries(self, key: str, group: str, now_ms: int,
+                         start: str = "-", end: str = "+",
+                         count: int | None = None,
+                         consumer: str | None = None,
+                         min_idle_ms: int | None = None) -> list[dict]:
+        """The individual pending entries of ``group`` on the stream
+        at ``key`` — Redis XPENDING, per-entry form: one dict per
+        pending entry, in ID order, carrying ``id``, ``consumer``
+        — who holds it — ``idle`` — the milliseconds since it was
+        last delivered, None when it was never delivered through a
+        delivery this version stamped (a replay of a pre-v0.71.0
+        log entry carries no stamp) — and ``deliveries`` — how
+        many times it has been handed out. ``start`` / ``end``
+        bound the IDs, "-" the start of the stream and "+" the
+        end, a bare millisecond naming that millisecond with
+        sequence 0, like XRANGE; ``count`` caps the list, None
+        for no cap; ``consumer`` keeps only the entries one
+        consumer holds; ``min_idle_ms`` keeps only the entries
+        idle at least that long — an entry with an unknown idle
+        cannot prove it has been idle that long, so it is skipped
+        when a minimum is given. ``now_ms`` is the wall-clock
+        millisecond the idle is measured against, so the store
+        itself never reads a clock: the caller passes its own
+        now, and the idle is clamped at 0, so a stamp from a
+        leader whose clock runs ahead never reads as a negative
+        idle. Raises TypeError when the value is a plain string:
+        an XPENDING reads a stream, not bytes, so a string key is
+        WRONGTYPE, like an xlen on a plain string. Raises
+        ValueError when the key does not exist or the group does
+        not exist on it: Redis's NOGROUP, a missing group is an
+        error, not an empty list — a typo'd group name must not
+        read as "nothing pending" — and for a bad bound, count,
+        consumer, or minimum idle. Pure read: no log entry, no
+        state change."""
+        if (not isinstance(start, str)
+                or not isinstance(end, str)):
+            raise ValueError(
+                "xpending start and end must be stream ID bounds")
+        start_bound = parse_stream_range_bound(start)
+        end_bound = parse_stream_range_bound(end)
+        if count is not None and (
+                not isinstance(count, int) or isinstance(count, bool)
+                or count < 0):
+            raise ValueError(
+                "xpending count must be a non-negative integer")
+        if consumer is not None and (
+                not isinstance(consumer, str) or not consumer):
+            raise ValueError(
+                "xpending consumer must be a non-empty string")
+        if min_idle_ms is not None and (
+                not isinstance(min_idle_ms, int)
+                or isinstance(min_idle_ms, bool) or min_idle_ms < 0):
+            raise ValueError(
+                "xpending min_idle_ms must be a non-negative "
+                "integer")
+        value = self._data.get(key)
+        if value is None:
+            raise ValueError(
+                f"xpending failed: no such key {key!r} or consumer "
+                f"group {group!r}")
+        if not is_stream(value):
+            raise TypeError(
+                f"xpending failed: value of {key!r} is not a stream")
+        groups = _stream_data(value).get("groups", {})
+        if group not in groups:
+            raise ValueError(
+                f"xpending failed: no such key {key!r} or consumer "
+                f"group {group!r}")
+        pending = groups[group]["pending"]
+        entries: list[dict] = []
+        for entry_id in sorted(pending, key=parse_stream_id):
+            parsed = parse_stream_id(entry_id)
+            if parsed < start_bound or parsed > end_bound:
+                continue
+            info = pending[entry_id]
+            if consumer is not None and info["consumer"] != consumer:
+                continue
+            delivered_ms = info.get("delivered_ms")
+            idle = (None if delivered_ms is None
+                    else max(0, now_ms - delivered_ms))
+            if min_idle_ms is not None and (
+                    idle is None or idle < min_idle_ms):
+                continue
+            if count is not None and len(entries) >= count:
+                break
+            entries.append({"id": entry_id,
+                            "consumer": info["consumer"],
+                            "idle": idle,
+                            "deliveries": info["deliveries"]})
+        return entries
 
     def xinfo_stream(self, key: str) -> dict:
         """The stream at ``key`` itself — Redis XINFO STREAM:

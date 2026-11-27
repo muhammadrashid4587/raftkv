@@ -1394,6 +1394,86 @@ class Session:
                 self.last_read_term = int(resp.get("read_term") or 0)
         return resp
 
+    def xpending_entries(self, key: str, group: str,
+                         start: str = "-", end: str = "+",
+                         count: int | None = None,
+                         consumer: str | None = None,
+                         min_idle_ms: int | None = None) -> dict:
+        """Ask for the individual pending entries of ``group`` on
+        the stream at ``key``, Redis XPENDING, per-entry form: the
+        reply carries ``entries`` — one dict per entry handed out
+        and not yet acked, in ID order, each with ``id``,
+        ``consumer`` — who holds it — ``idle`` — the milliseconds
+        since it was last delivered, None when it was never
+        delivered through a delivery this version stamped — and
+        ``deliveries`` — how many times it has been handed out.
+        ``start`` / ``end`` bound the IDs ("-" the start of the
+        stream, "+" the end, a bare millisecond naming that
+        millisecond with sequence 0), ``count`` caps the list,
+        ``consumer`` keeps only the entries one consumer holds,
+        and ``min_idle_ms`` keeps only the entries idle at least
+        that long. A missing key or group is a client error — not
+        an empty list — and a plain string value is one too. A bad
+        group, bound, count, consumer, or minimum idle never goes
+        on the wire and returns the server's error shape instead.
+        It rides the same ReadIndex path as ``get``, so it carries
+        the same session watermark and advances the read watermark
+        from the reply's ``read_index`` exactly the same way: a
+        list queried after your own xreadgroup counts the entries
+        that read handed out, and a later read never goes
+        backwards past it."""
+        if not isinstance(group, str) or not group:
+            return {"type": "client_response", "status": "error",
+                    "error": "xpending group must be a non-empty "
+                             "string"}
+        if not isinstance(start, str) or not isinstance(end, str):
+            return {"type": "client_response", "status": "error",
+                    "error": "xpending start and end must be "
+                             "stream ID bounds"}
+        if count is not None and (
+                not isinstance(count, int) or isinstance(count, bool)
+                or count < 0):
+            return {"type": "client_response", "status": "error",
+                    "error": "xpending count must be a non-negative "
+                             "integer"}
+        if consumer is not None and (
+                not isinstance(consumer, str) or not consumer):
+            return {"type": "client_response", "status": "error",
+                    "error": "xpending consumer must be a "
+                             "non-empty string"}
+        if min_idle_ms is not None and (
+                not isinstance(min_idle_ms, int)
+                or isinstance(min_idle_ms, bool) or min_idle_ms < 0):
+            return {"type": "client_response", "status": "error",
+                    "error": "xpending min_idle_ms must be a "
+                             "non-negative integer"}
+        if self.last_read_index > self.last_write_index:
+            min_index = self.last_read_index
+            term = self.last_read_term
+        else:
+            min_index = self.last_write_index
+            term = self.last_write_term
+        msg: dict = {"type": "client", "op": "xpending_entries",
+                     "key": key, "group": group,
+                     "start": start, "end": end,
+                     "client_id": self.client_id,
+                     "min_commit_index": min_index,
+                     "session_term": term}
+        if count is not None:
+            msg["count"] = count
+        if consumer is not None:
+            msg["consumer"] = consumer
+        if min_idle_ms is not None:
+            msg["min_idle_ms"] = min_idle_ms
+        resp = request(self.node_addr, msg, pool=self._pooled)
+        if (resp.get("status") == "ok"
+                and resp.get("read_index") is not None):
+            read_index = int(resp["read_index"])
+            if read_index > self.last_read_index:
+                self.last_read_index = read_index
+                self.last_read_term = int(resp.get("read_term") or 0)
+        return resp
+
     def xinfo_stream(self, key: str) -> dict:
         """Ask for the stream at ``key`` itself, Redis XINFO STREAM:
         the reply carries ``length`` — the number of entries —
@@ -3977,6 +4057,70 @@ def xpending(node_addr: tuple[str, int], key: str, group: str,
                    timeout=timeout)
 
 
+def xpending_entries(node_addr: tuple[str, int], key: str, group: str,
+                     start: str = "-", end: str = "+",
+                     count: int | None = None,
+                     consumer: str | None = None,
+                     min_idle_ms: int | None = None,
+                     timeout: float = 12.0) -> dict:
+    """Ask for the individual pending entries of ``group`` on the
+    stream at ``key``, following leader redirects like ``request``
+    — Redis XPENDING, per-entry form.
+
+    One request serves the list through the leader's ReadIndex
+    path, so it reflects the committed state as of one read index,
+    exactly as linearizable as a ``get``. The reply is the plain
+    xpending response (``status`` ``ok`` with ``entries`` — one
+    dict per entry handed out and not yet acked, in ID order, each
+    with ``id``, ``consumer`` who holds it, ``idle`` the
+    milliseconds since it was last delivered (None when it was
+    never delivered through a delivery this version stamped), and
+    ``deliveries`` how many times it has been handed out — plus
+    the ``read_index`` / ``read_term`` they were measured at).
+    ``start`` / ``end`` bound the IDs, ``count`` caps the list,
+    ``consumer`` keeps only one consumer's entries, and
+    ``min_idle_ms`` keeps only the entries idle at least that
+    long. A missing key or group is a client error, not an empty
+    list, and a plain string value is one too. A bad group, bound,
+    count, consumer, or minimum idle never goes on the wire and
+    returns the server's error shape instead."""
+    if not isinstance(group, str) or not group:
+        return {"type": "client_response", "status": "error",
+                "error": "xpending group must be a non-empty "
+                         "string"}
+    if not isinstance(start, str) or not isinstance(end, str):
+        return {"type": "client_response", "status": "error",
+                "error": "xpending start and end must be stream ID "
+                         "bounds"}
+    if count is not None and (
+            not isinstance(count, int) or isinstance(count, bool)
+            or count < 0):
+        return {"type": "client_response", "status": "error",
+                "error": "xpending count must be a non-negative "
+                         "integer"}
+    if consumer is not None and (
+            not isinstance(consumer, str) or not consumer):
+        return {"type": "client_response", "status": "error",
+                "error": "xpending consumer must be a non-empty "
+                         "string"}
+    if min_idle_ms is not None and (
+            not isinstance(min_idle_ms, int)
+            or isinstance(min_idle_ms, bool) or min_idle_ms < 0):
+        return {"type": "client_response", "status": "error",
+                "error": "xpending min_idle_ms must be a "
+                         "non-negative integer"}
+    msg: dict = {"type": "client", "op": "xpending_entries",
+                 "key": key, "group": group,
+                 "start": start, "end": end}
+    if count is not None:
+        msg["count"] = count
+    if consumer is not None:
+        msg["consumer"] = consumer
+    if min_idle_ms is not None:
+        msg["min_idle_ms"] = min_idle_ms
+    return request(node_addr, msg, timeout=timeout)
+
+
 def xinfo_stream(node_addr: tuple[str, int], key: str,
                  timeout: float = 12.0) -> dict:
     """Ask for the stream at ``key`` itself, following leader
@@ -5196,9 +5340,28 @@ def main(argv: list[str] | None = None) -> int:
         "xpending",
         help="print the pending-entries summary for a consumer "
              "group on the stream at key as JSON "
-             "({pending, min_id, max_id, consumers})")
+             "({pending, min_id, max_id, consumers}); with start "
+             "end count, print the individual pending entries "
+             "instead, one dict per entry ({id, consumer, idle, "
+             "deliveries})")
     p_xpending.add_argument("key")
     p_xpending.add_argument("group")
+    p_xpending.add_argument("start", nargs="?",
+                            help="first ID of the per-entry range "
+                                 "(\"-\", a bare millisecond, or a "
+                                 "full ms-seq)")
+    p_xpending.add_argument("end", nargs="?",
+                            help="last ID of the per-entry range "
+                                 "(\"+\", a bare millisecond, or a "
+                                 "full ms-seq)")
+    p_xpending.add_argument("count", nargs="?", type=int,
+                            help="at most this many pending entries")
+    p_xpending.add_argument("--consumer", default=None,
+                            help="keep only the entries one "
+                                 "consumer holds")
+    p_xpending.add_argument("--idle", type=int, default=None,
+                            help="keep only the entries idle at "
+                                 "least this many milliseconds")
     p_xinfo = sub.add_parser(
         "xinfo",
         help="print stream introspection as JSON: STREAM reports "
@@ -5614,6 +5777,18 @@ def main(argv: list[str] | None = None) -> int:
         msg["consumer"] = args.consumer
     if op == "xpending":
         msg["group"] = args.group
+        if args.start is not None:
+            # Per-entry form: a start bound turns the summary
+            # into the list of individual pending entries.
+            msg["op"] = "xpending_entries"
+            msg["start"] = args.start
+            msg["end"] = args.end if args.end is not None else "+"
+            if args.count is not None:
+                msg["count"] = args.count
+            if args.consumer is not None:
+                msg["consumer"] = args.consumer
+            if args.idle is not None:
+                msg["min_idle_ms"] = args.idle
     if op == "xinfo":
         msg["sub"] = args.sub
         if args.sub == "CONSUMERS":
@@ -5748,10 +5923,14 @@ def main(argv: list[str] | None = None) -> int:
         elif op == "xgroup_delconsumer":
             print(resp.get("xgroup_delconsumer"))
         elif op == "xpending":
-            print(json.dumps({"pending": resp.get("pending"),
-                              "min_id": resp.get("min_id"),
-                              "max_id": resp.get("max_id"),
-                              "consumers": resp.get("consumers")}))
+            if args.start is not None:
+                print(json.dumps(resp.get("entries")))
+            else:
+                print(json.dumps({"pending": resp.get("pending"),
+                                  "min_id": resp.get("min_id"),
+                                  "max_id": resp.get("max_id"),
+                                  "consumers":
+                                      resp.get("consumers")}))
         elif op == "xinfo":
             if args.sub == "GROUPS":
                 print(json.dumps(resp.get("groups")))

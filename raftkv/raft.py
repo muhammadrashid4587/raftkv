@@ -2720,6 +2720,82 @@ class RaftNode:
                                     min_index=min_index,
                                     session_term=session_term,
                                     stale_ok=bool(msg.get("stale_ok")))
+        if op == "xpending_entries":
+            # The individual pending entries of one consumer group:
+            # one dict per entry handed out and not yet acked, in
+            # ID order, with who holds it, how many times it has
+            # been delivered, and how long it has been idle —
+            # Redis XPENDING, per-entry form. It rides the same
+            # ReadIndex/lease path as a ``get`` — one leadership
+            # confirmation, one apply wait — so the list reflects
+            # the committed state as of the read index it names,
+            # exactly as linearizable, and a session read carries
+            # the same watermark a get would. The group must be a
+            # non-empty string, the bounds strings, the count a
+            # non-negative integer, the consumer a non-empty
+            # string when one is given, and the minimum idle a
+            # non-negative integer when one is given: a bad one
+            # is a client error, not a list of nonsense. Whether
+            # the key or the group exists is decided at serve
+            # time, like xlen's wrongtype: a missing key or group
+            # is an error in the payload (see _serve_read), not an
+            # empty list — a typo'd group name must not read as
+            # "nothing pending" — and a bad bound is the same
+            # kind of error, from the store's own validation.
+            if self._is_removed():
+                return {"type": "client_response", "status": "error",
+                        "error": "this node was removed from the cluster"}
+            group = msg.get("group")
+            if not isinstance(group, str) or not group:
+                return {"type": "client_response", "status": "error",
+                        "error": "xpending group must be a non-empty "
+                                 "string"}
+            if (not isinstance(msg.get("key"), str)
+                    or not msg.get("key")):
+                return {"type": "client_response", "status": "error",
+                        "error": "xpending key must be a non-empty "
+                                 "string"}
+            start = msg.get("start", "-")
+            end = msg.get("end", "+")
+            if not isinstance(start, str) or not isinstance(end, str):
+                return {"type": "client_response", "status": "error",
+                        "error": "xpending start and end must be "
+                                 "stream ID bounds"}
+            count = msg.get("count")
+            if count is not None and (
+                    not isinstance(count, int)
+                    or isinstance(count, bool) or count < 0):
+                return {"type": "client_response", "status": "error",
+                        "error": "xpending count must be a "
+                                 "non-negative integer"}
+            consumer = msg.get("consumer")
+            if consumer is not None and (
+                    not isinstance(consumer, str) or not consumer):
+                return {"type": "client_response", "status": "error",
+                        "error": "xpending consumer must be a "
+                                 "non-empty string"}
+            min_idle_ms = msg.get("min_idle_ms")
+            if min_idle_ms is not None and (
+                    not isinstance(min_idle_ms, int)
+                    or isinstance(min_idle_ms, bool)
+                    or min_idle_ms < 0):
+                return {"type": "client_response", "status": "error",
+                        "error": "xpending min_idle_ms must be a "
+                                 "non-negative integer"}
+            min_index, session_term, error = self._parse_read_params(msg)
+            if error is not None:
+                return error
+            return self._serve_read(
+                xpending_entries_key=msg.get("key"),
+                xpending_entries_group=group,
+                xpending_entries_start=start,
+                xpending_entries_end=end,
+                xpending_entries_count=count,
+                xpending_entries_consumer=consumer,
+                xpending_entries_min_idle_ms=min_idle_ms,
+                min_index=min_index,
+                session_term=session_term,
+                stale_ok=bool(msg.get("stale_ok")))
         if op == "xinfo":
             # Stream introspection: XINFO STREAM (the stream
             # itself: length, top ID, group count, first / last
@@ -4972,6 +5048,13 @@ class RaftNode:
                     xread_block_ms: int | None = None,
                     xpending_key: str | None = None,
                     xpending_group: str | None = None,
+                    xpending_entries_key: str | None = None,
+                    xpending_entries_group: str | None = None,
+                    xpending_entries_start: str = "-",
+                    xpending_entries_end: str = "+",
+                    xpending_entries_count: int | None = None,
+                    xpending_entries_consumer: str | None = None,
+                    xpending_entries_min_idle_ms: int | None = None,
                     xinfo_key: str | None = None,
                     xinfo_sub: str = "STREAM",
                     xinfo_group: str | None = None,
@@ -5133,6 +5216,24 @@ class RaftNode:
         client error, not a summary, and a missing key or group
         is one too — a typo'd group name must not read as
         "nothing pending".
+        ``xpending_entries_key`` / ``xpending_entries_group`` serve
+        the individual pending entries of one consumer group
+        instead — one dict per entry handed out and not yet acked,
+        in ID order, with ``id``, ``consumer`` who holds it,
+        ``idle`` the milliseconds since it was last delivered
+        (None when it was never delivered through a delivery this
+        version stamped), and ``deliveries`` how many times it has
+        been handed out — Redis XPENDING in per-entry form, with
+        ``xpending_entries_start`` / ``xpending_entries_end``
+        bounding the IDs, ``xpending_entries_count`` capping the
+        list, ``xpending_entries_consumer`` keeping only one
+        consumer's entries, and ``xpending_entries_min_idle_ms``
+        keeping only the entries idle at least that long — read
+        off the applied state machine the same way, so it is
+        exactly as linearizable as a ``get``; a plain string value
+        is a client error, not a list, and a missing key or group
+        — or a bad bound, count, consumer, or minimum idle — is
+        one too.
         ``xinfo_key`` serves stream introspection instead —
         ``xinfo_sub`` naming which: STREAM reports the stream
         itself (``length``, ``last_generated_id``, ``groups``
@@ -5161,7 +5262,7 @@ class RaftNode:
         appear in a later page if it sorts ahead of the cursor.
         Everything else — the lease fast path, the pending-read wait,
         the fallback, the redirect on leadership loss — is identical
-        for all nineteen shapes, so a scan or a TTL query is exactly as
+        for all twenty shapes, so a scan or a TTL query is exactly as
         linearizable as a single ``get``.
 
         A stale read (``stale_ok``) is the one exception to the
@@ -5513,6 +5614,34 @@ class RaftNode:
                 try:
                     return self.sm.xpending(xpending_key,
                                             xpending_group)
+                except (TypeError, ValueError) as e:
+                    return {"status": "error", "error": str(e)}
+            if xpending_entries_key is not None:
+                # The individual pending entries of one consumer
+                # group: one dict per entry handed out and not yet
+                # acked, in ID order, with who holds it, how many
+                # times it has been delivered, and how long it has
+                # been idle — Redis XPENDING, per-entry form —
+                # with the same wrongtype rule as xlen: a plain
+                # string value is a client error, not a list,
+                # carried the same way, overriding the "ok" in the
+                # response literal. A missing key or group — or a
+                # bad bound, count, consumer, or minimum idle —
+                # is the same kind of error, from the store's own
+                # validation. The idle times are measured against
+                # this node's wall clock at serve time, clamped
+                # at 0 in the store, so a stamp from a leader
+                # whose clock runs ahead never reads as a
+                # negative idle.
+                try:
+                    return {"entries": self.sm.xpending_entries(
+                        xpending_entries_key, xpending_entries_group,
+                        int(time.time() * 1000),
+                        start=xpending_entries_start,
+                        end=xpending_entries_end,
+                        count=xpending_entries_count,
+                        consumer=xpending_entries_consumer,
+                        min_idle_ms=xpending_entries_min_idle_ms)}
                 except (TypeError, ValueError) as e:
                     return {"status": "error", "error": str(e)}
             if xinfo_key is not None:
