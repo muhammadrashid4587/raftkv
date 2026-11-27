@@ -132,7 +132,9 @@ class Session:
                     "setrange_failed", "setbit_failed",
                     "bitop_failed",
                     "pfadd_failed", "hset_failed", "hdel_failed",
-                    "geoadd_failed", "xadd_failed", "xtrim_failed")
+                    "geoadd_failed", "xadd_failed", "xtrim_failed",
+                    "xgroup_create_failed", "xreadgroup_failed",
+                    "xack_failed")
                 and resp.get("index") is not None):
             self.last_write_index = int(resp["index"])
             self.last_write_term = int(resp.get("term") or 0)
@@ -1030,8 +1032,9 @@ class Session:
         ``approximate`` ("~" in Redis) is accepted and ignored —
         this store trims exactly — and ``mode`` is KEEPREF, DELREF,
         or ACKED when one is given: those govern consumer-group
-        references, and there are no consumer groups yet, so the
-        mode is accepted and ignored too. A bad strategy,
+        references — DELREF, and no mode at all, drops the pending
+        reference of a trimmed entry, KEEPREF keeps it, and ACKED
+        behaves like KEEPREF in this version. A bad strategy,
         threshold, or mode never goes on the wire and returns the
         server's error shape instead. The outcome is decided at
         apply time, at the entry's position in the log, so a retry
@@ -1076,6 +1079,177 @@ class Session:
         if mode is not None:
             msg["mode"] = mode.upper()
         return self._write(msg)
+
+    def xgroup_create(self, key: str, group: str,
+                      start_id: str = "$",
+                      mkstream: bool = False) -> dict:
+        """Create a consumer group on the stream at ``key``, Redis
+        XGROUP CREATE: the group starts reading from
+        ``start_id`` — "$" (only entries appended after the group
+        is created, the default), "0" (from the very first entry),
+        a bare millisecond, or a full "ms-seq" — and the reply
+        carries ``xgroup_create`` 1. With ``mkstream`` a missing
+        key is created as an empty stream, like an xadd creating
+        its key; without it a missing key fails with
+        ``xgroup_create_failed`` and reason ``no_group``. A group
+        that already exists fails the same way, reason
+        ``group_exists``, and a plain string value fails with
+        reason ``wrongtype``. A bad group name or start ID never
+        goes on the wire and returns the server's error shape
+        instead. The outcome is decided at apply time, at the
+        entry's position in the log, so a retry with the same
+        session id returns the first attempt's result instead of
+        creating the group twice, and a successful create keeps
+        the key's TTL deadline, like an xadd. A successful create
+        advances the write watermark from the reply's index, like
+        any other write — and so does a failed one, since it still
+        committed its entry."""
+        if not isinstance(group, str) or not group:
+            return {"type": "client_response", "status": "error",
+                    "error": "xgroup_create group must be a "
+                             "non-empty string"}
+        if not isinstance(start_id, str):
+            return {"type": "client_response", "status": "error",
+                    "error": "xgroup_create start_id must be a "
+                             "string"}
+        msg: dict = {"type": "client", "op": "xgroup_create",
+                     "key": key, "group": group,
+                     "start_id": start_id}
+        if mkstream:
+            msg["mkstream"] = True
+        return self._write(msg)
+
+    def xreadgroup(self, key: str, group: str, consumer: str,
+                   id: str = ">", count: int | None = None,
+                   noack: bool = False) -> dict:
+        """Read entries for one consumer of one group on the
+        stream at ``key``, Redis XREADGROUP: with ``id`` ">" (the
+        default) the group hands the consumer the entries appended
+        after its last delivery — in ID order, at most ``count``
+        of them when a count is given — and marks each one pending
+        for that consumer, moving the group's last delivery to the
+        last entry handed out; with any other ID ("0", a bare
+        millisecond, or a full "ms-seq") it re-reads the
+        consumer's own pending entries — the ones already handed
+        to this consumer and not yet acked, at or after the given
+        ID — and each re-read raises that entry's delivery count
+        by one. With ``noack`` the entries are delivered without
+        being recorded pending, though the last delivery still
+        advances. The reply carries ``entries`` — the [id, {field:
+        value}] pairs in ID order, an empty list when the group
+        has nothing for this consumer. A missing key or group
+        fails with ``xreadgroup_failed`` and reason ``no_group``,
+        and a plain string value fails with reason ``wrongtype``.
+        A bad group, consumer, ID, or count never goes on the wire
+        and returns the server's error shape instead. This is a
+        write, not a read: handing entries out mutates the pending
+        list and the last delivery, and the mutation replicates
+        through the log like any other, so a retry with the same
+        session id returns the first attempt's entries instead of
+        delivering them twice — a redelivery only ever comes from
+        a fresh explicit-ID read, never from a retry. A successful
+        read keeps the key's TTL deadline, like an xadd, and
+        advances the write watermark from the reply's index, like
+        any other write — and so does a failed one, since it still
+        committed its entry. There is no BLOCK yet: a readgroup
+        with nothing to hand out answers empty at once."""
+        if not isinstance(group, str) or not group:
+            return {"type": "client_response", "status": "error",
+                    "error": "xreadgroup group must be a non-empty "
+                             "string"}
+        if not isinstance(consumer, str) or not consumer:
+            return {"type": "client_response", "status": "error",
+                    "error": "xreadgroup consumer must be a "
+                             "non-empty string"}
+        if not isinstance(id, str):
+            return {"type": "client_response", "status": "error",
+                    "error": "xreadgroup id must be a string"}
+        if count is not None and (
+                not isinstance(count, int) or isinstance(count, bool)
+                or count < 0):
+            return {"type": "client_response", "status": "error",
+                    "error": "xreadgroup count must be a "
+                             "non-negative integer"}
+        msg: dict = {"type": "client", "op": "xreadgroup",
+                     "key": key, "group": group,
+                     "consumer": consumer, "id": id}
+        if count is not None:
+            msg["count"] = count
+        if noack:
+            msg["noack"] = True
+        return self._write(msg)
+
+    def xack(self, key: str, group: str, *ids: str) -> dict:
+        """Acknowledge entries for a consumer group on the stream
+        at ``key``, Redis XACK: every ID in ``ids`` that is pending
+        in the group — for any consumer, since an ack names the
+        entry, not its holder — leaves the pending list, and the
+        reply carries ``xack`` — how many entries actually went, 0
+        when none of them was pending. An ID that was never
+        delivered, or was already acked, simply does not count. A
+        missing key or group fails with ``xack_failed`` and reason
+        ``no_group``, and a plain string value fails with reason
+        ``wrongtype``. A bad group or ID list never goes on the wire
+        and returns the server's error shape instead. The outcome
+        is decided at apply time, at the entry's position in the
+        log, so a retry with the same session id returns the first
+        attempt's count instead of acking twice, and a successful
+        ack keeps the key's TTL deadline, like an xadd. A
+        successful ack advances the write watermark from the
+        reply's index, like any other write — and so does a failed
+        one, since it still committed its entry."""
+        if not isinstance(group, str) or not group:
+            return {"type": "client_response", "status": "error",
+                    "error": "xack group must be a non-empty string"}
+        if (not ids or len(ids) > 1000
+                or any(not isinstance(i, str) for i in ids)):
+            return {"type": "client_response", "status": "error",
+                    "error": "xack ids must be a list of 1 to 1000 "
+                             "stream IDs"}
+        return self._write({"type": "client", "op": "xack",
+                            "key": key, "group": group,
+                            "ids": list(ids)})
+
+    def xpending(self, key: str, group: str) -> dict:
+        """Ask for the pending-entries summary for ``group`` on the
+        stream at ``key``, Redis XPENDING, summary form: the reply
+        carries ``pending`` — the number of entries handed out and
+        not yet acked — ``min_id`` / ``max_id`` — the smallest /
+        largest pending ID, None when nothing is pending — and
+        ``consumers`` — the [[consumer, count], ...] pairs sorted
+        by consumer name. A missing key or group is a client error
+        — not a summary of zeros — and a plain string value is one
+        too. A bad group never goes on the wire and returns the
+        server's error shape instead. It rides the same ReadIndex
+        path as ``get``, so it carries the same session watermark
+        and advances the read watermark from the reply's
+        ``read_index`` exactly the same way: a summary queried
+        after your own xreadgroup counts the entries that read
+        handed out, and a later read never goes backwards past
+        it."""
+        if not isinstance(group, str) or not group:
+            return {"type": "client_response", "status": "error",
+                    "error": "xpending group must be a non-empty "
+                             "string"}
+        if self.last_read_index > self.last_write_index:
+            min_index = self.last_read_index
+            term = self.last_read_term
+        else:
+            min_index = self.last_write_index
+            term = self.last_write_term
+        msg: dict = {"type": "client", "op": "xpending", "key": key,
+                     "group": group,
+                     "client_id": self.client_id,
+                     "min_commit_index": min_index,
+                     "session_term": term}
+        resp = request(self.node_addr, msg, pool=self._pooled)
+        if (resp.get("status") == "ok"
+                and resp.get("read_index") is not None):
+            read_index = int(resp["read_index"])
+            if read_index > self.last_read_index:
+                self.last_read_index = read_index
+                self.last_read_term = int(resp.get("read_term") or 0)
+        return resp
 
     def pfadd(self, key: str, *elements: str) -> dict:
         """Add ``elements`` to the HyperLogLog at ``key``, Redis
@@ -1780,6 +1954,17 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
     a range bound can parse ("-", "+", a bare millisecond, or
     "ms-seq") for MINID — plus an optional ``approximate`` flag
     and an optional ``mode`` that is KEEPREF, DELREF, or ACKED,
+    ``xgroup_create`` a string key, a non-empty string group, and
+    a start ID — "$" (only entries appended after the group is
+    created), "0" (from the very first entry), a bare millisecond,
+    or a full "ms-seq" — plus an optional ``mkstream`` flag,
+    ``xreadgroup`` a string key, a non-empty string group, a
+    non-empty string consumer, and an ID — ">" (new entries, past
+    the group's last delivery), "0", a bare millisecond, or a full
+    "ms-seq" — plus an optional non-negative integer ``count``
+    and an optional ``noack`` flag, ``xack`` a string key, a
+    non-empty string group, and a non-empty list of at most 1000
+    explicit "ms-seq" IDs,
     ``hset`` a string key and a
     non-empty list of at most 1000 [field, value] string pairs,
     ``hdel`` a string key and a non-empty list of at most 1000
@@ -1798,7 +1983,9 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
                     "setnx", "getset",
                     "append", "getdel", "getex", "setrange", "setbit",
                     "bitop",
-                    "pfadd", "geoadd", "xadd", "xtrim", "hset", "hdel",
+                    "pfadd", "geoadd", "xadd", "xtrim",
+                    "xgroup_create", "xreadgroup", "xack",
+                    "hset", "hdel",
                     "setex",
                     "expireat",
                     "pexpireat"):
@@ -1806,7 +1993,8 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
                       "error": "pipeline op must be set, del, cas, "
                                "incr, incrbyfloat, setnx, getset, append, "
                                "getdel, getex, setrange, setbit, bitop, "
-                               "pfadd, geoadd, xadd, xtrim, hset, hdel, setex, expireat, or "
+                               "pfadd, geoadd, xadd, xtrim, xgroup_create, "
+                               "xreadgroup, xack, hset, hdel, setex, expireat, or "
                                "pexpireat"}
     key = op.get("key")
     if not isinstance(key, str):
@@ -2177,6 +2365,134 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
                                        "\"KEEPREF\", \"DELREF\", or "
                                        "\"ACKED\""}
             msg["mode"] = mode.upper()
+    if name == "xgroup_create":
+        # ``group``, ``start_id``, and ``mkstream`` ride along
+        # with a pipelined xgroup_create, validated here so a
+        # malformed one never goes on the wire: a non-empty string
+        # group, a start ID of "$", "0", a bare millisecond, or a
+        # full "ms-seq", and a bare ``mkstream`` flag — the same
+        # shapes the server enforces.
+        group = op.get("group")
+        if not isinstance(group, str) or not group:
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline xgroup_create group "
+                                   "must be a non-empty string"}
+        msg["group"] = group
+        start_id = op.get("start_id", "$")
+        if not isinstance(start_id, str):
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline xgroup_create start_id "
+                                   "must be a string"}
+        if start_id != "$":
+            parts = start_id.split("-")
+            if (start_id in ("-", "+")
+                    or len(parts) not in (1, 2)
+                    or not parts[0].isdigit()
+                    or int(parts[0]) > 2 ** 64 - 1
+                    or (len(parts) == 2
+                        and (not parts[1].isdigit()
+                             or int(parts[1]) > 2 ** 64 - 1))):
+                return None, {"type": "client_response",
+                              "status": "error",
+                              "error": "pipeline xgroup_create "
+                                       "start_id must be \"$\", "
+                                       "\"0\", \"ms\", or \"ms-seq\""}
+        msg["start_id"] = start_id
+        if op.get("mkstream") is not None:
+            if op.get("mkstream") is not True:
+                return None, {"type": "client_response",
+                              "status": "error",
+                              "error": "pipeline xgroup_create "
+                                       "MKSTREAM takes no argument"}
+            msg["mkstream"] = True
+    if name == "xreadgroup":
+        # ``group``, ``consumer``, ``id``, ``count``, and ``noack``
+        # ride along with a pipelined xreadgroup, validated here
+        # so a malformed one never goes on the wire: non-empty
+        # string group and consumer, an ID of ">", "0", a bare
+        # millisecond, or a full "ms-seq", a non-negative integer
+        # count when one is given, and a bare ``noack`` flag —
+        # the same shapes the server enforces.
+        group = op.get("group")
+        if not isinstance(group, str) or not group:
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline xreadgroup group must "
+                                   "be a non-empty string"}
+        msg["group"] = group
+        consumer = op.get("consumer")
+        if not isinstance(consumer, str) or not consumer:
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline xreadgroup consumer "
+                                   "must be a non-empty string"}
+        msg["consumer"] = consumer
+        id_str = op.get("id", ">")
+        if not isinstance(id_str, str):
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline xreadgroup id must be "
+                                   "a string"}
+        if id_str != ">":
+            parts = id_str.split("-")
+            if (id_str in ("-", "+", "$")
+                    or len(parts) not in (1, 2)
+                    or not parts[0].isdigit()
+                    or int(parts[0]) > 2 ** 64 - 1
+                    or (len(parts) == 2
+                        and (not parts[1].isdigit()
+                             or int(parts[1]) > 2 ** 64 - 1))):
+                return None, {"type": "client_response",
+                              "status": "error",
+                              "error": "pipeline xreadgroup id must "
+                                       "be \">\", \"0\", \"ms\", or "
+                                       "\"ms-seq\""}
+        msg["id"] = id_str
+        count = op.get("count")
+        if count is not None and (
+                not isinstance(count, int) or isinstance(count, bool)
+                or count < 0):
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline xreadgroup count must "
+                                   "be a non-negative integer"}
+        if count is not None:
+            msg["count"] = count
+        if op.get("noack") is not None:
+            if op.get("noack") is not True:
+                return None, {"type": "client_response",
+                              "status": "error",
+                              "error": "pipeline xreadgroup NOACK "
+                                       "takes no argument"}
+            msg["noack"] = True
+    if name == "xack":
+        # ``group`` and ``ids`` ride along with a pipelined xack,
+        # validated here so a malformed one never goes on the wire:
+        # a non-empty string group and a non-empty list of at most
+        # 1000 explicit "ms-seq" IDs — the same shapes the server
+        # enforces.
+        group = op.get("group")
+        if not isinstance(group, str) or not group:
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline xack group must be a "
+                                   "non-empty string"}
+        msg["group"] = group
+        ids = op.get("ids")
+        if (not isinstance(ids, list) or not ids
+                or len(ids) > 1000
+                or any(not isinstance(i, str) for i in ids)):
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline xack ids must be a list "
+                                   "of 1 to 1000 stream IDs"}
+        for entry_id in ids:
+            parts = entry_id.split("-")
+            if (len(parts) != 2 or not parts[0].isdigit()
+                    or not parts[1].isdigit()
+                    or int(parts[0]) > 2 ** 64 - 1
+                    or int(parts[1]) > 2 ** 64 - 1
+                    or (int(parts[0]) == 0 and int(parts[1]) == 0)):
+                return None, {"type": "client_response",
+                              "status": "error",
+                              "error": "pipeline xack ids must be "
+                                       "explicit \"ms-seq\" stream IDs "
+                                       "greater than 0-0"}
+        msg["ids"] = list(ids)
     if name == "hset":
         # ``pairs`` rides along with a pipelined hset, validated
         # here so a malformed one never goes on the wire: a
@@ -2994,13 +3310,14 @@ def xtrim(node_addr: tuple[str, int], key: str, strategy: str,
     or "ms-seq"). ``approximate`` ("~" in Redis) is accepted and
     ignored — this store trims exactly — and ``mode`` is KEEPREF,
     DELREF, or ACKED when one is given: those govern consumer-group
-    references, and there are no consumer groups yet, so the mode
-    is accepted and ignored too. A bad strategy, threshold, or
-    mode never goes on the wire and returns the server's error
-    shape instead. A successful xtrim keeps the key's TTL deadline
-    when entries remain, like an xadd, and a trim that empties the
-    stream deletes the key, like an hdel that removes the last
-    field."""
+    references — DELREF, and no mode at all, drops the pending
+    reference of a trimmed entry, KEEPREF keeps it, and ACKED
+    behaves like KEEPREF in this version. A bad strategy,
+    threshold, or mode never goes on the wire and returns the
+    server's error shape instead. A successful xtrim keeps the
+    key's TTL deadline when entries remain, like an xadd, and a
+    trim that empties the stream deletes the key, like an hdel
+    that removes the last field."""
     if (not isinstance(strategy, str)
             or strategy.upper() not in ("MAXLEN", "MINID")):
         return {"type": "client_response", "status": "error",
@@ -3032,6 +3349,157 @@ def xtrim(node_addr: tuple[str, int], key: str, strategy: str,
     if mode is not None:
         msg["mode"] = mode.upper()
     return request(node_addr, msg, timeout=timeout)
+
+
+def xgroup_create(node_addr: tuple[str, int], key: str, group: str,
+                  start_id: str = "$", mkstream: bool = False,
+                  timeout: float = 12.0) -> dict:
+    """Create a consumer group on the stream at ``key``, following
+    leader redirects like ``request`` — Redis XGROUP CREATE.
+
+    One request appends the create entry, so whether the group
+    exists is decided at the entry's position in the log: the reply
+    is the plain xgroup_create response (``status`` ``ok`` with
+    ``xgroup_create`` 1 — or ``xgroup_create_failed`` with reason
+    ``no_group`` when the key does not exist and ``mkstream`` was
+    not given, ``group_exists`` when the group already exists, or
+    ``wrongtype`` when the current value is a plain string). The
+    group starts reading from ``start_id`` — "$" (only entries
+    appended after the group is created), "0" (from the very first
+    entry), a bare millisecond, or a full "ms-seq" — and with
+    ``mkstream`` a missing key is created as an empty stream, like
+    an xadd creating its key. A bad group name or start ID never
+    goes on the wire and returns the server's error shape instead.
+    A successful create keeps the key's TTL deadline, like an
+    xadd."""
+    if not isinstance(group, str) or not group:
+        return {"type": "client_response", "status": "error",
+                "error": "xgroup_create group must be a non-empty "
+                         "string"}
+    if not isinstance(start_id, str):
+        return {"type": "client_response", "status": "error",
+                "error": "xgroup_create start_id must be a string"}
+    msg: dict = {"type": "client", "op": "xgroup_create",
+                 "key": key, "group": group, "start_id": start_id}
+    if mkstream:
+        msg["mkstream"] = True
+    return request(node_addr, msg, timeout=timeout)
+
+
+def xreadgroup(node_addr: tuple[str, int], key: str, group: str,
+               consumer: str, id: str = ">",
+               count: int | None = None, noack: bool = False,
+               timeout: float = 12.0) -> dict:
+    """Read entries for one consumer of one group on the stream at
+    ``key``, following leader redirects like ``request`` — Redis
+    XREADGROUP.
+
+    One request appends the read entry, so the entries it hands out
+    are decided at the entry's position in the log: the reply is
+    the plain xreadgroup response (``status`` ``ok`` with
+    ``entries`` — the [id, {field: value}] pairs in ID order, an
+    empty list when the group has nothing for this consumer — or
+    ``xreadgroup_failed`` with reason ``no_group`` when the key or
+    the group does not exist, or ``wrongtype`` when the current
+    value is a plain string). With ``id`` ">" the group hands the
+    consumer the entries appended after its last delivery and marks
+    each one pending for that consumer; with any other ID ("0", a
+    bare millisecond, or a full "ms-seq") it re-reads the
+    consumer's own pending entries at or after the given ID, and
+    each re-read raises that entry's delivery count by one. With
+    ``noack`` the entries are delivered without being recorded
+    pending, though the last delivery still advances. ``count``
+    caps how many entries one call returns, like Redis's COUNT —
+    None means no cap, 0 answers an empty list. A bad group,
+    consumer, ID, or count never goes on the wire and returns the
+    server's error shape instead. This is a write, not a read: a
+    retry with the same session id returns the first attempt's
+    entries instead of delivering them twice. There is no BLOCK
+    yet: a readgroup with nothing to hand out answers empty at
+    once."""
+    if not isinstance(group, str) or not group:
+        return {"type": "client_response", "status": "error",
+                "error": "xreadgroup group must be a non-empty "
+                         "string"}
+    if not isinstance(consumer, str) or not consumer:
+        return {"type": "client_response", "status": "error",
+                "error": "xreadgroup consumer must be a non-empty "
+                         "string"}
+    if not isinstance(id, str):
+        return {"type": "client_response", "status": "error",
+                "error": "xreadgroup id must be a string"}
+    if count is not None and (
+            not isinstance(count, int) or isinstance(count, bool)
+            or count < 0):
+        return {"type": "client_response", "status": "error",
+                "error": "xreadgroup count must be a "
+                         "non-negative integer"}
+    msg: dict = {"type": "client", "op": "xreadgroup",
+                 "key": key, "group": group, "consumer": consumer,
+                 "id": id}
+    if count is not None:
+        msg["count"] = count
+    if noack:
+        msg["noack"] = True
+    return request(node_addr, msg, timeout=timeout)
+
+
+def xack(node_addr: tuple[str, int], key: str, group: str,
+         ids: list[str], timeout: float = 12.0) -> dict:
+    """Acknowledge entries for a consumer group on the stream at
+    ``key``, following leader redirects like ``request`` — Redis
+    XACK.
+
+    One request appends the ack entry, so how many entries actually
+    went is decided at the entry's position in the log: the reply
+    is the plain xack response (``status`` ``ok`` with ``xack`` —
+    how many entries actually left the pending list, 0 when none
+    of them was pending — or ``xack_failed`` with reason
+    ``no_group`` when the key or the group does not exist, or
+    ``wrongtype`` when the current value is a plain string). An ID
+    that was never delivered, or was already acked, simply does
+    not count. A bad group or ID list never goes on the wire and
+    returns the server's error shape instead."""
+    if not isinstance(group, str) or not group:
+        return {"type": "client_response", "status": "error",
+                "error": "xack group must be a non-empty string"}
+    if (not isinstance(ids, list) or not ids or len(ids) > 1000
+            or any(not isinstance(i, str) for i in ids)):
+        return {"type": "client_response", "status": "error",
+                "error": "xack ids must be a list of 1 to 1000 "
+                         "stream IDs"}
+    return request(node_addr, {"type": "client", "op": "xack",
+                               "key": key, "group": group,
+                               "ids": list(ids)},
+                   timeout=timeout)
+
+
+def xpending(node_addr: tuple[str, int], key: str, group: str,
+             timeout: float = 12.0) -> dict:
+    """Ask for the pending-entries summary for ``group`` on the
+    stream at ``key``, following leader redirects like ``request``
+    — Redis XPENDING, summary form.
+
+    One request serves the summary through the leader's ReadIndex
+    path, so it reflects the committed state as of one read index,
+    exactly as linearizable as a ``get``. The reply is the plain
+    xpending response (``status`` ``ok`` with ``pending`` — the
+    number of entries handed out and not yet acked — ``min_id`` /
+    ``max_id`` — the smallest / largest pending ID, None when
+    nothing is pending — and ``consumers`` — the [[consumer,
+    count], ...] pairs sorted by consumer name — plus the
+    ``read_index`` / ``read_term`` they were measured at). A
+    missing key or group is a client error, not a summary of
+    zeros, and a plain string value is one too. A bad group never
+    goes on the wire and returns the server's error shape
+    instead."""
+    if not isinstance(group, str) or not group:
+        return {"type": "client_response", "status": "error",
+                "error": "xpending group must be a non-empty "
+                         "string"}
+    return request(node_addr, {"type": "client", "op": "xpending",
+                               "key": key, "group": group},
+                   timeout=timeout)
 
 
 def geodist(node_addr: tuple[str, int], key: str, member1: str,
@@ -4036,9 +4504,10 @@ def main(argv: list[str] | None = None) -> int:
                               "exactly)")
     p_xtrim.add_argument("--mode", default=None,
                          choices=("KEEPREF", "DELREF", "ACKED"),
-                         help="consumer-group reference mode "
-                              "(accepted for compatibility; there "
-                              "are no consumer groups yet)")
+                         help="consumer-group reference mode: DELREF "
+                              "(the default) drops the pending "
+                              "reference of a trimmed entry, KEEPREF "
+                              "keeps it, ACKED behaves like KEEPREF")
     p_xtrim.add_argument("--client-id", default=None,
                         help="session id for at-most-once writes: a retry "
                              "with the same client id + request id returns "
@@ -4046,6 +4515,81 @@ def main(argv: list[str] | None = None) -> int:
                              "twice")
     p_xtrim.add_argument("--request-id", default=None,
                         help="id of this write within the client session")
+    p_xgroup_create = sub.add_parser(
+        "xgroup_create",
+        help="create a consumer group on the stream at key and "
+             "print OK; the group starts reading from the start ID")
+    p_xgroup_create.add_argument("key")
+    p_xgroup_create.add_argument("group")
+    p_xgroup_create.add_argument("start_id", nargs="?", default="$",
+                                 help="\"$\" (only entries appended "
+                                      "after the group is created), "
+                                      "\"0\" (from the very first "
+                                      "entry), a bare millisecond, or "
+                                      "\"ms-seq\" (default $)")
+    p_xgroup_create.add_argument("--mkstream", action="store_true",
+                                 help="create the stream when the key "
+                                      "does not exist yet")
+    p_xgroup_create.add_argument("--client-id", default=None,
+                                 help="session id for at-most-once writes: "
+                                      "a retry with the same client id + "
+                                      "request id returns the first "
+                                      "attempt's result instead of writing "
+                                      "twice")
+    p_xgroup_create.add_argument("--request-id", default=None,
+                                 help="id of this write within the client "
+                                      "session")
+    p_xreadgroup = sub.add_parser(
+        "xreadgroup",
+        help="read entries for one consumer of one group on the "
+             "stream at key and print them as JSON ([[id, {field: "
+             "value}], ...]); \">\" hands out new entries, any "
+             "other ID re-reads the consumer's own pending entries")
+    p_xreadgroup.add_argument("key")
+    p_xreadgroup.add_argument("group")
+    p_xreadgroup.add_argument("consumer")
+    p_xreadgroup.add_argument("id", nargs="?", default=">",
+                              help="\">\" (new entries, past the "
+                                   "group's last delivery), \"0\", a bare "
+                                   "millisecond, or \"ms-seq\" (default >)")
+    p_xreadgroup.add_argument("--count", type=int, default=None,
+                              help="at most this many entries "
+                                   "(default: no cap)")
+    p_xreadgroup.add_argument("--noack", action="store_true",
+                              help="deliver without recording the "
+                                   "entries pending")
+    p_xreadgroup.add_argument("--client-id", default=None,
+                              help="session id for at-most-once writes: a "
+                                   "retry with the same client id + request "
+                                   "id returns the first attempt's result "
+                                   "instead of writing twice")
+    p_xreadgroup.add_argument("--request-id", default=None,
+                              help="id of this write within the client "
+                                   "session")
+    p_xack = sub.add_parser(
+        "xack",
+        help="acknowledge entries for a consumer group on the stream "
+             "at key and print how many entries actually left the "
+             "pending list (0 when none of them was pending)")
+    p_xack.add_argument("key")
+    p_xack.add_argument("group")
+    p_xack.add_argument("ids", nargs="+",
+                        help="the entry IDs to acknowledge: "
+                             "ms-seq ms-seq ... (at most 1000)")
+    p_xack.add_argument("--client-id", default=None,
+                        help="session id for at-most-once writes: a retry "
+                             "with the same client id + request id returns "
+                             "the first attempt's result instead of writing "
+                             "twice")
+    p_xack.add_argument("--request-id", default=None,
+                        help="id of this write within the client session")
+    p_xpending = sub.add_parser(
+        "xpending",
+        help="print the pending-entries summary for a consumer "
+             "group on the stream at key as JSON "
+             "({pending, min_id, max_id, consumers})")
+    p_xpending.add_argument("key")
+    p_xpending.add_argument("group")
     p_pfadd = sub.add_parser(
         "pfadd",
         help="add elements to the HyperLogLog at key and print 1 "
@@ -4257,6 +4801,7 @@ def main(argv: list[str] | None = None) -> int:
               "hlen", "hexists", "hkeys", "hvals", "hmget", "hscan",
               "geoadd", "geodist",
               "xadd", "xtrim", "xlen", "xrange",
+              "xgroup_create", "xreadgroup", "xack", "xpending",
               "setex", "expireat",
               "pexpireat"):
         msg["key"] = args.key
@@ -4414,6 +4959,24 @@ def main(argv: list[str] | None = None) -> int:
         msg["strategy"] = args.strategy
         if args.mode is not None:
             msg["mode"] = args.mode
+    if op == "xgroup_create":
+        msg["group"] = args.group
+        msg["start_id"] = args.start_id
+        if args.mkstream:
+            msg["mkstream"] = True
+    if op == "xreadgroup":
+        msg["group"] = args.group
+        msg["consumer"] = args.consumer
+        msg["id"] = args.id
+        if args.count is not None:
+            msg["count"] = args.count
+        if args.noack:
+            msg["noack"] = True
+    if op == "xack":
+        msg["group"] = args.group
+        msg["ids"] = args.ids
+    if op == "xpending":
+        msg["group"] = args.group
     if op == "pfadd":
         msg["elements"] = args.elements
     if op == "hset":
@@ -4441,7 +5004,8 @@ def main(argv: list[str] | None = None) -> int:
               "setbit", "bitop", "pfadd", "geoadd", "hset", "hdel",
               "setex",
               "expireat",
-              "pexpireat", "xadd", "xtrim") \
+              "pexpireat", "xadd", "xtrim", "xgroup_create",
+              "xreadgroup", "xack") \
             and args.request_id:
         # A request id without an explicit client id still dedups
         # within the default "cli" session; the same id retried from
@@ -4530,6 +5094,15 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(resp.get("streams")))
         elif op == "xtrim":
             print(resp.get("xtrim"))
+        elif op == "xreadgroup":
+            print(json.dumps(resp.get("entries")))
+        elif op == "xack":
+            print(resp.get("xack"))
+        elif op == "xpending":
+            print(json.dumps({"pending": resp.get("pending"),
+                              "min_id": resp.get("min_id"),
+                              "max_id": resp.get("max_id"),
+                              "consumers": resp.get("consumers")}))
         elif op == "geodist":
             dist = resp.get("distance")
             print(dist if dist is not None else "(nil)")

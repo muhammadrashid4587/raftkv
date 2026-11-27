@@ -226,7 +226,20 @@ def geo_distance(lon1: float, lat1: float, lon2: float,
 # like an hdel that removes the last field. XRANGE / XLEN
 # (v0.64.0) read the entries back; XREAD (v0.65.0) reads the
 # entries appended after one ID per stream, blocking for new ones
-# when asked.
+# when asked. XREADGROUP (v0.67.0) adds consumer groups to the
+# same blob: an optional "groups" key mapping a group name to
+# {"last_delivered": "ms-seq" or None, "pending": {"ms-seq":
+# {"consumer": name, "deliveries": n}}} — the last entry the
+# group was handed (None when it was created on an empty stream
+# with "$", so every later entry counts as new), and the pending
+# entries list: every entry handed out and not yet acked, with
+# which consumer holds it and how many times it has been
+# delivered. The groups ride in the same blob, so they survive
+# snapshots and replay exactly like the entries — a group created
+# before a snapshot is still there after one — and the blob stays
+# a pure function of (entries, groups), so every node computes
+# the same bytes. A stream created before groups existed carries
+# no "groups" key at all, and reads like one with no groups.
 STREAM_PREFIX = "\x00raftkv-stream\x00"
 
 # Largest number of fields one ``xadd`` may carry. The pairs ride
@@ -235,11 +248,39 @@ STREAM_PREFIX = "\x00raftkv-stream\x00"
 # for the same reason.
 XADD_MAX_FIELDS = 1000
 
+# Largest number of IDs one ``xack`` may carry. The IDs ride in
+# one log entry and one frame, so an unbounded list would let one
+# entry grow without limit — the same scale as the xadd cap, for
+# the same reason.
+XACK_MAX_IDS = 1000
+
 # A stream ID is two 64-bit halves, milliseconds and sequence,
 # Redis's shape: each half is an unsigned 64-bit integer, and 0-0
 # is not a valid ID — the first entry in a stream is never 0-0, so
 # an ID of 0-0 is smaller than every real entry.
 STREAM_ID_MAX = 2 ** 64 - 1
+
+
+def _parse_stored_stream_id(id_str) -> tuple[int, int]:
+    """Parse a stored stream ID — "ms-seq" with both halves digits,
+    0-0 allowed: a group's last_delivered can be 0-0 (created with
+    start "0", deliver from the very first entry), where an entry
+    ID never is. Raises ValueError on any other shape, on a half
+    past 2**64 - 1, or on a non-string. Unlike
+    ``parse_stream_id``, "*" and "ms-*" are not IDs here — a
+    stored ID is always fully explicit."""
+    if not isinstance(id_str, str):
+        raise ValueError("stored stream id must be a string")
+    parts = id_str.split("-")
+    if (len(parts) != 2 or not parts[0].isdigit()
+            or not parts[1].isdigit()):
+        raise ValueError("stored stream id must be \"ms-seq\"")
+    ms = int(parts[0])
+    seq = int(parts[1])
+    if ms > STREAM_ID_MAX or seq > STREAM_ID_MAX:
+        raise ValueError(
+            "stored stream id halves must be at most 2**64 - 1")
+    return ms, seq
 
 
 def parse_stream_id(id_str) -> tuple[int | str, int | None]:
@@ -317,19 +358,72 @@ def parse_stream_range_bound(bound: str) -> tuple[int, int]:
     return ms, seq
 
 
+def _is_group_map(groups) -> bool:
+    """Whether ``groups`` is a well-formed consumer-group map:
+    a dict of non-empty group name to {"last_delivered": "ms-seq"
+    or None, "pending": {"ms-seq": {"consumer": name,
+    "deliveries": n}}} — the last entry handed to the group (None
+    when it was created on an empty stream with "$"), and the
+    pending entries: every entry handed out and not yet acked,
+    with which consumer holds it and how many times it has been
+    delivered (at least 1 — an entry with 0 deliveries was never
+    handed out). A plain string can only pass this by being
+    hand-built to the exact shape — the same class of collision
+    the hash check has — so an XREADGROUP trusts the shape."""
+    if not isinstance(groups, dict):
+        return False
+    for name, group in groups.items():
+        if not isinstance(name, str) or not name:
+            return False
+        if (not isinstance(group, dict)
+                or set(group) != {"last_delivered", "pending"}):
+            return False
+        last = group["last_delivered"]
+        if last is not None:
+            try:
+                _parse_stored_stream_id(last)
+            except ValueError:
+                return False
+        pending = group["pending"]
+        if not isinstance(pending, dict):
+            return False
+        for entry_id, info in pending.items():
+            try:
+                _parse_stored_stream_id(entry_id)
+            except ValueError:
+                return False
+            if (not isinstance(info, dict)
+                    or set(info) != {"consumer", "deliveries"}):
+                return False
+            if (not isinstance(info["consumer"], str)
+                    or not info["consumer"]):
+                return False
+            deliveries = info["deliveries"]
+            if (not isinstance(deliveries, int)
+                    or isinstance(deliveries, bool)
+                    or deliveries < 1):
+                return False
+    return True
+
+
 def is_stream(value) -> bool:
     """Whether ``value`` is a stream blob: a string carrying the
-    marker prefix and a JSON object with "last" and "entries"
+    marker prefix and a JSON object with "last" and "entries" —
+    and, since v0.67.0, an optional "groups" consumer-group map —
     behind it. A plain string can only pass this by being
     hand-built to the exact shape — the same class of collision
-    the hash check has — so an XADD trusts the shape."""
+    the hash check has — so an XADD trusts the shape. A stream
+    created before groups existed carries no "groups" key, and
+    reads like one with no groups."""
     if not isinstance(value, str) or not value.startswith(STREAM_PREFIX):
         return False
     try:
         data = json.loads(value[len(STREAM_PREFIX):])
     except (ValueError, TypeError):
         return False
-    if not isinstance(data, dict) or set(data) != {"last", "entries"}:
+    if (not isinstance(data, dict)
+            or set(data) not in ({"last", "entries"},
+                                 {"last", "entries", "groups"})):
         return False
     last = data["last"]
     if last is not None:
@@ -342,14 +436,18 @@ def is_stream(value) -> bool:
             # is a request, never a stored ID.
             return False
     entries = data["entries"]
-    return (isinstance(entries, list)
+    if not (isinstance(entries, list)
             and all(isinstance(e, list) and len(e) == 2
                     and isinstance(e[0], str)
                     and isinstance(e[1], dict)
                     and all(isinstance(f, str)
                             and isinstance(v, str)
                             for f, v in e[1].items())
-                    for e in entries))
+                    for e in entries)):
+        return False
+    if "groups" in data and not _is_group_map(data["groups"]):
+        return False
+    return True
 
 
 def _stream_data(value: str) -> dict:
@@ -633,8 +731,7 @@ class KVStore:
         state at apply time — currently "set", "cas", "expire", "expireat",
         "pexpireat", "incr", "incrbyfloat", "setnx", "getset", "append", "getdel",
         "setrange", "getex", "setbit", "bitop", "pfadd", "hset", "hdel",
-        and "geoadd" —
-        and "geoadd" —
+        "geoadd", "xadd", "xtrim", "xgroup_create", "xreadgroup", and "xack" —
         and None for del, whose outcome is always ok. The result is
         what the leader hands back to the waiting client and what the
         dedup table caches for retries, so it must be a pure function
@@ -1830,12 +1927,21 @@ class KVStore:
             # set. The ``approximate`` flag ("~" in Redis) is
             # accepted and ignored — this store trims exactly,
             # since there is no radix tree whose nodes need a
-            # visit budget — and the ``mode`` (KEEPREF / DELREF /
-            # ACKED) is accepted and ignored too: those govern
-            # consumer-group references, and there are no
-            # consumer groups yet, so no entry carries one. The
-            # strategy and threshold were validated on the leader
-            # before the entry was logged (MAXLEN with a
+            # visit budget. The ``mode`` (KEEPREF / DELREF /
+            # ACKED) governs what happens to the pending entries
+            # of consumer groups when their entry is trimmed:
+            # DELREF — and no mode at all, the default — drops
+            # the pending reference, so the entry stops being
+            # pending in every group; KEEPREF keeps it, so the
+            # entry stays pending (and still counts in XPENDING)
+            # even though its data is gone, and a later XREADGROUP
+            # with an explicit ID simply skips it, since there is
+            # nothing left to return. ACKED is accepted and
+            # behaves like KEEPREF in this version: dropping only
+            # entries already acked by every group would need
+            # per-entry read tracking the store does not keep yet.
+            # The strategy and threshold were validated on the
+            # leader before the entry was logged (MAXLEN with a
             # non-negative integer threshold, MINID with a bound
             # a range bound can parse), so by apply time they
             # are well-formed — a hand-built log entry with a bad
@@ -1883,6 +1989,25 @@ class KVStore:
                     else:
                         break
                 kept = entries[removed:]
+            if removed:
+                # Trimming drops the pending references of the
+                # entries that went — DELREF, and no mode at all
+                # — so a trimmed entry stops being pending in
+                # every group; KEEPREF (and ACKED, which behaves
+                # like it here) keeps them, so the entry stays
+                # pending even though its data is gone. A trim
+                # that empties the stream deletes the key
+                # outright, groups and all, so there is nothing
+                # left to drop there.
+                mode = command.get("mode")
+                if mode not in ("KEEPREF", "ACKED"):
+                    gone = {entry_id for entry_id, _f
+                            in entries[:removed]}
+                    for group in stream.get("groups", {}).values():
+                        pending = group["pending"]
+                        for entry_id in list(pending):
+                            if entry_id in gone:
+                                del pending[entry_id]
             if not kept:
                 del self._data[key]
                 idx = bisect.bisect_left(self._keys, key)
@@ -1896,6 +2021,294 @@ class KVStore:
             self._data[key] = _stream_value(stream)
             return {"type": "client_response", "status": "ok",
                     "xtrim": removed}
+        elif op == "xgroup_create":
+            # Create a consumer group on a stream, Redis XGROUP
+            # CREATE: the group starts reading from ``start_id``
+            # — "$" (only entries appended after the group is
+            # created: last_delivered is the stream's top, or
+            # None on an empty stream, so every later entry
+            # counts as new), "0" (from the very first entry:
+            # last_delivered "0-0"), a bare millisecond, or a
+            # full "ms-seq". The reply carries ``xgroup_create``
+            # 1. A missing key is created as an empty stream when
+            # ``mkstream`` rides along, like an xadd creating its
+            # key; without it the create fails with
+            # ``xgroup_create_failed`` / ``no_group`` — a group
+            # cannot exist on a stream that does not. A group
+            # that already exists fails the same way, reason
+            # ``group_exists`` — Redis's BUSYGROUP — and a key
+            # holding a plain string fails with WRONGTYPE, like
+            # an xadd. The outcome is decided here, at this exact
+            # point in the log, like a CAS, so a retry with the
+            # same session id returns the first attempt's result
+            # instead of creating the group twice. The group rides
+            # in the stream blob, so it survives snapshots and
+            # replay exactly like the entries, and a successful
+            # create keeps the key's deadline, like an xadd: it
+            # is an update of the value, not a fresh set. The
+            # group name and start ID were validated on the leader
+            # before the entry was logged (a non-empty string
+            # name; "$" or a bound a range bound can parse), so
+            # by apply time they are well-formed — a hand-built
+            # log entry with a bad name or ID still raises rather
+            # than silently creating nonsense.
+            key = command["key"]
+            group = command.get("group")
+            if not isinstance(group, str) or not group:
+                raise ValueError(
+                    "xgroup_create group must be a non-empty string")
+            start_id = command.get("start_id", "$")
+            if not isinstance(start_id, str):
+                raise ValueError("xgroup_create start_id must be a "
+                                 "string")
+            current = self._data.get(key)
+            if current is not None and not is_stream(current):
+                return {"type": "client_response",
+                        "status": "xgroup_create_failed",
+                        "reason": "wrongtype",
+                        "current": current,
+                        "error": "xgroup_create failed: value of "
+                                 f"{key!r} is not a stream"}
+            if current is None and not command.get("mkstream"):
+                return {"type": "client_response",
+                        "status": "xgroup_create_failed",
+                        "reason": "no_group",
+                        "error": "xgroup_create failed: no such key "
+                                 f"{key!r} (use MKSTREAM to create "
+                                 "the stream)"}
+            stream = (_stream_data(current)
+                      if current is not None
+                      else {"last": None, "entries": []})
+            groups = stream.setdefault("groups", {})
+            if group in groups:
+                return {"type": "client_response",
+                        "status": "xgroup_create_failed",
+                        "reason": "group_exists",
+                        "error": "xgroup_create failed: consumer "
+                                 f"group {group!r} already exists"}
+            if start_id == "$":
+                last_delivered = stream["last"]
+            else:
+                start_ms, start_seq = parse_stream_range_bound(
+                    start_id)
+                last_delivered = f"{start_ms}-{start_seq}"
+            groups[group] = {"last_delivered": last_delivered,
+                             "pending": {}}
+            if key not in self._data:
+                bisect.insort(self._keys, key)
+            self._data[key] = _stream_value(stream)
+            return {"type": "client_response", "status": "ok",
+                    "xgroup_create": 1}
+        elif op == "xreadgroup":
+            # Read entries for one consumer of one group, Redis
+            # XREADGROUP: with ``id`` ">" the group hands the
+            # consumer the entries appended after its
+            # last_delivered — in ID order, at most ``count`` of
+            # them when a count is given — and marks each one
+            # pending for that consumer (delivery count 1, unless
+            # ``noack`` rides along, which still advances
+            # last_delivered but records nothing pending), moving
+            # last_delivered to the last entry handed out; with
+            # any other ID it re-reads the consumer's own pending
+            # entries — the ones already handed to this consumer
+            # and not yet acked, with an ID at or after the given
+            # one — in ID order, at most ``count`` of them, and
+            # each re-read raises its delivery count by one, so a
+            # consumer can tell a first delivery from a retry.
+            # The reply carries ``entries`` — the [id, {field:
+            # value}] pairs in ID order, an empty list when the
+            # group has nothing for this consumer. A missing key
+            # or a missing group fails with
+            # ``xreadgroup_failed`` / ``no_group`` — Redis's
+            # NOGROUP — and a key holding a plain string fails
+            # with WRONGTYPE, like an xadd. The outcome is
+            # decided here, at this exact point in the log, like
+            # a CAS, so a retry with the same session id returns
+            # the first attempt's entries instead of delivering
+            # them twice — a redelivery only ever comes from a
+            # fresh explicit-ID read, never from a retry. This is
+            # a write, not a read: handing entries out mutates the
+            # pending list and last_delivered, and the mutation
+            # must replicate through the log like any other, so
+            # every node agrees on who holds what. A successful
+            # read keeps the key's deadline, like an xadd, and a
+            # read that hands out nothing writes nothing at all.
+            # The group, consumer, and ID were validated on the
+            # leader before the entry was logged (non-empty
+            # strings; ">" or a bound a range bound can parse;
+            # a non-negative integer count), so by apply time
+            # they are well-formed — a hand-built log entry with
+            # a bad name, ID, or count still raises rather than
+            # silently delivering nonsense.
+            key = command["key"]
+            group = command.get("group")
+            consumer = command.get("consumer")
+            if not isinstance(group, str) or not group:
+                raise ValueError(
+                    "xreadgroup group must be a non-empty string")
+            if not isinstance(consumer, str) or not consumer:
+                raise ValueError(
+                    "xreadgroup consumer must be a non-empty "
+                    "string")
+            id_str = command.get("id", ">")
+            if not isinstance(id_str, str):
+                raise ValueError("xreadgroup id must be a string")
+            count = command.get("count")
+            if count is not None and (
+                    not isinstance(count, int)
+                    or isinstance(count, bool) or count < 0):
+                raise ValueError(
+                    "xreadgroup count must be a non-negative "
+                    "integer")
+            current = self._data.get(key)
+            if current is None:
+                return {"type": "client_response",
+                        "status": "xreadgroup_failed",
+                        "reason": "no_group",
+                        "error": "xreadgroup failed: no such key "
+                                 f"{key!r} or consumer group "
+                                 f"{group!r}"}
+            if not is_stream(current):
+                return {"type": "client_response",
+                        "status": "xreadgroup_failed",
+                        "reason": "wrongtype",
+                        "current": current,
+                        "error": "xreadgroup failed: value of "
+                                 f"{key!r} is not a stream"}
+            stream = _stream_data(current)
+            groups = stream.get("groups", {})
+            if group not in groups:
+                return {"type": "client_response",
+                        "status": "xreadgroup_failed",
+                        "reason": "no_group",
+                        "error": "xreadgroup failed: no such key "
+                                 f"{key!r} or consumer group "
+                                 f"{group!r}"}
+            state = groups[group]
+            entries = stream["entries"]
+            noack = bool(command.get("noack"))
+            if id_str == ">":
+                # New entries: everything after the group's last
+                # delivery — None means the group was created on
+                # an empty stream with "$", so every entry is
+                # new. A bare (0, 0) floor is the same thing: no
+                # real entry is ever 0-0.
+                last = state["last_delivered"]
+                after = ((0, 0) if last is None
+                         else _parse_stored_stream_id(last))
+                chosen = [(eid, fields) for eid, fields in entries
+                          if parse_stream_id(eid) > after]
+                if count is not None:
+                    chosen = chosen[:count]
+                if chosen:
+                    if not noack:
+                        for eid, _fields in chosen:
+                            state["pending"][eid] = {
+                                "consumer": consumer, "deliveries": 1}
+                    state["last_delivered"] = chosen[-1][0]
+            else:
+                # Pending entries: the consumer's own unacked
+                # ones, at or after the given ID — in ID order,
+                # each re-read raising its delivery count. An
+                # entry trimmed away under KEEPREF is still
+                # pending but its data is gone, so it is skipped:
+                # there is nothing left to return for it.
+                start = parse_stream_range_bound(id_str)
+                by_id = {eid: fields for eid, fields in entries}
+                chosen = []
+                for eid in sorted(state["pending"],
+                                  key=parse_stream_id):
+                    if parse_stream_id(eid) < start:
+                        continue
+                    info = state["pending"][eid]
+                    if info["consumer"] != consumer:
+                        continue
+                    if eid not in by_id:
+                        continue
+                    if count is not None and len(chosen) >= count:
+                        break
+                    chosen.append((eid, by_id[eid]))
+                    info["deliveries"] += 1
+            if chosen:
+                self._data[key] = _stream_value(stream)
+            return {"type": "client_response", "status": "ok",
+                    "entries": [[eid, dict(fields)]
+                                for eid, fields in chosen]}
+        elif op == "xack":
+            # Acknowledge entries for a consumer group, Redis
+            # XACK: every ID in ``ids`` that is pending in the
+            # group — for any consumer, since an ack names the
+            # entry, not its holder — leaves the pending list,
+            # and the reply carries ``xack`` — how many entries
+            # actually went, 0 when none of them was pending. An
+            # ID that was never delivered, or was already acked,
+            # simply does not count. A missing key or a missing
+            # group fails with ``xack_failed`` / ``no_group`` —
+            # Redis's NOGROUP — and a key holding a plain string
+            # fails with WRONGTYPE, like an xadd. The outcome is
+            # decided here, at this exact point in the log, like
+            # a CAS, so a retry with the same session id returns
+            # the first attempt's count instead of acking twice.
+            # A successful ack keeps the key's deadline, like an
+            # xadd, and an ack that removes nothing writes nothing
+            # at all. The group and IDs were validated on the
+            # leader before the entry was logged (a non-empty
+            # string group; a non-empty list of at most 1000
+            # explicit "ms-seq" IDs), so by apply time they are
+            # well-formed — a hand-built log entry with a bad
+            # group or ID still raises rather than silently
+            # acking nonsense.
+            key = command["key"]
+            group = command.get("group")
+            if not isinstance(group, str) or not group:
+                raise ValueError(
+                    "xack group must be a non-empty string")
+            ids = command.get("ids")
+            if (not isinstance(ids, list) or not ids
+                    or len(ids) > XACK_MAX_IDS
+                    or any(not isinstance(i, str) for i in ids)):
+                raise ValueError(
+                    "xack ids must be a non-empty list of at most "
+                    f"{XACK_MAX_IDS} stream IDs")
+            for entry_id in ids:
+                _ms, seq = parse_stream_id(entry_id)
+                if seq is None:
+                    raise ValueError(
+                        "xack ids must be explicit \"ms-seq\" IDs")
+            current = self._data.get(key)
+            if current is None:
+                return {"type": "client_response",
+                        "status": "xack_failed",
+                        "reason": "no_group",
+                        "error": "xack failed: no such key "
+                                 f"{key!r} or consumer group "
+                                 f"{group!r}"}
+            if not is_stream(current):
+                return {"type": "client_response",
+                        "status": "xack_failed",
+                        "reason": "wrongtype",
+                        "current": current,
+                        "error": "xack failed: value of "
+                                 f"{key!r} is not a stream"}
+            stream = _stream_data(current)
+            groups = stream.get("groups", {})
+            if group not in groups:
+                return {"type": "client_response",
+                        "status": "xack_failed",
+                        "reason": "no_group",
+                        "error": "xack failed: no such key "
+                                 f"{key!r} or consumer group "
+                                 f"{group!r}"}
+            pending = groups[group]["pending"]
+            acked = 0
+            for entry_id in ids:
+                if entry_id in pending:
+                    del pending[entry_id]
+                    acked += 1
+            if acked:
+                self._data[key] = _stream_value(stream)
+            return {"type": "client_response", "status": "ok",
+                    "xack": acked}
         elif op == "setrange":
             # Overwrite part of a string value, Redis SETRANGE:
             # starting at ``offset``, replace as many characters
@@ -2327,6 +2740,45 @@ class KVStore:
             if entries:
                 results.append([key, entries])
         return results
+
+    def xpending(self, key: str, group: str) -> dict:
+        """The pending-entries summary for ``group`` on the stream
+        at ``key`` — Redis XPENDING, summary form: ``pending``
+        the number of entries handed out and not yet acked,
+        ``min_id`` / ``max_id`` the smallest / largest pending
+        ID (None when nothing is pending), and ``consumers`` the
+        [[consumer, count], ...] pairs sorted by consumer name.
+        Raises TypeError when the value is a plain string: an
+        XPENDING reads a stream, not bytes, so a string key is
+        WRONGTYPE, like an xlen on a plain string. Raises
+        ValueError when the key does not exist or the group does
+        not exist on it: Redis's NOGROUP, a missing group is an
+        error, not an empty summary — a typo'd group name must
+        not read as "nothing pending". Pure read: no log entry,
+        no state change."""
+        value = self._data.get(key)
+        if value is None:
+            raise ValueError(
+                f"xpending failed: no such key {key!r} or consumer "
+                f"group {group!r}")
+        if not is_stream(value):
+            raise TypeError(
+                f"xpending failed: value of {key!r} is not a stream")
+        groups = _stream_data(value).get("groups", {})
+        if group not in groups:
+            raise ValueError(
+                f"xpending failed: no such key {key!r} or consumer "
+                f"group {group!r}")
+        pending = groups[group]["pending"]
+        counts: dict[str, int] = {}
+        for info in pending.values():
+            consumer = info["consumer"]
+            counts[consumer] = counts.get(consumer, 0) + 1
+        ids = sorted(pending, key=parse_stream_id)
+        return {"pending": len(pending),
+                "min_id": ids[0] if ids else None,
+                "max_id": ids[-1] if ids else None,
+                "consumers": [[c, counts[c]] for c in sorted(counts)]}
 
     def hexists(self, key: str, field: str) -> int:
         """1 when ``field`` is set in the hash at ``key``, 0

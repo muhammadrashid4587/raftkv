@@ -198,6 +198,11 @@ GEO_LAT_MAX = 85.05112878
 # never a real use — the same scale as the hset cap above, for the
 # same reason.
 XADD_MAX_FIELDS = 1000
+# Largest number of IDs one ``xack`` may carry. The IDs ride in
+# one log entry and one frame, so an unbounded list would let one
+# entry grow without limit — the same scale as the xadd cap above,
+# for the same reason.
+XACK_MAX_IDS = 1000
 # A stream ID is two 64-bit halves, milliseconds and sequence,
 # Redis's shape: each half is an unsigned 64-bit integer, and 0-0
 # is not a valid ID.
@@ -1490,7 +1495,8 @@ class RaftNode:
                 # The apply result matters for set, CAS, expire,
                 # expireat, pexpireat, incr, incrbyfloat, setnx,
                 # getset, append, getdel, setrange, getex, setbit,
-                # bitop, pfadd, hset, hdel, geoadd, xadd, and xtrim:
+                # bitop, pfadd, hset, hdel, geoadd, xadd, xtrim,
+                # xgroup_create, xreadgroup, and xack:
                 # their outcome is decided here, at this exact point
                 # in the log, so the result is recorded in the dedup
                 # table
@@ -1744,12 +1750,52 @@ class RaftNode:
                             self.sm.get(entry["command"]["key"]),
                             "set",
                             index=self.last_applied)
+                elif (op == "xgroup_create" and result is not None
+                        and result.get("status") == "ok"):
+                    # A successful group create fires like a set,
+                    # with the new (stream blob) value: a failed
+                    # create wrote nothing, so it fires nothing,
+                    # like a failed xadd.
+                    self.watch.notify(entry["command"]["key"],
+                                      self.sm.get(entry["command"]["key"]),
+                                      "set",
+                                      index=self.last_applied)
+                elif (op == "xreadgroup" and result is not None
+                        and result.get("status") == "ok"
+                        and result.get("entries")):
+                    # A readgroup that handed entries out fires
+                    # like a set, with the new (stream blob) value:
+                    # it changed the pending list and the last
+                    # delivery, so a watcher sees the change — and
+                    # a blocked XREAD waiting on this key wakes
+                    # and re-reads, finding nothing new, since no
+                    # entry was appended. A readgroup that handed
+                    # out nothing changed nothing, so it fires
+                    # nothing, like a failed xadd — and a failed
+                    # readgroup wrote nothing either.
+                    self.watch.notify(entry["command"]["key"],
+                                      self.sm.get(entry["command"]["key"]),
+                                      "set",
+                                      index=self.last_applied)
+                elif (op == "xack" and result is not None
+                        and result.get("status") == "ok"
+                        and result.get("xack", 0) > 0):
+                    # An ack that removed pending entries fires
+                    # like a set, with the new (stream blob) value:
+                    # an ack that removed nothing changed nothing,
+                    # so it fires nothing, like a failed xadd —
+                    # and a failed ack wrote nothing either.
+                    self.watch.notify(entry["command"]["key"],
+                                      self.sm.get(entry["command"]["key"]),
+                                      "set",
+                                      index=self.last_applied)
                 if (op in ("set", "cas", "expire", "expireat",
                            "pexpireat",
                            "incr", "incrbyfloat", "setnx", "getset",
                            "append", "getdel", "setrange", "getex",
                            "setbit", "bitop", "pfadd", "hset", "hdel",
-                           "geoadd", "xadd", "xtrim")
+                           "geoadd", "xadd", "xtrim", "xgroup_create",
+                           "xreadgroup", "xack")
                         and result is not None
                         and self.role == "leader"):
                     # Record the outcome only when a local waiter is
@@ -1763,7 +1809,8 @@ class RaftNode:
                     # index alone. Set, CAS, expire, expireat, pexpireat,
                     # incr, incrbyfloat, setnx, getset, append,
                     # getdel, setrange, getex, setbit, bitop, pfadd, hset, and
-                    # geoadd are
+                    # geoadd, xadd, xtrim, xgroup_create, xreadgroup, and
+                    # xack are
                     # the ops whose apply returns a result — a del
                     # returns None and has nothing to record.
                     key = _dedup_key(entry["command"])
@@ -2583,6 +2630,44 @@ class RaftNode:
                                     min_index=min_index,
                                     session_term=session_term,
                                     stale_ok=bool(msg.get("stale_ok")))
+        if op == "xpending":
+            # The pending-entries summary for one consumer group:
+            # how many entries are handed out and not yet acked,
+            # the smallest / largest pending ID, and the
+            # per-consumer counts — Redis XPENDING, summary form.
+            # It rides the same ReadIndex/lease path as a ``get``
+            # — one leadership confirmation, one apply wait — so
+            # the summary reflects the committed state as of the
+            # read index it names, exactly as linearizable, and a
+            # session read carries the same watermark a get would.
+            # The group must be a non-empty string: a bad group is
+            # a client error, not a summary of nonsense. Whether
+            # the key or the group exists is decided at serve time,
+            # like xlen's wrongtype: a missing key or group is an
+            # error in the payload (see _serve_read), not a list
+            # of zeros — a typo'd group name must not read as
+            # "nothing pending".
+            if self._is_removed():
+                return {"type": "client_response", "status": "error",
+                        "error": "this node was removed from the cluster"}
+            group = msg.get("group")
+            if not isinstance(group, str) or not group:
+                return {"type": "client_response", "status": "error",
+                        "error": "xpending group must be a non-empty "
+                                 "string"}
+            if (not isinstance(msg.get("key"), str)
+                    or not msg.get("key")):
+                return {"type": "client_response", "status": "error",
+                        "error": "xpending key must be a non-empty "
+                                 "string"}
+            min_index, session_term, error = self._parse_read_params(msg)
+            if error is not None:
+                return error
+            return self._serve_read(xpending_key=msg.get("key"),
+                                    xpending_group=group,
+                                    min_index=min_index,
+                                    session_term=session_term,
+                                    stale_ok=bool(msg.get("stale_ok")))
         key = msg.get("key")
         if op not in ("set", "get", "del", "cas", "ttl", "expire",
                       "expireat", "pexpireat",
@@ -2596,6 +2681,7 @@ class RaftNode:
                       "hscan",
                       "geoadd", "geodist",
                       "xadd", "xtrim", "xlen", "xrange",
+                      "xgroup_create", "xreadgroup", "xack",
                       "setex") \
                 or key is None:
             return {"type": "client_response", "status": "error",
@@ -2609,6 +2695,7 @@ class RaftNode:
                              "hlen/hexists/hkeys/hvals/hmget/hscan/"
                              "geoadd/geodist/"
                              "xadd/xtrim/xlen/xrange/"
+                             "xgroup_create/xreadgroup/xack/"
                              "setex "
                              "with a key"}
         if self._is_removed():
@@ -3397,9 +3484,14 @@ class RaftNode:
             # that passes "~" working instead of failing on a
             # distinction the store does not make. ``mode`` is
             # KEEPREF, DELREF, or ACKED when one is given: those
-            # govern consumer-group references, and there are no
-            # consumer groups yet, so the mode is recorded and
-            # ignored too.
+            # govern consumer-group references, and there are
+            # consumer groups now — DELREF (and no mode at all)
+            # drops the pending reference of a trimmed entry,
+            # KEEPREF keeps it — so the mode is recorded and
+            # honoured at apply time. ACKED is recorded too, and
+            # behaves like KEEPREF there: dropping only entries
+            # already acked by every group would need per-entry
+            # read tracking the store does not keep yet.
             strategy = msg.get("strategy")
             if (not isinstance(strategy, str)
                     or strategy.upper() not in ("MAXLEN", "MINID")):
@@ -3454,6 +3546,152 @@ class RaftNode:
                             "error": "xtrim mode must be \"KEEPREF\", "
                                      "\"DELREF\", or \"ACKED\""}
                 command["mode"] = mode.upper()
+        if op == "xgroup_create":
+            # Create a consumer group on a stream, Redis XGROUP
+            # CREATE: the group name must be a non-empty string,
+            # and the start ID "$" (only entries appended after
+            # the group is created), "0" (from the very first
+            # entry), a bare millisecond, or a full "ms-seq" — a
+            # malformed name or ID is a client error, not a log
+            # entry. Whether the key holds a stream (and whether
+            # the group already exists) is decided at apply time,
+            # like a CAS, not here. ``mkstream`` creates the
+            # stream when the key does not exist yet, like an
+            # xadd creating its key; it is a bare flag, so any
+            # other value is a client error too.
+            group = msg.get("group")
+            if not isinstance(group, str) or not group:
+                return {"type": "client_response", "status": "error",
+                        "error": "xgroup_create group must be a "
+                                 "non-empty string"}
+            command["group"] = group
+            start_id = msg.get("start_id", "$")
+            if not isinstance(start_id, str):
+                return {"type": "client_response", "status": "error",
+                        "error": "xgroup_create start_id must be a "
+                                 "string"}
+            if start_id != "$":
+                parts = start_id.split("-")
+                if (start_id in ("-", "+")
+                        or len(parts) not in (1, 2)
+                        or not parts[0].isdigit()
+                        or int(parts[0]) > STREAM_ID_MAX
+                        or (len(parts) == 2
+                            and (not parts[1].isdigit()
+                                 or int(parts[1]) > STREAM_ID_MAX))):
+                    return {"type": "client_response",
+                            "status": "error",
+                            "error": "xgroup_create start_id must be "
+                                     "\"$\", \"0\", \"ms\", or "
+                                     "\"ms-seq\""}
+            command["start_id"] = start_id
+            if msg.get("mkstream") is not None:
+                if msg.get("mkstream") is not True:
+                    return {"type": "client_response",
+                            "status": "error",
+                            "error": "xgroup_create MKSTREAM takes "
+                                     "no argument"}
+                command["mkstream"] = True
+        if op == "xreadgroup":
+            # Read entries for one consumer of one group, Redis
+            # XREADGROUP: the group and the consumer must be
+            # non-empty strings, and the ID ">" (new entries, past
+            # the group's last delivery) or a bound a range bound
+            # can parse — "0" (the group's pending entries from
+            # the start), a bare millisecond, or a full "ms-seq" —
+            # so a malformed name, consumer, or ID is a client
+            # error, not a log entry. "$" is not an ID here: ">"
+            # is the marker for new entries, and a "$" would mean
+            # nothing to re-read. The count, when one is given, is
+            # a non-negative integer (a bool is not one), and
+            # ``noack`` is a bare flag: deliver without recording
+            # the entries pending. Whether the key or the group
+            # exists is decided at apply time, like a CAS, not
+            # here.
+            group = msg.get("group")
+            if not isinstance(group, str) or not group:
+                return {"type": "client_response", "status": "error",
+                        "error": "xreadgroup group must be a "
+                                 "non-empty string"}
+            command["group"] = group
+            consumer = msg.get("consumer")
+            if not isinstance(consumer, str) or not consumer:
+                return {"type": "client_response", "status": "error",
+                        "error": "xreadgroup consumer must be a "
+                                 "non-empty string"}
+            command["consumer"] = consumer
+            id_str = msg.get("id", ">")
+            if not isinstance(id_str, str):
+                return {"type": "client_response", "status": "error",
+                        "error": "xreadgroup id must be a string"}
+            if id_str != ">":
+                parts = id_str.split("-")
+                if (id_str in ("-", "+", "$")
+                        or len(parts) not in (1, 2)
+                        or not parts[0].isdigit()
+                        or int(parts[0]) > STREAM_ID_MAX
+                        or (len(parts) == 2
+                            and (not parts[1].isdigit()
+                                 or int(parts[1]) > STREAM_ID_MAX))):
+                    return {"type": "client_response",
+                            "status": "error",
+                            "error": "xreadgroup id must be \">\", "
+                                     "\"0\", \"ms\", or \"ms-seq\""}
+            command["id"] = id_str
+            count = msg.get("count")
+            if count is not None and (
+                    not isinstance(count, int)
+                    or isinstance(count, bool) or count < 0):
+                return {"type": "client_response", "status": "error",
+                        "error": "xreadgroup count must be a "
+                                 "non-negative integer"}
+            if count is not None:
+                command["count"] = count
+            if msg.get("noack") is not None:
+                if msg.get("noack") is not True:
+                    return {"type": "client_response",
+                            "status": "error",
+                            "error": "xreadgroup NOACK takes no "
+                                     "argument"}
+                command["noack"] = True
+        if op == "xack":
+            # Acknowledge entries for a consumer group, Redis
+            # XACK: the group must be a non-empty string, and the
+            # IDs a non-empty list of at most XACK_MAX_IDS explicit
+            # "ms-seq" IDs — an empty list names nothing to ack,
+            # and a longer one would ride in one frame and one log
+            # entry without bound — so a malformed group or ID
+            # list is a client error, not a log entry. Whether the
+            # key or the group exists (and which IDs are actually
+            # pending) is decided at apply time, like a CAS, not
+            # here.
+            group = msg.get("group")
+            if not isinstance(group, str) or not group:
+                return {"type": "client_response", "status": "error",
+                        "error": "xack group must be a non-empty "
+                                 "string"}
+            command["group"] = group
+            ids = msg.get("ids")
+            if (not isinstance(ids, list) or not ids
+                    or len(ids) > XACK_MAX_IDS
+                    or any(not isinstance(i, str) for i in ids)):
+                return {"type": "client_response", "status": "error",
+                        "error": "xack ids must be a list of 1 to "
+                                 f"{XACK_MAX_IDS} stream IDs"}
+            for entry_id in ids:
+                parts = entry_id.split("-")
+                if (len(parts) != 2 or not parts[0].isdigit()
+                        or not parts[1].isdigit()
+                        or int(parts[0]) > STREAM_ID_MAX
+                        or int(parts[1]) > STREAM_ID_MAX
+                        or (int(parts[0]) == 0
+                            and int(parts[1]) == 0)):
+                    return {"type": "client_response",
+                            "status": "error",
+                            "error": "xack ids must be explicit "
+                                     "\"ms-seq\" stream IDs greater "
+                                     "than 0-0"}
+            command["ids"] = list(ids)
         if op == "setex":
             # Set a key with a wall-clock TTL, Redis SETEX: the
             # value is required, like a set's — a setex with no
@@ -4400,6 +4638,8 @@ class RaftNode:
                     xread_ids: list[str] | None = None,
                     xread_count: int | None = None,
                     xread_block_ms: int | None = None,
+                    xpending_key: str | None = None,
+                    xpending_group: str | None = None,
                     scan_prefix: str | None = None,
                     scan_limit: int = MAX_KEYS_SCAN,
                     scan_start_after: str | None = None) -> dict:
@@ -4546,6 +4786,18 @@ class RaftNode:
         keys were given — only streams with entries ride along,
         so a stream with nothing new is simply absent — plus
         ``timed_out`` when a block was given.
+        ``xpending_key`` / ``xpending_group`` serve the
+        pending-entries summary for one consumer group instead —
+        ``pending`` the number of entries handed out and not yet
+        acked, ``min_id`` / ``max_id`` the smallest / largest
+        pending ID (None when nothing is pending), and
+        ``consumers`` the [[consumer, count], ...] pairs sorted by
+        consumer name, Redis XPENDING in summary form — read off
+        the applied state machine the same way, so it is exactly
+        as linearizable as a ``get``; a plain string value is a
+        client error, not a summary, and a missing key or group
+        is one too — a typo'd group name must not read as
+        "nothing pending".
         ``scan_prefix`` serves a key enumeration instead — every key
         in the applied state machine starting with the prefix,
         sorted, at most ``scan_limit`` of them, with ``truncated``
@@ -4896,6 +5148,22 @@ class RaftNode:
                             xread_keys, xread_ids)
                     return {"streams": self.sm.xread(
                         xread_keys, _xread_resolved[0], xread_count)}
+                except (TypeError, ValueError) as e:
+                    return {"status": "error", "error": str(e)}
+            if xpending_key is not None:
+                # The pending-entries summary for one consumer
+                # group: how many entries are handed out and not
+                # yet acked, the smallest / largest pending ID,
+                # and the per-consumer counts — Redis XPENDING,
+                # summary form — with the same wrongtype rule as
+                # xlen: a plain string value is a client error,
+                # not a summary, carried the same way, overriding
+                # the "ok" in the response literal. A missing key
+                # or group is the same kind of error, from the
+                # store's own validation.
+                try:
+                    return self.sm.xpending(xpending_key,
+                                            xpending_group)
                 except (TypeError, ValueError) as e:
                     return {"status": "error", "error": str(e)}
             if keys is not None:

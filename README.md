@@ -825,8 +825,9 @@ logic and the failure handling, not the key-value API on top.
   too. Like hget and geodist it is a read, so it is not a pipeline
   op. The honest limit is the same growth as xadd: the whole
   stream is one blob, so a read still scans the blob to filter
-  it — there is no index over entries — and there are no consumer
-  groups yet, so XREADGROUP is still missing.
+  it — there is no index over entries — and consumer groups are a
+  separate read: XREADGROUP (v0.67.0) hands entries to one
+  consumer of a group instead of reading the stream raw.
 - **Streams (XTRIM)** — since v0.66.0 `xtrim key MAXLEN [~|=]
   threshold [KEEPREF|DELREF|ACKED]` or `xtrim key MINID [~|=]
   threshold [KEEPREF|DELREF|ACKED]` (`Session.xtrim(k, strategy,
@@ -856,11 +857,75 @@ logic and the failure handling, not the key-value API on top.
   "mode": "KEEPREF"|"DELREF"|"ACKED"}` is a pipeline op too. The
   "~" flag is accepted and ignored — this store trims exactly,
   since there is no radix tree whose nodes need a visit budget —
-  and the mode is accepted and ignored too: those govern
-  consumer-group references, and there are no consumer groups
-  yet, so no entry carries one. The honest limit is the same
+  and the mode governs consumer-group references: DELREF — and no
+  mode at all, the default — drops the pending reference of a
+  trimmed entry, so the entry stops being pending in every group;
+  KEEPREF keeps it, so the entry stays pending even though its
+  data is gone; ACKED is accepted and behaves like KEEPREF in
+  this version. The honest limit is the same
   growth as xadd: the whole stream is one blob, so a trim still
   rewrites the blob whole — there is no index over entries.
+- **Streams (XREADGROUP)** — since v0.67.0 `xgroup_create key group
+  [start] [--mkstream]`, `xreadgroup key group consumer [id]
+  [--count n] [--noack]`, `xack key group id ...`, and `xpending key
+  group` (`Session.xgroup_create(k, group, start_id, mkstream)`,
+  `Session.xreadgroup(k, group, consumer, id, count, noack)`,
+  `Session.xack(k, group, *ids)`, `Session.xpending(k, group)`,
+  `client.xgroup_create(addr, k, group, start_id, mkstream)`,
+  `client.xreadgroup(addr, k, group, consumer, id, count, noack)`,
+  `client.xack(addr, k, group, ids)`,
+  `client.xpending(addr, k, group)`, and the same four on the CLI)
+  are consumer groups — Redis XGROUP CREATE / XREADGROUP / XACK /
+  XPENDING. A group starts reading from "$" (only entries appended
+  after the group is created), "0" (from the very first entry), a
+  bare millisecond, or a full "ms-seq", and MKSTREAM creates the
+  stream when the key does not exist yet. XREADGROUP with ">" hands
+  a consumer the entries appended after the group's last delivery —
+  in ID order, at most COUNT of them — and marks each one pending
+  for that consumer, moving the last delivery to the last entry
+  handed out, so two consumers reading ">" split the entries
+  between them and each entry goes to exactly one consumer; with
+  any other ID ("0", a bare millisecond, or a full "ms-seq") it
+  re-reads the consumer's own pending entries at or after the ID,
+  and each re-read raises that entry's delivery count by one, so a
+  consumer can tell a first delivery from a retry. NOACK delivers
+  without recording the entries pending, though the last delivery
+  still advances. XACK acknowledges pending entries — for any
+  consumer, since an ack names the entry, not its holder — and
+  answers how many actually left the pending list. XPENDING
+  answers the summary: the pending count, the smallest and largest
+  pending ID, and the per-consumer counts sorted by consumer name.
+  The groups ride in the stream blob with the entries, so they
+  survive snapshots and replay exactly like the entries, and the
+  blob stays a pure function of (entries, groups), so every node
+  computes the same bytes. A group that already exists fails with
+  `xgroup_create_failed` / `group_exists`, a missing key or group
+  fails a readgroup or an ack with `no_group`, and a missing key
+  or group fails XPENDING as a client error, not a summary of
+  zeros — a typo'd group name must not read as "nothing pending".
+  A plain string value fails all four with `wrongtype`. The
+  outcomes are decided at apply time, at each entry's exact
+  position in the log, like a CAS, so a retry with the same session
+  id returns the first attempt's entries or count instead of
+  delivering or acking twice — a redelivery only ever comes from a
+  fresh explicit-ID read, never from a retry. XREADGROUP and XACK
+  are writes, not reads: handing entries out and acking them
+  mutate the pending list and the last delivery, and the mutation
+  must replicate through the log like any other, so every node
+  agrees on who holds what; XPENDING is a pure read through the
+  same ReadIndex path as a `get`. Trimming drops the pending
+  reference of a trimmed entry by default (DELREF, and no mode at
+  all); KEEPREF keeps it, so the entry stays pending even though
+  its data is gone, and a later explicit-ID re-read simply skips
+  it. `{"op": "xgroup_create", ...}`, `{"op": "xreadgroup", ...}`,
+  and `{"op": "xack", ...}` are pipeline ops too; like other reads,
+  XPENDING is not one. The honest limits are the same growth as
+  xadd — the whole stream is one blob, so a readgroup still scans
+  the blob — and the scope: no BLOCK yet (a readgroup with nothing
+  to hand out answers empty at once), no XGROUP SETID / DESTROY /
+  DELCONSUMER, and XPENDING answers the summary form only, not
+  the per-entry form — and XTRIM's ACKED mode behaves like KEEPREF
+  in this version.
 - **HyperLogLog** — since v0.47.0 `pfadd key element [element ...]`
   (`Session.pfadd(k, *elements)`, `client.pfadd(addr, k, *elements)`,
   `pfadd key element ...` on the CLI) adds elements to the
@@ -3691,9 +3756,11 @@ entries left in `log.jsonl` are dropped by their index on reload.
   xadd. A trim that removes entries fires a `set` watch event
   with the new value, a trim that empties the stream fires a
   `del`, and a trim that removes nothing fires nothing. The "~"
-  flag and the KEEPREF / DELREF / ACKED modes are accepted and
-  ignored: the trim is exact either way, and there are no
-  consumer groups yet, so no entry carries a reference.
+  flag is accepted and ignored — the trim is exact either way —
+  and the KEEPREF / DELREF / ACKED modes are honoured: DELREF
+  (and no mode at all) drops the pending reference of a trimmed
+  entry, KEEPREF keeps it, and ACKED behaves like KEEPREF in
+  this version.
   `Session.xtrim`, `client.xtrim`, and `xtrim` on the CLI; like
   xadd, it is a pipeline op.
   `tests/test_streams.py` proves it: store-level MAXLEN keeping
@@ -3715,3 +3782,56 @@ entries left in `log.jsonl` are dropped by their index on reload.
   a new roadmap item grounded in this project's purpose,
   proposed by the next run — candidates: XREADGROUP (consumer
   groups).
+- ~~Streams (XREADGROUP)~~ — done in v0.67.0,
+  Nov 27, 2026: `xgroup_create key group [start] [--mkstream]`,
+  `xreadgroup key group consumer [id] [--count n] [--noack]`,
+  `xack key group id ...`, and `xpending key group` are consumer
+  groups — Redis XGROUP CREATE / XREADGROUP / XACK / XPENDING. A
+  group starts reading from "$" (only entries appended after the
+  group is created), "0" (from the very first entry), a bare
+  millisecond, or a full "ms-seq", and MKSTREAM creates the stream
+  when the key does not exist yet. XREADGROUP with ">" hands a
+  consumer the entries appended after the group's last delivery and
+  marks each one pending for that consumer, moving the last delivery
+  to the last entry handed out, so two consumers reading ">" split
+  the entries between them; with any other ID it re-reads the
+  consumer's own pending entries at or after the ID, and each
+  re-read raises that entry's delivery count by one. NOACK delivers
+  without recording the entries pending, though the last delivery
+  still advances. XACK acknowledges pending entries — for any
+  consumer — and answers how many actually left the pending list.
+  XPENDING answers the summary: the pending count, the smallest and
+  largest pending ID, and the per-consumer counts sorted by consumer
+  name. The groups ride in the stream blob with the entries, so
+  they survive snapshots and replay exactly like the entries. A
+  group that already exists fails with `group_exists`, a missing key
+  or group fails a readgroup or an ack with `no_group`, and a
+  missing key or group fails XPENDING as a client error, not a
+  summary of zeros. The outcomes are decided at apply time, so a
+  retry with the same session id returns the first attempt's entries
+  or count instead of delivering or acking twice. XREADGROUP and
+  XACK are writes, not reads — the mutation replicates through the
+  log like any other — and XPENDING is a pure read through the same
+  ReadIndex path as a `get`. Trimming drops the pending reference
+  of a trimmed entry by default; KEEPREF keeps it. `Session`
+  methods, `client` module functions, and the four commands on the
+  CLI; xgroup_create, xreadgroup, and xack are pipeline ops, and
+  XPENDING, like other reads, is not one.
+  `tests/test_xreadgroup.py` proves it: store-level groups from
+  "$" and "0", MKSTREAM creating an empty stream, duplicate groups,
+  missing keys, and wrongtype; two consumers splitting the entries,
+  explicit-ID re-reads raising delivery counts, NOACK delivering
+  without pending, XACK acking any consumer's entries, the XPENDING
+  summary, snapshot loads rebuilding groups with their pending
+  lists and delivery counts, and XTRIM dropping pending references
+  by default while KEEPREF and ACKED keep them; and cluster-level
+  full flow replicated to every node, dedup retries delivering
+  once, bad arguments as client errors with no log entry, session
+  read-your-writes, the module functions from a follower, pipelined
+  group ops in position, snapshot + restart survival, and the CLI
+  end to end.
+  The roadmap is exhausted again, so the next real thing is
+  a new roadmap item grounded in this project's purpose,
+  proposed by the next run — candidates: XREADGROUP BLOCK (blocking
+  consumer-group reads), XGROUP SETID / DESTROY / DELCONSUMER, or
+  XPENDING in per-entry form.

@@ -1482,8 +1482,10 @@ class TestXtrim(unittest.TestCase):
 
     def test_xtrim_approximate_and_mode_accepted(self):
         """The "~" flag and the KEEPREF / DELREF / ACKED modes are
-        accepted and ignored: the trim is exact either way, since
-        there are no consumer groups yet."""
+        accepted: the trim is exact either way, and with no consumer
+        groups on the stream the mode changes nothing — what each
+        mode does to pending references is proved in
+        test_xreadgroup.py."""
         store = self._five()
         for mode in ("KEEPREF", "DELREF", "ACKED"):
             result = store.apply({"op": "xtrim", "key": "events",
