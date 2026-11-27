@@ -163,6 +163,15 @@ HDEL_MAX_FIELDS = 1000
 # nonsense, never a real use — the same scale as the hdel cap
 # above, for the same reason.
 HMGET_MAX_FIELDS = 1000
+# Default and largest number of fields one ``hscan`` call
+# examines. The count is a hint, like Redis's COUNT — a page
+# examines at most that many fields, matching or not — so the
+# cap bounds one reply the way the hmget cap bounds one
+# request: 1,000 fields is far past a real page of one hash,
+# and a client scanning more just calls again with the cursor
+# the reply carried, like a keys client paging past the limit.
+HSCAN_DEFAULT_COUNT = 10
+HSCAN_MAX_COUNT = 1000
 # Leader lease for reads (Raft dissertation §6.4): how long a majority
 # ack stays fresh. Must be shorter than ELECTION_TIMEOUT_MIN (150ms):
 # a follower that acked at time T heard from the leader no later than
@@ -2403,6 +2412,7 @@ class RaftNode:
                       "setbit", "getbit", "pfadd", "pfcount",
                       "hset", "hget", "hdel", "hgetall",
                       "hlen", "hexists", "hkeys", "hvals", "hmget",
+                      "hscan",
                       "setex") \
                 or key is None:
             return {"type": "client_response", "status": "error",
@@ -2412,7 +2422,8 @@ class RaftNode:
                              "strlen/getdel/"
                              "getrange/setrange/getex/setbit/getbit/"
                              "pfadd/pfcount/hset/hget/hdel/hgetall/"
-                             "hlen/hexists/hkeys/hvals/hmget/setex "
+                             "hlen/hexists/hkeys/hvals/hmget/hscan/"
+                             "setex "
                              "with a key"}
         if self._is_removed():
             return {"type": "client_response", "status": "error",
@@ -2670,6 +2681,54 @@ class RaftNode:
                 return error
             return self._serve_read(hmget_key=key,
                                     hmget_fields=list(fields),
+                                    min_index=min_index,
+                                    session_term=session_term,
+                                    stale_ok=bool(msg.get("stale_ok")))
+        if op == "hscan":
+            # One page of a hash: the field-value pairs from the
+            # cursor on, Redis HSCAN. It rides the same
+            # ReadIndex/lease path as a ``get`` — one leadership
+            # confirmation, one apply wait — so the page reflects
+            # the committed state as of the read index it names,
+            # exactly as linearizable, and a session read carries
+            # the same watermark a get would. A string key is a
+            # client error, not a page: the payload carries its
+            # own "status": "error" (see _serve_read), like
+            # hget's wrongtype. The cursor must be a
+            # non-negative integer (a bool is not one) — it is an
+            # offset into the sorted field list, so 0 starts the
+            # scan and a reply's cursor of 0 ends it; the match
+            # must be a string glob when one is given; the count
+            # is a hint for how many fields one call examines,
+            # default 10, at most HSCAN_MAX_COUNT — all validated
+            # here, on the leader, before anything is served, so
+            # a malformed scan is a client error, not a page of
+            # nonsense.
+            cursor = msg.get("cursor", 0)
+            if (not isinstance(cursor, int)
+                    or isinstance(cursor, bool) or cursor < 0):
+                return {"type": "client_response", "status": "error",
+                        "error": "hscan cursor must be a "
+                                 "non-negative integer"}
+            match = msg.get("match")
+            if match is not None and not isinstance(match, str):
+                return {"type": "client_response", "status": "error",
+                        "error": "hscan match must be a string"}
+            count = msg.get("count")
+            if count is None:
+                count = HSCAN_DEFAULT_COUNT
+            if (not isinstance(count, int) or isinstance(count, bool)
+                    or count < 1 or count > HSCAN_MAX_COUNT):
+                return {"type": "client_response", "status": "error",
+                        "error": "hscan count must be an integer "
+                                 f"between 1 and {HSCAN_MAX_COUNT}"}
+            min_index, session_term, error = self._parse_read_params(msg)
+            if error is not None:
+                return error
+            return self._serve_read(hscan_key=key,
+                                    hscan_cursor=cursor,
+                                    hscan_match=match,
+                                    hscan_count=count,
                                     min_index=min_index,
                                     session_term=session_term,
                                     stale_ok=bool(msg.get("stale_ok")))
@@ -3764,6 +3823,10 @@ class RaftNode:
                     hvals_key: str | None = None,
                     hmget_key: str | None = None,
                     hmget_fields: list[str] | None = None,
+                    hscan_key: str | None = None,
+                    hscan_cursor: int = 0,
+                    hscan_match: str | None = None,
+                    hscan_count: int = 10,
                     scan_prefix: str | None = None,
                     scan_limit: int = MAX_KEYS_SCAN,
                     scan_start_after: str | None = None) -> dict:
@@ -3844,6 +3907,15 @@ class RaftNode:
         the same way, so it is exactly as linearizable as a
         ``get``; a plain string value is a client error, not a
         list.
+        ``hscan_key`` serves one page of a hash instead — the
+        [field, value] pairs from ``hscan_cursor`` on, at most
+        ``hscan_count`` fields examined, filtered by the glob in
+        ``hscan_match`` when one is given, Redis HSCAN — read
+        off the applied state machine the same way, so it is
+        exactly as linearizable as a ``get``; a plain string
+        value is a client error, not a page. The reply carries
+        ``cursor`` — the offset to resume from, 0 when the scan
+        is done — and ``pairs``, the page in sorted field order.
         ``scan_prefix`` serves a key enumeration instead — every key
         in the applied state machine starting with the prefix,
         sorted, at most ``scan_limit`` of them, with ``truncated``
@@ -3858,7 +3930,7 @@ class RaftNode:
         appear in a later page if it sorts ahead of the cursor.
         Everything else — the lease fast path, the pending-read wait,
         the fallback, the redirect on leadership loss — is identical
-        for all fifteen shapes, so a scan or a TTL query is exactly as
+        for all sixteen shapes, so a scan or a TTL query is exactly as
         linearizable as a single ``get``.
 
         A stale read (``stale_ok``) is the one exception to the
@@ -4090,6 +4162,23 @@ class RaftNode:
                 try:
                     return {"values": self.sm.hmget(
                         hmget_key, hmget_fields)}
+                except TypeError as e:
+                    return {"status": "error", "error": str(e)}
+            if hscan_key is not None:
+                # One page of a hash: the [field, value] pairs
+                # from the cursor on — at most hscan_count fields
+                # examined, filtered by the glob in hscan_match
+                # when one is given — and the next cursor, 0 when
+                # the scan is done, Redis HSCAN — with the same
+                # wrongtype rule as hmget: a plain string value
+                # is a client error, not a page, carried the same
+                # way, overriding the "ok" in the response
+                # literal.
+                try:
+                    next_cursor, pairs = self.sm.hscan(
+                        hscan_key, hscan_cursor, hscan_match,
+                        hscan_count)
+                    return {"cursor": next_cursor, "pairs": pairs}
                 except TypeError as e:
                     return {"status": "error", "error": str(e)}
             if keys is not None:

@@ -26,7 +26,8 @@ import time
 import unittest
 
 from harness import Cluster, client_request, wait_for_key
-from raftkv.client import Session, main as client_main
+from raftkv.client import Session, hscan_all as client_hscan_all, \
+    main as client_main
 from raftkv.store import KVStore
 
 
@@ -88,6 +89,14 @@ def hmget(addr, key="user:1", fields=None):
                                  "key": key,
                                  "fields": fields if fields is not None
                                  else ["name"]})
+
+
+def hscan(addr, key="user:1", cursor=0, match=None, count=10):
+    msg = {"type": "client", "op": "hscan", "key": key,
+           "cursor": cursor, "count": count}
+    if match is not None:
+        msg["match"] = match
+    return client_request(addr, msg)
 
 
 def write(addr, key="user:1", value="plain"):
@@ -436,6 +445,116 @@ class TestHashStore(unittest.TestCase):
         self.assertEqual(store2.hvals("u"), ["phl", "mo"])
         self.assertEqual(store2.hmget("u", ["name", "nope"]),
                          ["mo", None])
+
+    def test_hscan_pages_through_fields_with_cursor(self):
+        store = KVStore()
+        self.assertEqual(store.hscan("nope"), (0, []))
+        store.apply({"op": "hset", "key": "u",
+                     "pairs": [["name", "mo"], ["city", "phl"],
+                               ["age", "22"], ["lang", "py"],
+                               ["os", "linux"]]})
+        # Sorted field order — age, city, lang, name, os — and
+        # the cursor is the offset to resume from, 0 when the
+        # scan is done.
+        cursor, pairs = store.hscan("u", count=2)
+        self.assertEqual(cursor, 2)
+        self.assertEqual(pairs, [["age", "22"], ["city", "phl"]])
+        cursor, pairs = store.hscan("u", cursor=cursor, count=2)
+        self.assertEqual(cursor, 4)
+        self.assertEqual(pairs, [["lang", "py"], ["name", "mo"]])
+        cursor, pairs = store.hscan("u", cursor=cursor, count=2)
+        self.assertEqual(cursor, 0)
+        self.assertEqual(pairs, [["os", "linux"]])
+        # The whole walk rebuilds the map, in order.
+        walked: list[list[str]] = []
+        cursor = 0
+        while True:
+            cursor, pairs = store.hscan("u", cursor=cursor, count=2)
+            walked.extend(pairs)
+            if cursor == 0:
+                break
+        self.assertEqual(dict(walked),
+                         {"name": "mo", "city": "phl", "age": "22",
+                          "lang": "py", "os": "linux"})
+        # A count past the end finishes in one page.
+        self.assertEqual(store.hscan("u", count=100),
+                         (0, [["age", "22"], ["city", "phl"],
+                              ["lang", "py"], ["name", "mo"],
+                              ["os", "linux"]]))
+        # A cursor past the end finishes the scan with no page.
+        self.assertEqual(store.hscan("u", cursor=99), (0, []))
+
+    def test_hscan_match_filters_by_glob(self):
+        store = KVStore()
+        store.apply({"op": "hset", "key": "u",
+                     "pairs": [["name", "mo"], ["nick", "rashid"],
+                               ["city", "phl"], ["age", "22"],
+                               ["lang", "py"]]})
+        # Sorted order is age, city, lang, name, nick. The count
+        # counts fields examined, not pairs returned — so the
+        # first page examines age and city, matches neither, and
+        # still has a cursor to go.
+        cursor, pairs = store.hscan("u", match="n*", count=2)
+        self.assertEqual(pairs, [])
+        self.assertEqual(cursor, 2)
+        cursor, pairs = store.hscan("u", cursor=cursor, match="n*",
+                                    count=2)
+        self.assertEqual(pairs, [["name", "mo"]])
+        self.assertEqual(cursor, 4)
+        cursor, pairs = store.hscan("u", cursor=cursor, match="n*",
+                                    count=2)
+        self.assertEqual(pairs, [["nick", "rashid"]])
+        self.assertEqual(cursor, 0)
+        # "?" is one character, "[...]" a character class, "*"
+        # everything — the fnmatch glob, not a substring.
+        self.assertEqual(store.hscan("u", match="ag?"),
+                         (0, [["age", "22"]]))
+        self.assertEqual(store.hscan("u", match="[cn]*"),
+                         (0, [["city", "phl"], ["name", "mo"],
+                              ["nick", "rashid"]]))
+        self.assertEqual(store.hscan("u", match="zzz*"), (0, []))
+        self.assertEqual(store.hscan("u", match="*")[1],
+                         [["age", "22"], ["city", "phl"],
+                          ["lang", "py"], ["name", "mo"],
+                          ["nick", "rashid"]])
+        # A match that names nothing still walks the whole hash.
+        cursor, pairs = store.hscan("u", match="zzz*", count=2)
+        self.assertEqual(pairs, [])
+        self.assertEqual(cursor, 2)
+
+    def test_hscan_on_plain_string_raises(self):
+        store = KVStore()
+        store.apply({"op": "set", "key": "u", "value": "plain"})
+        with self.assertRaises(TypeError):
+            store.hscan("u")
+
+    def test_hscan_rejects_bad_cursor_match_and_count(self):
+        store = KVStore()
+        store.apply({"op": "hset", "key": "u",
+                     "pairs": [["a", "1"]]})
+        for bad in ({"cursor": -1}, {"cursor": True},
+                    {"cursor": "0"}, {"cursor": 1.5},
+                    {"count": 0}, {"count": 1001},
+                    {"count": True}, {"count": "10"},
+                    {"match": 5}, {"match": ["n*"]}):
+            with self.assertRaises(ValueError, msg=bad):
+                store.hscan("u", **bad)
+
+    def test_hscan_survives_snapshot_load(self):
+        # The blob is a plain string in _data, so a snapshot
+        # carries it exactly like any other value — and the
+        # scan pages off the loaded blob in the same order.
+        store = KVStore()
+        store.apply({"op": "hset", "key": "u",
+                     "pairs": [["name", "mo"], ["city", "phl"],
+                               ["age", "22"]]})
+        state = store.items()
+        store2 = KVStore()
+        store2.load(state)
+        self.assertEqual(store2.hscan("u", count=2),
+                         (2, [["age", "22"], ["city", "phl"]]))
+        self.assertEqual(store2.hscan("u", cursor=2, count=2),
+                         (0, [["name", "mo"]]))
 
     def test_hdel_rejects_malformed_fields(self):
         store = KVStore()
@@ -1661,6 +1780,267 @@ class TestHashCluster(unittest.TestCase):
             with contextlib.redirect_stderr(err):
                 rc = client_main(["--node", node, "hmget", "user:1",
                                   "name"])
+            self.assertEqual(rc, 1)
+            self.assertIn("not a hash", err.getvalue())
+        finally:
+            cluster.stop_all()
+
+    def test_hscan_succeeds_and_replicates(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            self.assertEqual(
+                hset(addr, pairs=[["name", "mo"], ["city", "phl"],
+                                  ["age", "22"], ["lang", "py"],
+                                  ["os", "linux"]]).get("hset"), 5)
+            # Page through with count 2, in sorted field order.
+            resp = hscan(addr, count=2)
+            self.assertEqual(resp.get("status"), "ok", resp)
+            self.assertEqual(resp.get("cursor"), 2, resp)
+            self.assertEqual(resp.get("pairs"),
+                             [["age", "22"], ["city", "phl"]], resp)
+            resp = hscan(addr, cursor=2, count=2)
+            self.assertEqual(resp.get("cursor"), 4, resp)
+            self.assertEqual(resp.get("pairs"),
+                             [["lang", "py"], ["name", "mo"]], resp)
+            resp = hscan(addr, cursor=4, count=2)
+            self.assertEqual(resp.get("cursor"), 0, resp)
+            self.assertEqual(resp.get("pairs"), [["os", "linux"]],
+                             resp)
+            # A MATCH page filters by glob, and the cursor still
+            # advances past the fields the pattern skipped.
+            resp = hscan(addr, match="n*", count=2)
+            self.assertEqual(resp.get("cursor"), 2, resp)
+            self.assertEqual(resp.get("pairs"), [], resp)
+            resp = hscan(addr, cursor=2, match="n*", count=2)
+            self.assertEqual(resp.get("cursor"), 4, resp)
+            self.assertEqual(resp.get("pairs"), [["name", "mo"]],
+                             resp)
+            resp = hscan(addr, cursor=4, match="n*", count=2)
+            self.assertEqual(resp.get("cursor"), 0, resp)
+            self.assertEqual(resp.get("pairs"), [], resp)
+            # The whole scan walks every node the same way.
+            resp = client_hscan_all(addr, "user:1", count=2)
+            self.assertEqual(resp.get("status"), "ok", resp)
+            self.assertEqual(resp.get("cursor"), 0, resp)
+            self.assertEqual(resp.get("pages"), 3, resp)
+            self.assertEqual(resp.get("pairs"),
+                             [["age", "22"], ["city", "phl"],
+                              ["lang", "py"], ["name", "mo"],
+                              ["os", "linux"]], resp)
+            for node_id in cluster.live:
+                node = cluster.nodes[node_id]
+                self.assertTrue(
+                    wait_for_hgetall(node, "user:1",
+                                     {"name": "mo", "city": "phl",
+                                      "age": "22", "lang": "py",
+                                      "os": "linux"}))
+                self.assertEqual(
+                    node.sm.hscan("user:1", count=2),
+                    (2, [["age", "22"], ["city", "phl"]]))
+            # The scan tracks a delete on every node too.
+            self.assertEqual(hdel(addr, fields=["age"]).get("hdel"), 1)
+            for node_id in cluster.live:
+                node = cluster.nodes[node_id]
+                self.assertTrue(
+                    wait_for_hgetall(node, "user:1",
+                                     {"name": "mo", "city": "phl",
+                                      "lang": "py", "os": "linux"}))
+                self.assertEqual(
+                    node.sm.hscan("user:1", count=100),
+                    (0, [["city", "phl"], ["lang", "py"],
+                         ["name", "mo"], ["os", "linux"]]))
+            self.assertEqual(
+                hscan(addr, count=100).get("pairs"),
+                [["city", "phl"], ["lang", "py"], ["name", "mo"],
+                 ["os", "linux"]])
+        finally:
+            cluster.stop_all()
+
+    def test_hscan_missing_key_answers_empty(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            resp = hscan(addr)
+            self.assertEqual(resp.get("status"), "ok", resp)
+            self.assertEqual(resp.get("cursor"), 0, resp)
+            self.assertEqual(resp.get("pairs"), [], resp)
+            resp = hscan(addr, match="n*", count=2)
+            self.assertEqual(resp.get("cursor"), 0, resp)
+            self.assertEqual(resp.get("pairs"), [], resp)
+        finally:
+            cluster.stop_all()
+
+    def test_hscan_on_plain_string_is_client_error(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            self.assertEqual(write(addr).get("status"), "ok")
+            resp = hscan(addr)
+            self.assertEqual(resp.get("status"), "error", resp)
+            self.assertIn("not a hash", resp.get("error", ""), resp)
+            # The string is still there, untouched.
+            self.assertEqual(client_request(
+                addr, {"type": "client", "op": "get",
+                       "key": "user:1"}).get("value"), "plain")
+        finally:
+            cluster.stop_all()
+
+    def test_hscan_malformed_args_rejected_with_no_log_entry(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            node = cluster.nodes[leader.id]
+            before = len(node.log)
+            for bad in ({"cursor": -1}, {"cursor": True},
+                        {"cursor": "0"}, {"count": 0},
+                        {"count": 1001}, {"count": True},
+                        {"match": 5}):
+                msg = {"type": "client", "op": "hscan",
+                       "key": "user:1"}
+                msg.update(bad)
+                resp = client_request(addr, msg)
+                self.assertEqual(resp.get("status"), "error", bad)
+            # Nothing was logged for any of them.
+            self.assertEqual(len(node.log), before)
+        finally:
+            cluster.stop_all()
+
+    def test_hscan_continues_after_leader_change(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            self.assertEqual(
+                hset(addr, pairs=[["name", "mo"]]).get("hset"), 1)
+            self.assertEqual(hscan(addr).get("pairs"),
+                             [["name", "mo"]])
+            cluster.stop_node(leader.id)
+            new_leader = cluster.wait_for_leader()
+            addr = cluster.addrs[new_leader.id]
+            self.assertEqual(
+                hset(addr, pairs=[["city", "phl"]]).get("hset"), 1)
+            self.assertEqual(hscan(addr, count=1).get("pairs"),
+                             [["city", "phl"]])
+            self.assertEqual(hscan(addr, cursor=1, count=1)
+                             .get("pairs"), [["name", "mo"]])
+            self.assertEqual(hscan(addr, cursor=1, count=1)
+                             .get("cursor"), 0)
+        finally:
+            cluster.stop_all()
+
+    def test_session_hscan_is_read_your_writes(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            with Session(addr) as session:
+                resp = session.hset("user:1", {"name": "mo",
+                                               "city": "phl",
+                                               "age": "22"})
+                self.assertEqual(resp.get("status"), "ok", resp)
+                self.assertEqual(resp.get("hset"), 3, resp)
+                self.assertGreater(session.last_write_index, 0)
+                resp = session.hscan("user:1", count=2)
+                self.assertEqual(resp.get("status"), "ok", resp)
+                self.assertEqual(resp.get("cursor"), 2, resp)
+                self.assertEqual(resp.get("pairs"),
+                                 [["age", "22"], ["city", "phl"]])
+                resp = session.hscan("user:1", cursor=2, count=2)
+                self.assertEqual(resp.get("cursor"), 0, resp)
+                self.assertEqual(resp.get("pairs"),
+                                 [["name", "mo"]])
+                resp = session.hscan("user:1", match="c*")
+                self.assertEqual(resp.get("pairs"),
+                                 [["city", "phl"]])
+                resp = session.hscan_all("user:1", count=2)
+                self.assertEqual(resp.get("status"), "ok", resp)
+                self.assertEqual(resp.get("pages"), 2, resp)
+                self.assertEqual(resp.get("pairs"),
+                                 [["age", "22"], ["city", "phl"],
+                                  ["name", "mo"]])
+                resp = session.hdel("user:1", "city")
+                self.assertEqual(resp.get("status"), "ok", resp)
+                self.assertEqual(resp.get("hdel"), 1, resp)
+                resp = session.hscan_all("user:1")
+                self.assertEqual(resp.get("pairs"),
+                                 [["age", "22"], ["name", "mo"]])
+                # A bad cursor never goes on the wire.
+                resp = session.hscan("user:1", cursor=-1)
+                self.assertEqual(resp.get("status"), "error", resp)
+        finally:
+            cluster.stop_all()
+
+    def test_hscan_cli(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            host, port = cluster.addrs[leader.id]
+            node = f"{host}:{port}"
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "hscan", "user:1",
+                                  "0"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(out.getvalue()),
+                             {"cursor": 0, "pairs": []})
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "hset", "user:1",
+                                  "name", "mo", "city", "phl",
+                                  "age", "22"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(out.getvalue().strip(), "3")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "hscan", "user:1",
+                                  "0", "--count", "2"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(out.getvalue()),
+                             {"cursor": 2,
+                              "pairs": [["age", "22"],
+                                        ["city", "phl"]]})
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "hscan", "user:1",
+                                  "2", "--count", "2"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(out.getvalue()),
+                             {"cursor": 0,
+                              "pairs": [["name", "mo"]]})
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "hscan", "user:1",
+                                  "0", "--match", "c*"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(out.getvalue()),
+                             {"cursor": 0,
+                              "pairs": [["city", "phl"]]})
+            # A negative cursor exits 1 and names the failure.
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = client_main(["--node", node, "hscan", "user:1",
+                                  "-1"])
+            self.assertEqual(rc, 1)
+            self.assertIn("non-negative", err.getvalue())
+            # A failed hscan on a plain string exits 1 too.
+            self.assertEqual(write(cluster.addrs[leader.id],
+                                   value="plain").get("status"), "ok")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = client_main(["--node", node, "hscan", "user:1",
+                                  "0"])
             self.assertEqual(rc, 1)
             self.assertIn("not a hash", err.getvalue())
         finally:

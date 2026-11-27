@@ -782,6 +782,38 @@ logic and the failure handling, not the key-value API on top.
   hget and hgetall they are reads, so they are not pipeline
   ops. The honest limit is the same encoding as hset: a plain
   `get` on a hash key still returns the encoded blob.
+- **Hash field scan** — since v0.59.0 `hscan key cursor [MATCH
+  pattern] [COUNT n]` (`Session.hscan(k, cursor, match, count)`,
+  `client.hscan(addr, k, cursor, match, count)`, `hscan key
+  cursor [--match pattern] [--count n]` on the CLI) answers one
+  page of the hash at the key — the [field, value] pairs from
+  the cursor on, in sorted field order, and the next cursor to
+  pass back, 0 when the scan is done — Redis HSCAN. The cursor
+  is an offset into the sorted field list: start at 0 and keep
+  going until a reply answers 0. COUNT is how many fields one
+  call examines (a hint, like Redis's COUNT — default 10, at
+  most 1000), MATCH a glob pattern — `*`, `?`, `[abc]` —
+  applied to field names, so a selective MATCH can answer a
+  page with no pairs at all and a cursor still to go. A missing
+  key answers cursor 0 with an empty page. It is a pure read:
+  no log entry, no state change, no watch event, and the TTL
+  deadline is untouched — the page is read off the applied
+  state machine exactly like an hget. A key holding a plain
+  string makes it a client error, not a page. It rides the same
+  ReadIndex path as a `get`, so it carries the same session
+  watermark and is exactly as linearizable, and it survives
+  snapshots and replay exactly like any other hash read — the
+  blob is a plain string in the store, so nothing about the
+  encoding changes. `Session.hscan_all` / `client.hscan_all`
+  walk the pages in one call and answer every pair in sorted
+  field order, plus `pages`, how many RPCs the walk took. Like
+  hget and hgetall it is a read, so it is not a pipeline op.
+  The honest limit is the same encoding as hset: a plain `get`
+  on a hash key still returns the encoded blob — and the scan
+  as a whole is not a snapshot: each page is linearizable on
+  its own, but a field written or deleted between pages can be
+  missed, or appear in a later page if it sorts ahead of the
+  cursor, like the keys scan.
 - **Key enumeration** — since v0.31.0 one `keys` RPC lists the
   store's keys (`client.keys(prefix, limit, start_after)`,
   `Session.keys(prefix, limit, start_after)`, `keys --prefix p
@@ -1096,7 +1128,7 @@ make test
 # or: python3 -m unittest discover -s tests -v
 ```
 
-660 tests, plus a smoke test for the benchmark script, all passing:
+672 tests, plus a smoke test for the benchmark script, all passing:
 
 | Test | What it proves |
 |---|---|
@@ -3140,3 +3172,39 @@ entries left in `log.jsonl` are dropped by their index on reload.
   The roadmap is exhausted again, so the next real thing is
   a new roadmap item grounded in this project's purpose,
   proposed by the next run.
+- ~~Hashes (HSCAN)~~ — done in v0.59.0,
+  Nov 26, 2026: `hscan key cursor [MATCH pattern] [COUNT n]`
+  answers one page of the hash at the key — the [field, value]
+  pairs from the cursor on, in sorted field order, and the next
+  cursor to pass back, 0 when the scan is done — Redis HSCAN.
+  The cursor is an offset into the sorted field list, so 0
+  starts the scan and a reply's cursor of 0 ends it; COUNT is
+  how many fields one call examines (a hint, like Redis's
+  COUNT — default 10, at most 1000), and MATCH is a glob
+  pattern — `*`, `?`, `[abc]` — applied to field names, so a
+  selective MATCH can answer a page with no pairs at all and a
+  cursor still to go. A missing key answers cursor 0 with an
+  empty page, and a cursor past the end finishes the scan the
+  same way. It is a pure read — no log entry, no state change,
+  no watch event — read off the applied state machine through
+  the same ReadIndex path as a `get`, so each page is exactly
+  as linearizable, and a plain string value is a client error,
+  not a page. A bad cursor, match, or count is a client error
+  and appends nothing. `Session.hscan` / `Session.hscan_all`,
+  `client.hscan` / `client.hscan_all`, and `hscan` on the CLI
+  expose it; like hget and hgetall it is a read, so it is not
+  a pipeline op. `tests/test_hash.py` proves it: store-level
+  paging through the fields with the cursor, a MATCH page that
+  answers empty and still has a cursor to go, the `?` and
+  `[...]` glob forms, a missing key and a cursor past the end
+  answering empty, a plain string raising, bad cursors, matches,
+  and counts raising, and the scan paging off a snapshot load;
+  replication to every node, a missing key answering empty on
+  the cluster, a plain string a client error, malformed args
+  rejected with no log entry, continuing after a leader change,
+  session read-your-writes with a full `hscan_all` walk, and
+  the CLI end to end with `--match` and `--count`.
+  The roadmap is exhausted again, so the next real thing is
+  a new roadmap item grounded in this project's purpose,
+  proposed by the next run — candidates: BITOP (bitwise ops
+  across string keys), or GEO, or streams.

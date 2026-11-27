@@ -9,6 +9,7 @@ pure function of (current state, command).
 """
 
 import bisect
+import fnmatch
 import hashlib
 import json
 import math
@@ -1505,6 +1506,68 @@ class KVStore:
                 f"hmget failed: value of {key!r} is not a hash")
         stored = _hash_fields(value)
         return [stored.get(f) for f in fields]
+
+    def hscan(self, key: str, cursor: int = 0,
+              match: str | None = None, count: int = 10
+              ) -> tuple[int, list[list[str]]]:
+        """One page of the fields in the hash at ``key`` — the
+        next cursor and the [field, value] pairs on this page,
+        Redis HSCAN. The cursor is an offset into the sorted
+        field list: start at 0, pass each reply's cursor back,
+        and stop when a reply answers cursor 0 — the iteration
+        is done. ``count`` is how many fields one call examines
+        (a hint, like Redis's COUNT — a page examines at most
+        that many fields, matching or not, so a selective MATCH
+        can answer a page with no pairs at all and a cursor
+        still to go); ``match`` is a glob pattern — ``*``,
+        ``?``, ``[abc]`` — applied to field names with
+        fnmatch, and None matches everything. A missing key
+        answers (0, []), and a cursor past the end finishes
+        the scan with (0, []). Raises TypeError when the value
+        is a plain string: an HSCAN reads a hash, not bytes, so
+        a string key is WRONGTYPE, like an hkeys on a plain
+        string. Raises ValueError for a bad cursor or count: a
+        cursor must be a non-negative integer (a bool is not
+        one) and a count an integer from 1 to 1000 — the same
+        cap as an hmget batch, for the same reason, so one
+        reply never carries an unbounded page. Pure read: no
+        log entry, no state change. The pairs come back in
+        sorted field order, so the pages together rebuild the
+        map in order — and each page is a read off the applied
+        state machine exactly like an hget, but the scan as a
+        whole is not a snapshot: a field written or deleted
+        between pages can be missed, or appear in a later page
+        if it sorts ahead of the cursor, like the keys scan."""
+        if (not isinstance(cursor, int) or isinstance(cursor, bool)
+                or cursor < 0):
+            raise ValueError(
+                "hscan cursor must be a non-negative integer")
+        if (not isinstance(count, int) or isinstance(count, bool)
+                or count < 1 or count > 1000):
+            raise ValueError(
+                "hscan count must be an integer between 1 and 1000")
+        if match is not None and not isinstance(match, str):
+            raise ValueError("hscan match must be a string")
+        value = self._data.get(key)
+        if value is None:
+            return 0, []
+        if not is_hash(value):
+            raise TypeError(
+                f"hscan failed: value of {key!r} is not a hash")
+        fields = _hash_fields(value)
+        names = sorted(fields)
+        if cursor >= len(names):
+            return 0, []
+        pairs: list[list[str]] = []
+        i = cursor
+        examined = 0
+        while i < len(names) and examined < count:
+            name = names[i]
+            examined += 1
+            i += 1
+            if match is None or fnmatch.fnmatchcase(name, match):
+                pairs.append([name, fields[name]])
+        return (0 if i >= len(names) else i), pairs
 
     def getbit(self, key: str, offset: int) -> int:
         """The bit at ``offset`` in the string value at ``key``,

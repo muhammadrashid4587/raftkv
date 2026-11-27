@@ -997,6 +997,101 @@ class Session:
                 self.last_read_term = int(resp.get("read_term") or 0)
         return resp
 
+    def hscan(self, key: str, cursor: int = 0,
+              match: str | None = None, count: int = 10) -> dict:
+        """Ask for one page of the hash at ``key``, Redis HSCAN:
+        the [field, value] pairs from ``cursor`` on — at most
+        ``count`` fields examined (a hint, like Redis's COUNT),
+        filtered by the glob in ``match`` when one is given — and
+        the next ``cursor`` to pass back, 0 when the scan is
+        done. Start at cursor 0 and keep going until a reply
+        answers cursor 0. A missing key answers cursor 0 with an
+        empty page, and a plain string value is a client error —
+        not a page. A bad cursor, match, or count never goes on
+        the wire and returns the server's error shape instead.
+        It rides the same ReadIndex path as ``get``, so it
+        carries the same session watermark and advances the read
+        watermark from the reply's ``read_index`` exactly the
+        same way: a page queried after your own write shows the
+        fields that write set, and a later read never goes
+        backwards past it."""
+        if not isinstance(cursor, int) or isinstance(cursor, bool) \
+                or cursor < 0:
+            return {"type": "client_response", "status": "error",
+                    "error": "hscan cursor must be a "
+                             "non-negative integer"}
+        if match is not None and not isinstance(match, str):
+            return {"type": "client_response", "status": "error",
+                    "error": "hscan match must be a string"}
+        if not isinstance(count, int) or isinstance(count, bool) \
+                or count < 1 or count > 1000:
+            return {"type": "client_response", "status": "error",
+                    "error": "hscan count must be an integer "
+                             "between 1 and 1000"}
+        if self.last_read_index > self.last_write_index:
+            min_index = self.last_read_index
+            term = self.last_read_term
+        else:
+            min_index = self.last_write_index
+            term = self.last_write_term
+        msg: dict = {"type": "client", "op": "hscan", "key": key,
+                     "cursor": cursor, "count": count,
+                     "client_id": self.client_id,
+                     "min_commit_index": min_index,
+                     "session_term": term}
+        if match is not None:
+            msg["match"] = match
+        resp = request(self.node_addr, msg, pool=self._pooled)
+        if (resp.get("status") == "ok"
+                and resp.get("read_index") is not None):
+            read_index = int(resp["read_index"])
+            if read_index > self.last_read_index:
+                self.last_read_index = read_index
+                self.last_read_term = int(resp.get("read_term") or 0)
+        return resp
+
+    def hscan_all(self, key: str, match: str | None = None,
+                  count: int = 10) -> dict:
+        """Read every field of the hash at ``key`` by paging
+        through the ``hscan`` RPC: each page fetches at most
+        ``count`` fields examined, then resumes from the page's
+        ``cursor`` until a page answers cursor 0. The reply is
+        one merged ``hscan`` response — every [field, value]
+        pair in sorted field order, ``cursor`` 0 — plus
+        ``pages``, how many RPCs the walk took, and the
+        ``read_index`` / ``read_term`` of the last page. Each
+        page is linearizable on its own, but the walk as a whole
+        is not a snapshot: a field written or deleted mid-walk
+        can be missed or appear once the cursor has passed it.
+        An error on any page stops the walk and returns that
+        error response instead of a partial list."""
+        all_pairs: list[list[str]] = []
+        cursor = 0
+        pages = 0
+        last_resp: dict = {}
+        while True:
+            resp = self.hscan(key, cursor=cursor, match=match,
+                              count=count)
+            if resp.get("status") != "ok":
+                return resp
+            pages += 1
+            all_pairs.extend(resp.get("pairs") or [])
+            last_resp = resp
+            cursor = resp.get("cursor")
+            if cursor == 0:
+                break
+            if not isinstance(cursor, int):
+                # A page that ends the scan any other way cannot
+                # be resumed — treat it as a server bug, not a
+                # partial answer.
+                return {"type": "client_response", "status": "error",
+                        "error": "hscan page returned a "
+                                 "non-integer cursor"}
+        last_resp = dict(last_resp)
+        last_resp["pairs"] = all_pairs
+        last_resp["pages"] = pages
+        return last_resp
+
     def get(self, key: str) -> dict:
         # The read carries the higher of the two watermarks — the
         # last acknowledged write, or the newest state a previous
@@ -2301,6 +2396,84 @@ def hmget(node_addr: tuple[str, int], key: str,
                    timeout=timeout)
 
 
+def hscan(node_addr: tuple[str, int], key: str, cursor: int = 0,
+          match: str | None = None, count: int = 10,
+          timeout: float = 12.0) -> dict:
+    """Ask for one page of the hash at ``key``, following leader
+    redirects like ``request`` — Redis HSCAN.
+
+    One request serves the page through the leader's ReadIndex
+    path, so it reflects the committed state as of one read
+    index, exactly as linearizable as a ``get``. The reply is
+    the plain hscan response (``status`` ``ok`` with ``cursor``
+    — the offset to resume from, 0 when the scan is done —
+    and ``pairs``, the [field, value] pairs on this page in
+    sorted field order — plus the ``read_index`` /
+    ``read_term`` it was measured at). Start at cursor 0 and
+    keep going until a reply answers cursor 0. A missing key
+    answers cursor 0 with an empty page. A bad cursor, match,
+    or count never goes on the wire and returns the server's
+    error shape instead. A plain string value is a client
+    error, not a page."""
+    if not isinstance(cursor, int) or isinstance(cursor, bool) \
+            or cursor < 0:
+        return {"type": "client_response", "status": "error",
+                "error": "hscan cursor must be a non-negative "
+                         "integer"}
+    if match is not None and not isinstance(match, str):
+        return {"type": "client_response", "status": "error",
+                "error": "hscan match must be a string"}
+    if not isinstance(count, int) or isinstance(count, bool) \
+            or count < 1 or count > 1000:
+        return {"type": "client_response", "status": "error",
+                "error": "hscan count must be an integer between "
+                         "1 and 1000"}
+    msg: dict = {"type": "client", "op": "hscan", "key": key,
+                 "cursor": cursor, "count": count}
+    if match is not None:
+        msg["match"] = match
+    return request(node_addr, msg, timeout=timeout)
+
+
+def hscan_all(node_addr: tuple[str, int], key: str,
+              match: str | None = None, count: int = 10,
+              timeout: float = 12.0) -> dict:
+    """Read every field of the hash at ``key`` by paging through
+    the ``hscan`` RPC: each page fetches at most ``count``
+    fields examined, then resumes from the page's ``cursor``
+    until a page answers cursor 0. The reply is one merged
+    ``hscan`` response — every [field, value] pair in sorted
+    field order, ``cursor`` 0 — plus ``pages``, how many RPCs
+    the walk took. Each page is linearizable on its own, but
+    the walk as a whole is not a snapshot: a field written or
+    deleted mid-walk can be missed or appear once the cursor
+    has passed it. An error on any page stops the walk and
+    returns that error response instead of a partial list."""
+    all_pairs: list[list[str]] = []
+    cursor = 0
+    pages = 0
+    last_resp: dict = {}
+    while True:
+        resp = hscan(node_addr, key, cursor=cursor, match=match,
+                     count=count, timeout=timeout)
+        if resp.get("status") != "ok":
+            return resp
+        pages += 1
+        all_pairs.extend(resp.get("pairs") or [])
+        last_resp = resp
+        cursor = resp.get("cursor")
+        if cursor == 0:
+            break
+        if not isinstance(cursor, int):
+            return {"type": "client_response", "status": "error",
+                    "error": "hscan page returned a non-integer "
+                             "cursor"}
+    last_resp = dict(last_resp)
+    last_resp["pairs"] = all_pairs
+    last_resp["pages"] = pages
+    return last_resp
+
+
 def mset(node_addr: tuple[str, int], pairs: list,
          ttl_entries: int | None = None,
          timeout: float = 12.0) -> dict:
@@ -2943,6 +3116,22 @@ def main(argv: list[str] | None = None) -> int:
     p_hmget.add_argument("fields", nargs="+",
                          help="fields to read: f1 f2 ... "
                               "(at most 1000 fields)")
+    p_hscan = sub.add_parser(
+        "hscan",
+        help="print one page of the hash at key as JSON "
+             "({\"cursor\": next, \"pairs\": [[field, value], ...]}): "
+             "start at cursor 0 and pass each reply's cursor back "
+             "until it answers 0")
+    p_hscan.add_argument("key")
+    p_hscan.add_argument("cursor", type=int,
+                         help="offset into the sorted field list to "
+                              "resume from (0 starts the scan)")
+    p_hscan.add_argument("--match",
+                         help="glob pattern to filter field names "
+                              "(*, ?, [abc])")
+    p_hscan.add_argument("--count", type=int, default=10,
+                         help="fields examined per page "
+                              "(default 10, at most 1000)")
     p_add = sub.add_parser("add-server",
                            help="add a server to the cluster (Raft §6)")
     p_add.add_argument("server_id")
@@ -3038,7 +3227,7 @@ def main(argv: list[str] | None = None) -> int:
               "setnx", "getset", "append", "strlen", "getdel",
               "getex", "getrange", "setrange", "setbit", "getbit",
               "pfadd", "pfcount", "hset", "hget", "hdel", "hgetall",
-              "hlen", "hexists", "hkeys", "hvals", "hmget",
+              "hlen", "hexists", "hkeys", "hvals", "hmget", "hscan",
               "setex", "expireat",
               "pexpireat"):
         msg["key"] = args.key
@@ -3144,6 +3333,11 @@ def main(argv: list[str] | None = None) -> int:
         msg["fields"] = args.fields
     if op == "hmget":
         msg["fields"] = args.fields
+    if op == "hscan":
+        msg["cursor"] = args.cursor
+        if args.match is not None:
+            msg["match"] = args.match
+        msg["count"] = args.count
     if op in ("set", "del", "cas", "mset", "expire", "incr",
               "incrbyfloat", "setnx",
               "getset", "append", "getdel", "getex", "setrange",
@@ -3236,6 +3430,9 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(resp.get("values")))
         elif op == "hmget":
             print(json.dumps(resp.get("values")))
+        elif op == "hscan":
+            print(json.dumps({"cursor": resp.get("cursor"),
+                              "pairs": resp.get("pairs")}))
         elif op == "mget":
             print(json.dumps(resp.get("values")))
         elif op == "keys":
