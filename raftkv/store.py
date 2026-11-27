@@ -221,9 +221,9 @@ def geo_distance(lon1: float, lat1: float, lon2: float,
 # it does for a hash key. The honest limit is the growth itself:
 # there is no MAXLEN trimming yet, so a stream grows without
 # bound — every entry stays in the one blob, and the blob rides
-# every snapshot and replay whole — and there is no XREAD yet, so
-# a blocking read of new entries is still missing; XRANGE / XLEN
-# (v0.64.0) read the entries back.
+# every snapshot and replay whole. XRANGE / XLEN (v0.64.0) read
+# the entries back; XREAD (v0.65.0) reads the entries appended
+# after one ID per stream, blocking for new ones when asked.
 STREAM_PREFIX = "\x00raftkv-stream\x00"
 
 # Largest number of fields one ``xadd`` may carry. The pairs ride
@@ -2117,6 +2117,119 @@ class KVStore:
                     break
                 entries.append([entry_id, dict(fields)])
         return entries
+
+    def stream_top(self, key: str) -> str | None:
+        """The top ID of the stream at ``key`` — None when the key
+        does not exist. Raises TypeError when the value is a plain
+        string: a top ID is a stream notion, not a string one,
+        like an xlen on a plain string. Pure read: no log entry,
+        no state change."""
+        value = self._data.get(key)
+        if value is None:
+            return None
+        if not is_stream(value):
+            raise TypeError(
+                f"stream top failed: value of {key!r} is not a stream")
+        return _stream_data(value)["last"]
+
+    def xread_resolve(self, keys: list[str],
+                      ids: list[str]) -> list[str]:
+        """The concrete ID each xread id names: "$" becomes the
+        stream's top ID at this moment — "0-0" when the key does
+        not exist, so every future entry counts — and any other
+        id passes through unchanged. Raises ValueError when the
+        keys are not a non-empty list of non-empty strings, when
+        the ids are not one string per key, or when an id is "-",
+        "+" (a range bound, not a stream ID), or any other shape
+        a range bound cannot parse; raises TypeError when a "$"
+        key holds a plain string. Resolving once and reusing the
+        list is what makes a blocking XREAD with "$" measure from
+        the top the call started with, instead of moving the
+        goalpost past the entries that arrived while it waited.
+        Pure read: no log entry, no state change."""
+        if (not isinstance(keys, list) or not keys
+                or not all(isinstance(k, str) and k for k in keys)):
+            raise ValueError(
+                "xread keys must be a non-empty list of "
+                "non-empty strings")
+        if (not isinstance(ids, list) or len(ids) != len(keys)
+                or not all(isinstance(i, str) for i in ids)):
+            raise ValueError(
+                "xread ids must be a list of one id per key")
+        resolved: list[str] = []
+        for key, id_str in zip(keys, ids):
+            if id_str == "$":
+                value = self._data.get(key)
+                if value is None:
+                    resolved.append("0-0")
+                elif not is_stream(value):
+                    raise TypeError(
+                        f"xread failed: value of {key!r} is not "
+                        "a stream")
+                else:
+                    last = _stream_data(value)["last"]
+                    resolved.append(last if last is not None
+                                    else "0-0")
+            elif id_str in ("-", "+"):
+                raise ValueError(
+                    "xread id must be \"$\", \"ms\", or \"ms-seq\"")
+            else:
+                # A bare millisecond or a full "ms-seq", like an
+                # xrange bound — validated here so a bad id is an
+                # error before any key is looked up.
+                parse_stream_range_bound(id_str)
+                resolved.append(id_str)
+        return resolved
+
+    def xread(self, keys: list[str], ids: list[str],
+              count: int | None = None) -> list[list]:
+        """The entries appended to the streams at ``keys`` after
+        the matching ID in ``ids``, in ID order — Redis XREAD.
+        Each id is "$" (only entries after the stream's top ID
+        at this moment), a bare millisecond (that millisecond,
+        sequence 0), or a full "ms-seq". The reply is [[key,
+        [[id, {field: value}], ...]], ...] — only the streams
+        that hold at least one entry after their id ride along,
+        in the order the keys were given, so a stream with
+        nothing new is simply absent — and ``count`` caps how
+        many entries one stream returns, like Redis's COUNT —
+        None means no cap, 0 answers nothing for that stream.
+        A missing key holds no entries, so it rides along never.
+        Raises TypeError when a key holds a plain string: an
+        XREAD reads a stream, not bytes, so a string key is
+        WRONGTYPE, like an xlen on a plain string. Raises
+        ValueError for bad keys, ids, or count: a count must be
+        a non-negative integer (a bool is not one). Pure read:
+        no log entry, no state change. The entries come back as
+        [id, {field: value}] pairs, in ID order — the same shape
+        the stream blob stores them in — and each field map is a
+        fresh copy, so the caller cannot mutate the stored blob's
+        parse."""
+        if count is not None and (
+                not isinstance(count, int) or isinstance(count, bool)
+                or count < 0):
+            raise ValueError(
+                "xread count must be a non-negative integer")
+        resolved = self.xread_resolve(keys, ids)
+        results: list[list] = []
+        for key, id_str in zip(keys, resolved):
+            after = parse_stream_range_bound(id_str)
+            value = self._data.get(key)
+            if value is None:
+                continue
+            if not is_stream(value):
+                raise TypeError(
+                    f"xread failed: value of {key!r} is not a stream")
+            entries: list[list] = []
+            for entry_id, fields in _stream_data(value)["entries"]:
+                entry = parse_stream_id(entry_id)
+                if entry > after:
+                    if count is not None and len(entries) >= count:
+                        break
+                    entries.append([entry_id, dict(fields)])
+            if entries:
+                results.append([key, entries])
+        return results
 
     def hexists(self, key: str, field: str) -> int:
         """1 when ``field`` is set in the hash at ``key``, 0

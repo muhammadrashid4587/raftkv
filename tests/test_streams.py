@@ -26,6 +26,7 @@ import contextlib
 import io
 import json
 import re
+import threading
 import time
 import unittest
 
@@ -34,6 +35,7 @@ from raftkv.client import Session, main as client_main
 from raftkv.client import xadd as client_xadd
 from raftkv.client import xlen as client_xlen
 from raftkv.client import xrange as client_xrange
+from raftkv.client import xread as client_xread
 from raftkv.store import KVStore, STREAM_PREFIX, is_stream
 
 ID_RE = re.compile(r"^\d+-\d+$")
@@ -60,6 +62,17 @@ def xrange(addr, key="events", start="-", end="+", count=None):
            "start": start, "end": end}
     if count is not None:
         msg["count"] = count
+    return client_request(addr, msg)
+
+
+def xread(addr, keys=("events",), ids=("0-0",), count=None,
+          block=None):
+    msg = {"type": "client", "op": "xread", "keys": list(keys),
+           "ids": list(ids)}
+    if count is not None:
+        msg["count"] = count
+    if block is not None:
+        msg["block"] = block
     return client_request(addr, msg)
 
 
@@ -367,6 +380,114 @@ class TestStreamsStore(unittest.TestCase):
         for bad_count in (-1, True, "2", 1.5):
             with self.assertRaises(ValueError, msg=str(bad_count)):
                 store.xrange("s", "-", "+", count=bad_count)
+
+    def test_xread_multi_stream_after_ids(self):
+        """XREAD reads the entries after one ID per stream, in ID
+        order — only the streams that hold one ride along, in the
+        order the keys were given, and a missing key or a stream
+        with nothing new is simply absent."""
+        store = KVStore()
+        self.assertEqual(store.xread(["s"], ["0-0"]), [])
+        for entry_id in ("100-5", "100-6", "101-0"):
+            store.apply({"op": "xadd", "key": "s",
+                         "pairs": [["a", entry_id]], "id": entry_id})
+        for entry_id in ("200-0", "200-1"):
+            store.apply({"op": "xadd", "key": "t",
+                         "pairs": [["b", entry_id]], "id": entry_id})
+        self.assertEqual(store.xread(["s", "t"], ["0-0", "0-0"]),
+                         [["s", [["100-5", {"a": "100-5"}],
+                                 ["100-6", {"a": "100-6"}],
+                                 ["101-0", {"a": "101-0"}]]],
+                          ["t", [["200-0", {"b": "200-0"}],
+                                 ["200-1", {"b": "200-1"}]]]])
+        # An ID past a stream's top leaves that stream out.
+        self.assertEqual(store.xread(["s", "t"], ["101-0", "0-0"]),
+                         [["t", [["200-0", {"b": "200-0"}],
+                                 ["200-1", {"b": "200-1"}]]]])
+        # A missing key never rides along.
+        self.assertEqual(store.xread(["nope", "s"], ["0-0", "100-6"]),
+                         [["s", [["101-0", {"a": "101-0"}]]]])
+        # The order follows the keys given, not the keyspace.
+        self.assertEqual(
+            [pair[0] for pair in
+             store.xread(["t", "s"], ["0-0", "0-0"])],
+            ["t", "s"])
+
+    def test_xread_dollar_means_only_new_entries(self):
+        """An ID of "$" resolves to the stream's top at read time:
+        only entries appended after the call count — and on a
+        missing key it resolves to 0-0, so every future entry
+        counts."""
+        store = KVStore()
+        store.apply({"op": "xadd", "key": "s",
+                     "pairs": [["a", "1"]], "id": "100-5"})
+        self.assertEqual(store.xread(["s"], ["$"]), [])
+        store.apply({"op": "xadd", "key": "s",
+                     "pairs": [["a", "2"]], "id": "100-6"})
+        self.assertEqual(store.xread(["s"], ["$"]), [])
+        # Resolving once, then appending, is what a blocking
+        # "$" read measures from: the entry that lands after
+        # the resolution is the one it sees.
+        resolved = store.xread_resolve(["s"], ["$"])
+        self.assertEqual(resolved, ["100-6"])
+        store.apply({"op": "xadd", "key": "s",
+                     "pairs": [["a", "3"]], "id": "101-0"})
+        self.assertEqual(store.xread(["s"], resolved),
+                         [["s", [["101-0", {"a": "3"}]]]])
+        # A missing key resolves "$" to 0-0.
+        self.assertEqual(store.xread_resolve(["nope"], ["$"]),
+                         ["0-0"])
+
+    def test_xread_count_caps_per_stream_and_zero_is_empty(self):
+        """COUNT caps how many entries one stream returns — per
+        stream, not across the call — and COUNT 0 answers nothing
+        for that stream."""
+        store = KVStore()
+        for entry_id in ("100-5", "100-6", "101-0"):
+            store.apply({"op": "xadd", "key": "s",
+                         "pairs": [["a", entry_id]], "id": entry_id})
+            store.apply({"op": "xadd", "key": "t",
+                         "pairs": [["b", entry_id]], "id": entry_id})
+        self.assertEqual(store.xread(["s", "t"], ["0-0", "0-0"],
+                                     count=2),
+                         [["s", [["100-5", {"a": "100-5"}],
+                                 ["100-6", {"a": "100-6"}]]],
+                          ["t", [["100-5", {"b": "100-5"}],
+                                 ["100-6", {"b": "100-6"}]]]])
+        self.assertEqual(store.xread(["s"], ["0-0"], count=0), [])
+
+    def test_xread_wrongtype_and_bad_args_raise(self):
+        """A plain string value fails an xread with TypeError and
+        leaves the value untouched; bad keys, ids, and counts
+        raise ValueError — even on a missing key, since the ids
+        are parsed before any key is looked up."""
+        store = KVStore()
+        store.apply({"op": "set", "key": "k", "value": "x"})
+        with self.assertRaises(TypeError):
+            store.xread(["k"], ["0-0"])
+        with self.assertRaises(TypeError):
+            store.xread(["k"], ["$"])
+        self.assertEqual(store.get("k"), "x")
+        for bad_keys, bad_ids in (([], ["0-0"]),
+                                  (["s"], []),
+                                  (["s"], ["0-0", "0-0"]),
+                                  (["s", "t"], ["0-0"]),
+                                  ([5], ["0-0"]),
+                                  ([""], ["0-0"]),
+                                  ("s", ["0-0"]),
+                                  (["s"], "0-0"),
+                                  (["s"], [5]),
+                                  (["s"], [None])):
+            with self.assertRaises(ValueError,
+                                   msg=str((bad_keys, bad_ids))):
+                store.xread(bad_keys, bad_ids)
+        for bad_id in ("bogus", "1-2-3", "", "-", "+", "*", "5-",
+                       "18446744073709551616-0"):
+            with self.assertRaises(ValueError, msg=bad_id):
+                store.xread(["s"], [bad_id])
+        for bad_count in (-1, True, "2", 1.5):
+            with self.assertRaises(ValueError, msg=str(bad_count)):
+                store.xread(["s"], ["0-0"], count=bad_count)
 
 
 class TestStreamsCluster(unittest.TestCase):
@@ -915,6 +1036,298 @@ class TestStreamsCluster(unittest.TestCase):
                                   "bogus", "+"])
             self.assertEqual(rc, 1)
             self.assertIn("bound", err.getvalue())
+        finally:
+            cluster.stop_all()
+
+    def test_xread_cluster(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            for entry_id in ("100-5", "100-6", "101-0"):
+                resp = xadd(addr, pairs=(("a", entry_id),),
+                            id=entry_id)
+                self.assertEqual(resp.get("status"), "ok", resp)
+            for entry_id in ("200-0", "200-1"):
+                resp = xadd(addr, key="alerts",
+                            pairs=(("b", entry_id),), id=entry_id)
+                self.assertEqual(resp.get("status"), "ok", resp)
+            # XREAD reads the entries after one ID per stream, in
+            # ID order — including from a follower, which
+            # redirects to the leader.
+            for node_id in cluster.live:
+                resp = xread(cluster.addrs[node_id],
+                             keys=("events", "alerts"),
+                             ids=("0-0", "0-0"))
+                self.assertEqual(resp.get("status"), "ok", resp)
+                self.assertEqual(resp.get("streams"),
+                                 [["events",
+                                   [["100-5", {"a": "100-5"}],
+                                    ["100-6", {"a": "100-6"}],
+                                    ["101-0", {"a": "101-0"}]]],
+                                  ["alerts",
+                                   [["200-0", {"b": "200-0"}],
+                                    ["200-1", {"b": "200-1"}]]]])
+            # "$" means only entries after the top: nothing new
+            # here, so the reply is empty — and a missing key
+            # never rides along.
+            resp = xread(addr, keys=("events", "nope"),
+                         ids=("$", "0-0"))
+            self.assertEqual(resp.get("status"), "ok", resp)
+            self.assertEqual(resp.get("streams"), [])
+            # A per-stream COUNT cap, from a follower.
+            follower = next(n for n in cluster.live
+                            if n != leader.id)
+            resp = xread(cluster.addrs[follower],
+                         keys=("events", "alerts"), ids=("0-0", "0-0"),
+                         count=1)
+            self.assertEqual(resp.get("streams"),
+                             [["events", [["100-5", {"a": "100-5"}]]],
+                              ["alerts", [["200-0", {"b": "200-0"}]]]])
+            # The module function follows redirects too.
+            resp = client_xread(cluster.addrs[follower],
+                                ["events"], ["100-5"])
+            self.assertEqual(resp.get("status"), "ok", resp)
+            self.assertEqual(resp.get("streams"),
+                             [["events", [["100-6", {"a": "100-6"}],
+                                         ["101-0", {"a": "101-0"}]]]],
+                             resp)
+        finally:
+            cluster.stop_all()
+
+    def test_xread_block_returns_when_entry_lands(self):
+        """A BLOCK read with nothing yet returns as soon as an
+        entry lands — it does not wait out the whole block."""
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+
+            def _append_later():
+                time.sleep(0.3)
+                xadd(addr, pairs=(("a", "late"),), id="100-5")
+
+            writer = threading.Thread(target=_append_later)
+            writer.start()
+            try:
+                started = time.monotonic()
+                resp = client_xread(addr, ["events"], ["0-0"],
+                                    block=5000)
+                elapsed = time.monotonic() - started
+            finally:
+                writer.join()
+            self.assertEqual(resp.get("status"), "ok", resp)
+            self.assertEqual(resp.get("streams"),
+                             [["events",
+                               [["100-5", {"a": "late"}]]]], resp)
+            self.assertFalse(resp.get("timed_out"), resp)
+            # It woke on the entry, well before the 5s block.
+            self.assertLess(elapsed, 3.0, elapsed)
+        finally:
+            cluster.stop_all()
+
+    def test_xread_block_with_dollar_sees_only_new_entries(self):
+        """A BLOCK read with "$" sees only the entries appended
+        after the call — the "$" is resolved once, at the read
+        index, so the entry that wakes it is the one it
+        returns."""
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            for entry_id in ("100-5", "100-6"):
+                resp = xadd(addr, pairs=(("a", entry_id),),
+                            id=entry_id)
+                self.assertEqual(resp.get("status"), "ok", resp)
+
+            def _append_later():
+                time.sleep(0.3)
+                xadd(addr, pairs=(("a", "new"),), id="101-0")
+
+            writer = threading.Thread(target=_append_later)
+            writer.start()
+            try:
+                resp = client_xread(addr, ["events"], ["$"],
+                                    block=5000)
+            finally:
+                writer.join()
+            self.assertEqual(resp.get("status"), "ok", resp)
+            self.assertEqual(resp.get("streams"),
+                             [["events",
+                               [["101-0", {"a": "new"}]]]], resp)
+            self.assertFalse(resp.get("timed_out"), resp)
+        finally:
+            cluster.stop_all()
+
+    def test_xread_block_times_out_empty(self):
+        """A BLOCK read on a stream nothing lands in answers an
+        empty list with timed_out set, after about the block —
+        not an error, and not a hang."""
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            started = time.monotonic()
+            resp = client_xread(addr, ["events"], ["0-0"], block=500)
+            elapsed = time.monotonic() - started
+            self.assertEqual(resp.get("status"), "ok", resp)
+            self.assertEqual(resp.get("streams"), [], resp)
+            self.assertTrue(resp.get("timed_out"), resp)
+            self.assertGreaterEqual(elapsed, 0.4, elapsed)
+            self.assertLess(elapsed, 3.0, elapsed)
+        finally:
+            cluster.stop_all()
+
+    def test_xread_wrongtype_and_bad_args(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            before = len(leader.log)
+            self.assertEqual(write(addr, key="plain",
+                                   value="v").get("status"), "ok")
+            resp = xread(addr, keys=("plain",), ids=("0-0",))
+            self.assertEqual(resp.get("status"), "error", resp)
+            self.assertIn("stream", resp.get("error", ""), resp)
+            resp = xread(addr, keys=("plain",), ids=("$",))
+            self.assertEqual(resp.get("status"), "error", resp)
+            # Bad keys, ids, counts, and blocks are client
+            # errors, not reads.
+            resp = xread(addr, keys=(), ids=())
+            self.assertEqual(resp.get("status"), "error", resp)
+            resp = xread(addr, keys=("events",), ids=("0-0", "0-0"))
+            self.assertEqual(resp.get("status"), "error", resp)
+            resp = xread(addr, keys=("events",), ids=("bogus",))
+            self.assertEqual(resp.get("status"), "error", resp)
+            resp = xread(addr, keys=("events",), ids=("-",))
+            self.assertEqual(resp.get("status"), "error", resp)
+            resp = client_request(
+                addr, {"type": "client", "op": "xread",
+                       "keys": ["events"], "ids": ["0-0"],
+                       "count": -1})
+            self.assertEqual(resp.get("status"), "error", resp)
+            resp = client_request(
+                addr, {"type": "client", "op": "xread",
+                       "keys": ["events"], "ids": ["0-0"],
+                       "block": -5})
+            self.assertEqual(resp.get("status"), "error", resp)
+            # Reads append no log entries, bad or not.
+            self.assertEqual(len(leader.log), before + 1)
+        finally:
+            cluster.stop_all()
+
+    def test_session_xread_is_read_your_writes(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            with Session(addr) as session:
+                resp = session.xadd("events", {"type": "login"},
+                                    id="100-5")
+                self.assertEqual(resp.get("status"), "ok", resp)
+                # A session read sees its own xadd's entry.
+                resp = session.xread(["events"], ["0-0"])
+                self.assertEqual(resp.get("status"), "ok", resp)
+                self.assertEqual(resp.get("streams"),
+                                 [["events",
+                                   [["100-5", {"type": "login"}]]]],
+                                 resp)
+                # And with "$" after its own xadd, nothing is
+                # new — the top is its own entry.
+                resp = session.xread(["events"], ["$"])
+                self.assertEqual(resp.get("status"), "ok", resp)
+                self.assertEqual(resp.get("streams"), [], resp)
+                # A session read from a follower still sees the
+                # session's own xadd.
+                follower = next(n for n in cluster.live
+                                if n != leader.id)
+                with Session(cluster.addrs[follower],
+                             client_id=session.client_id) as other:
+                    other.last_write_index = session.last_write_index
+                    other.last_write_term = session.last_write_term
+                    resp = other.xread(["events"], ["0-0"])
+                    self.assertEqual(resp.get("streams"),
+                                     [["events",
+                                       [["100-5", {"type": "login"}]]]],
+                                     resp)
+        finally:
+            cluster.stop_all()
+
+    def test_xread_cli(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            host, port = cluster.addrs[leader.id]
+            node = f"{host}:{port}"
+            for entry_id in ("100-5", "100-6"):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    rc = client_main(["--node", node, "xadd", "events",
+                                      entry_id, "a", entry_id])
+                self.assertEqual(rc, 0)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "xadd", "alerts",
+                                  "200-0", "b", "200-0"])
+            self.assertEqual(rc, 0)
+            # XREAD prints the streams as JSON.
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "xread",
+                                  "events", "0-0", "alerts", "0-0"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(out.getvalue()),
+                             [["events",
+                               [["100-5", {"a": "100-5"}],
+                                ["100-6", {"a": "100-6"}]]],
+                              ["alerts",
+                               [["200-0", {"b": "200-0"}]]]])
+            # "$" prints only what is new — nothing here.
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "xread",
+                                  "events", "$"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(out.getvalue()), [])
+            # COUNT caps per stream.
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "xread",
+                                  "events", "0-0", "--count", "1"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(out.getvalue()),
+                             [["events", [["100-5", {"a": "100-5"}]]]])
+            # A BLOCK with nothing landing prints an empty list.
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "xread",
+                                  "events", "$", "--block", "200"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(out.getvalue()), [])
+            # An odd number of key/id pairs fails: a CLI usage
+            # error (exit 2), and the error names the problem.
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                with self.assertRaises(SystemExit) as cm:
+                    client_main(["--node", node, "xread",
+                                 "events"])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("key id pairs", err.getvalue())
+            # A bad id fails: rc 1, and the error names the
+            # problem.
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = client_main(["--node", node, "xread",
+                                  "events", "bogus"])
+            self.assertEqual(rc, 1)
+            self.assertIn("stream", err.getvalue())
         finally:
             cluster.stop_all()
 

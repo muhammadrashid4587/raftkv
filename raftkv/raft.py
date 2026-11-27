@@ -2487,6 +2487,79 @@ class RaftNode:
                 return {"type": "client_response", "status": "error",
                         "error": "this node was removed from the cluster"}
             return self._on_mset(msg)
+        if op == "xread":
+            # Read the entries appended to one or more streams
+            # after one ID per stream: [key, [[id, {field:
+            # value}], ...]] pairs for every stream that has any,
+            # in the order the keys were given — Redis XREAD. It
+            # rides the same ReadIndex/lease path as a ``get`` —
+            # one leadership confirmation, one apply wait — so the
+            # entries reflect the committed state as of the read
+            # index it names, exactly as linearizable, and a
+            # session read carries the same watermark a get would.
+            # A string key is a client error, not a list: the
+            # payload carries its own "status": "error" (see
+            # _serve_read), like xlen's wrongtype. The keys must
+            # be a non-empty list of non-empty strings, the ids
+            # one string per key — "$" (only entries after the
+            # stream's top), a bare millisecond, or a full
+            # "ms-seq" — and the count, when one is given, a
+            # non-negative integer (a bool is not one): a bad key,
+            # id, or count is a client error, not a list of
+            # nonsense. The count caps how many entries one
+            # stream returns, like Redis's COUNT — 0 answers
+            # nothing for that stream, and no count means no cap.
+            # ``block`` waits that many milliseconds for a new
+            # entry when the first read finds none — 0 waits up
+            # to the server's WATCH_MAX_TIMEOUT cap, like a watch
+            # — and the wait happens on the leader path only (see
+            # _serve_read): a stale follower-lease read answers
+            # immediately with current data.
+            if self._is_removed():
+                return {"type": "client_response", "status": "error",
+                        "error": "this node was removed from the cluster"}
+            keys = msg.get("keys")
+            ids = msg.get("ids")
+            if (not isinstance(keys, list) or not keys
+                    or not all(isinstance(k, str) and k
+                               for k in keys)):
+                return {"type": "client_response", "status": "error",
+                        "error": "xread keys must be a non-empty "
+                                 "list of non-empty strings"}
+            if len(keys) > MAX_MGET_KEYS:
+                return {"type": "client_response", "status": "error",
+                        "error": "xread serves at most "
+                                 f"{MAX_MGET_KEYS} streams"}
+            if (not isinstance(ids, list) or len(ids) != len(keys)
+                    or not all(isinstance(i, str) for i in ids)):
+                return {"type": "client_response", "status": "error",
+                        "error": "xread ids must be a list of one "
+                                 "id per key"}
+            count = msg.get("count")
+            if count is not None and (
+                    not isinstance(count, int)
+                    or isinstance(count, bool) or count < 0):
+                return {"type": "client_response", "status": "error",
+                        "error": "xread count must be a "
+                                 "non-negative integer"}
+            block = msg.get("block")
+            if block is not None and (
+                    not isinstance(block, int)
+                    or isinstance(block, bool) or block < 0):
+                return {"type": "client_response", "status": "error",
+                        "error": "xread block must be a "
+                                 "non-negative integer number of "
+                                 "milliseconds"}
+            min_index, session_term, error = self._parse_read_params(msg)
+            if error is not None:
+                return error
+            return self._serve_read(xread_keys=keys,
+                                    xread_ids=ids,
+                                    xread_count=count,
+                                    xread_block_ms=block,
+                                    min_index=min_index,
+                                    session_term=session_term,
+                                    stale_ok=bool(msg.get("stale_ok")))
         key = msg.get("key")
         if op not in ("set", "get", "del", "cas", "ttl", "expire",
                       "expireat", "pexpireat",
@@ -4226,6 +4299,10 @@ class RaftNode:
                     xrange_start: str = "-",
                     xrange_end: str = "+",
                     xrange_count: int | None = None,
+                    xread_keys: list[str] | None = None,
+                    xread_ids: list[str] | None = None,
+                    xread_count: int | None = None,
+                    xread_block_ms: int | None = None,
                     scan_prefix: str | None = None,
                     scan_limit: int = MAX_KEYS_SCAN,
                     scan_start_after: str | None = None) -> dict:
@@ -4347,6 +4424,31 @@ class RaftNode:
         a plain string value is a client error, not a list, and
         a bad bound or count is one too. The reply carries
         ``entries``, the pairs in ID order.
+        ``xread_keys`` serves new stream entries instead — the
+        [key, [[id, {field: value}], ...]] pairs for every stream
+        in ``xread_keys`` that holds an entry after the matching
+        ID in ``xread_ids``, in ID order, at most ``xread_count``
+        per stream when a count is given, Redis XREAD — read off
+        the applied state machine the same way, so it is exactly
+        as linearizable as a ``get``; a plain string value is a
+        client error, not a list, and a bad id or count is one
+        too. An ID of "$" means the stream's top ID at the read
+        index — only entries appended after the read started
+        count — and it is resolved once, at the read index, so a
+        blocking read that wakes on a new entry still measures
+        from the top it started with. ``xread_block_ms`` waits
+        for new entries when the first read finds none: the
+        leader long-polls the watched stream keys until one
+        changes or the block expires — BLOCK 0 (wait forever)
+        is capped at WATCH_MAX_TIMEOUT, like a watch, since the
+        transport socket times out at 30s — and the reply
+        carries ``timed_out`` when the wait expired with no new
+        entry. A stale (follower-lease) xread answers
+        immediately with current data and never blocks. The
+        reply carries ``streams``, the pairs in the order the
+        keys were given — only streams with entries ride along,
+        so a stream with nothing new is simply absent — plus
+        ``timed_out`` when a block was given.
         ``scan_prefix`` serves a key enumeration instead — every key
         in the applied state machine starting with the prefix,
         sorted, at most ``scan_limit`` of them, with ``truncated``
@@ -4417,6 +4519,11 @@ class RaftNode:
         but then it is already applied), is an error, not a wait: the
         token names a write this node cannot have.
         """
+        # The "$" IDs of a blocking XREAD, resolved once at the
+        # read index: _values caches them here so every re-read
+        # in the block wait measures from the same top.
+        _xread_resolved: list[list[str] | None] = [None]
+
         def _values() -> dict:
             """The read payload, from the applied state machine
             (lock held at every call site): ``value`` for one key,
@@ -4670,6 +4777,30 @@ class RaftNode:
                         xrange_count)}
                 except (TypeError, ValueError) as e:
                     return {"status": "error", "error": str(e)}
+            if xread_keys is not None:
+                # The entries appended to one or more streams
+                # after one ID per stream: [key, [[id, {field:
+                # value}], ...]] pairs for every stream that has
+                # any, in the order the keys were given — Redis
+                # XREAD — with the same wrongtype rule as xlen:
+                # a plain string value is a client error, not a
+                # list, carried the same way, overriding the "ok"
+                # in the response literal. A bad id or count is
+                # the same kind of error, from the store's own
+                # validation. The "$" IDs are resolved once, at
+                # this first read — the resolved list is kept in
+                # _xread_resolved, so a blocking read that wakes
+                # on a new entry still measures from the top the
+                # call started with instead of re-resolving "$"
+                # past the entries that arrived while it waited.
+                try:
+                    if _xread_resolved[0] is None:
+                        _xread_resolved[0] = self.sm.xread_resolve(
+                            xread_keys, xread_ids)
+                    return {"streams": self.sm.xread(
+                        xread_keys, _xread_resolved[0], xread_count)}
+                except (TypeError, ValueError) as e:
+                    return {"status": "error", "error": str(e)}
             if keys is not None:
                 return {"values": [self.sm.get(k) for k in keys]}
             return {"value": self.sm.get(key)}
@@ -4718,15 +4849,16 @@ class RaftNode:
                     "error": "could not confirm leadership"}
         # Wait for the state machine to catch up to the read index.
         deadline = time.monotonic() + READ_INDEX_TIMEOUT
+        values: dict | None = None
         while True:
             with self.lock:
                 if self.role != "leader" or self.current_term != term:
                     return self._redirect()
                 if self.last_applied >= read_index:
-                    return {"type": "client_response", "status": "ok",
-                            **_values(),
-                            "read_index": self.last_applied,
-                            "read_term": self._term_at(self.last_applied)}
+                    values = _values()
+                    read_index = self.last_applied
+                    read_term = self._term_at(self.last_applied)
+                    break
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
@@ -4737,6 +4869,76 @@ class RaftNode:
             event.wait(timeout=remaining)
             with self.lock:
                 self._unregister_pending_read(event)
+        if values is not None:
+            # A blocking XREAD with nothing yet: long-poll the
+            # watched stream keys until one changes or the block
+            # expires, then read again — the same watch/condition
+            # pattern _on_watch uses, so the wait holds no lock
+            # and cannot stall the apply path. The "$" IDs were
+            # resolved once, at the read index above (see
+            # _values), so the re-read still measures from the
+            # top the call started with — re-resolving "$" after
+            # the wait would move the goalpost past the very
+            # entries that arrived. BLOCK 0 (wait forever) is
+            # capped at WATCH_MAX_TIMEOUT, like a watch: the
+            # transport socket times out at 30s, so no reply
+            # could be sent after that anyway. A stale
+            # (follower-lease) xread never reaches here — it
+            # answers immediately from _values above.
+            timed_out = False
+            if (xread_keys is not None and xread_block_ms is not None
+                    and values.get("status") != "error"
+                    and not values.get("streams")):
+                wait_s = (WATCH_MAX_TIMEOUT if xread_block_ms == 0
+                          else min(xread_block_ms / 1000.0,
+                                   WATCH_MAX_TIMEOUT))
+                cond = threading.Condition()
+                arrived: list[dict] = []
+
+                def _wake(event: dict) -> None:
+                    with cond:
+                        arrived.append(event)
+                        cond.notify_all()
+
+                watch_ids = [self.watch.watch(k, _wake)
+                             for k in xread_keys]
+                try:
+                    # Re-check under the lock before waiting: an
+                    # entry may have committed between the read
+                    # above and the watch registration, and the
+                    # watch only fires on changes after it.
+                    with self.lock:
+                        if (self.role != "leader"
+                                or self.current_term != term):
+                            return self._redirect()
+                        values = _values()
+                        read_index = self.last_applied
+                        read_term = self._term_at(read_index)
+                    if (values.get("status") != "error"
+                            and not values.get("streams")):
+                        block_deadline = time.monotonic() + wait_s
+                        with cond:
+                            while not arrived:
+                                remaining = (block_deadline
+                                             - time.monotonic())
+                                if remaining <= 0:
+                                    break
+                                cond.wait(remaining)
+                        timed_out = not arrived
+                        with self.lock:
+                            if (self.role != "leader"
+                                    or self.current_term != term):
+                                return self._redirect()
+                            values = _values()
+                            read_index = self.last_applied
+                            read_term = self._term_at(read_index)
+                finally:
+                    for watch_id in watch_ids:
+                        self.watch.cancel(watch_id)
+            if xread_keys is not None and xread_block_ms is not None:
+                values = {**values, "timed_out": timed_out}
+            return {"type": "client_response", "status": "ok", **values,
+                    "read_index": read_index, "read_term": read_term}
         # Fallback: apply stalled past the timeout, but we are still
         # leader in this term. A session read never takes it: serving
         # whatever happens to be applied could return state that

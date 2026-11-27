@@ -933,6 +933,89 @@ class Session:
                 self.last_read_term = int(resp.get("read_term") or 0)
         return resp
 
+    def xread(self, keys: list[str], ids: list[str],
+              count: int | None = None,
+              block: int | None = None) -> dict:
+        """Ask for the entries appended to the streams at ``keys``
+        after the matching ID in ``ids``, in ID order — Redis
+        XREAD: each id is "$" (only entries appended after this
+        call — the stream's top at the read index), a bare
+        millisecond (that millisecond, sequence 0), or a full
+        "ms-seq", and ``count`` caps how many entries one stream
+        returns, like Redis's COUNT — None means no cap, 0
+        answers nothing for that stream. ``block`` waits that many
+        milliseconds for a new entry when the first read finds
+        none — 0 waits up to the server's 25s cap, like a watch —
+        and the reply carries ``timed_out`` when the wait expired
+        with no new entry. The reply carries ``streams`` — the
+        [key, [[id, {field: value}], ...]] pairs for every stream
+        that has an entry after its id, in the order the keys were
+        given, so a stream with nothing new is simply absent —
+        an empty list when no stream has anything, and a client
+        error — not a list — when a key holds a plain string. A
+        bad key, id, count, or block never goes on the wire and
+        returns the server's error shape instead. It rides the
+        same ReadIndex path as ``get``, so it carries the same
+        session watermark and advances the read watermark from
+        the reply's ``read_index`` exactly the same way: a read
+        after your own xadd shows the entry that xadd appended,
+        and a later read never goes backwards past it. A blocking
+        read goes one-shot, not over a pooled connection, so a
+        long wait never pins one — like a watch."""
+        if (not isinstance(keys, list) or not keys
+                or not all(isinstance(k, str) and k for k in keys)):
+            return {"type": "client_response", "status": "error",
+                    "error": "xread keys must be a non-empty list "
+                             "of non-empty strings"}
+        if (not isinstance(ids, list) or len(ids) != len(keys)
+                or not all(isinstance(i, str) for i in ids)):
+            return {"type": "client_response", "status": "error",
+                    "error": "xread ids must be a list of one id "
+                             "per key"}
+        if count is not None and (
+                not isinstance(count, int) or isinstance(count, bool)
+                or count < 0):
+            return {"type": "client_response", "status": "error",
+                    "error": "xread count must be a "
+                             "non-negative integer"}
+        if block is not None and (
+                not isinstance(block, int) or isinstance(block, bool)
+                or block < 0):
+            return {"type": "client_response", "status": "error",
+                    "error": "xread block must be a non-negative "
+                             "integer number of milliseconds"}
+        if self.last_read_index > self.last_write_index:
+            min_index = self.last_read_index
+            term = self.last_read_term
+        else:
+            min_index = self.last_write_index
+            term = self.last_write_term
+        msg: dict = {"type": "client", "op": "xread",
+                     "keys": list(keys), "ids": list(ids),
+                     "client_id": self.client_id,
+                     "min_commit_index": min_index,
+                     "session_term": term}
+        if count is not None:
+            msg["count"] = count
+        if block is not None:
+            msg["block"] = block
+        # A blocking read waits on the server up to block ms (0
+        # waits up to the server's 25s cap), so the request
+        # timeout must outlast the wait — plus headroom for the
+        # leadership confirmation and the reply.
+        timeout = 12.0
+        if block is not None:
+            timeout = min(block / 1000.0, 25.0) + 10.0
+        resp = request(self.node_addr, msg, timeout=timeout,
+                       pool=self._pooled if block is None else None)
+        if (resp.get("status") == "ok"
+                and resp.get("read_index") is not None):
+            read_index = int(resp["read_index"])
+            if read_index > self.last_read_index:
+                self.last_read_index = read_index
+                self.last_read_term = int(resp.get("read_term") or 0)
+        return resp
+
     def pfadd(self, key: str, *elements: str) -> dict:
         """Add ``elements`` to the HyperLogLog at ``key``, Redis
         PFADD: each element hashes into one of 16384 registers
@@ -2708,6 +2791,70 @@ def xrange(node_addr: tuple[str, int], key: str,
     return request(node_addr, msg, timeout=timeout)
 
 
+def xread(node_addr: tuple[str, int], keys: list[str],
+          ids: list[str], count: int | None = None,
+          block: int | None = None,
+          timeout: float | None = None) -> dict:
+    """Ask for the entries appended to the streams at ``keys``
+    after the matching ID in ``ids``, following leader redirects
+    like ``request`` — Redis XREAD.
+
+    One request serves the entries through the leader's ReadIndex
+    path, so they reflect the committed state as of one read index,
+    exactly as linearizable as a ``get``. The reply is the plain
+    xread response (``status`` ``ok`` with ``streams`` — the [key,
+    [[id, {field: value}], ...]] pairs for every stream that has
+    an entry after its id, in the order the keys were given, an
+    empty list when no stream has anything — plus the
+    ``read_index`` / ``read_term`` they were measured at).
+    Each id is "$" (only entries after the stream's top at the
+    read index), a bare millisecond, or a full "ms-seq", and
+    ``count`` caps how many entries one stream returns, like
+    Redis's COUNT — None means no cap, 0 answers nothing for that
+    stream. ``block`` waits that many milliseconds for a new entry
+    when the first read finds none — 0 waits up to the server's 25s
+    cap, like a watch — and the reply then carries ``timed_out``
+    when the wait expired with no new entry. A plain string value
+    is a client error, not a list, and a bad key, id, count, or
+    block never goes on the wire and returns the server's error
+    shape instead. ``timeout`` defaults to 12s, or the block plus
+    10s headroom when a block is given, so a blocking read is
+    never cut off by its own client timeout."""
+    if (not isinstance(keys, list) or not keys
+            or not all(isinstance(k, str) and k for k in keys)):
+        return {"type": "client_response", "status": "error",
+                "error": "xread keys must be a non-empty list of "
+                         "non-empty strings"}
+    if (not isinstance(ids, list) or len(ids) != len(keys)
+            or not all(isinstance(i, str) for i in ids)):
+        return {"type": "client_response", "status": "error",
+                "error": "xread ids must be a list of one id "
+                         "per key"}
+    if count is not None and (
+            not isinstance(count, int) or isinstance(count, bool)
+            or count < 0):
+        return {"type": "client_response", "status": "error",
+                "error": "xread count must be a "
+                         "non-negative integer"}
+    if block is not None and (
+            not isinstance(block, int) or isinstance(block, bool)
+            or block < 0):
+        return {"type": "client_response", "status": "error",
+                "error": "xread block must be a non-negative "
+                         "integer number of milliseconds"}
+    msg: dict = {"type": "client", "op": "xread",
+                 "keys": list(keys), "ids": list(ids)}
+    if count is not None:
+        msg["count"] = count
+    if block is not None:
+        msg["block"] = block
+    if timeout is None:
+        timeout = 12.0
+        if block is not None:
+            timeout = min(block / 1000.0, 25.0) + 10.0
+    return request(node_addr, msg, timeout=timeout)
+
+
 def geodist(node_addr: tuple[str, int], key: str, member1: str,
             member2: str, unit: str = "m",
             timeout: float = 12.0) -> dict:
@@ -3670,6 +3817,22 @@ def main(argv: list[str] | None = None) -> int:
     p_xrange.add_argument("--count", type=int, default=None,
                           help="at most this many entries "
                                "(default: no cap)")
+    p_xread = sub.add_parser(
+        "xread",
+        help="print the entries appended to one or more streams "
+             "after one ID per stream, as JSON ([[key, [[id, "
+             "{field: value}], ...]], ...]); an ID of \"$\" means "
+             "only entries appended after this call")
+    p_xread.add_argument("streams", nargs="+",
+                         help="key id pairs: k1 0-0 k2 $ ... (one "
+                              "ID per key, in the same order)")
+    p_xread.add_argument("--count", type=int, default=None,
+                         help="at most this many entries per stream "
+                              "(default: no cap)")
+    p_xread.add_argument("--block", type=int, default=None,
+                         help="wait up to this many milliseconds "
+                              "for a new entry when there is none "
+                              "yet (0 waits up to 25s)")
     p_pfadd = sub.add_parser(
         "pfadd",
         help="add elements to the HyperLogLog at key and print 1 "
@@ -4010,6 +4173,15 @@ def main(argv: list[str] | None = None) -> int:
         msg["end"] = args.end
         if args.count is not None:
             msg["count"] = args.count
+    if op == "xread":
+        if len(args.streams) % 2:
+            parser.error("xread takes key id pairs: k1 0-0 k2 $ ...")
+        msg["keys"] = args.streams[0::2]
+        msg["ids"] = args.streams[1::2]
+        if args.count is not None:
+            msg["count"] = args.count
+        if args.block is not None:
+            msg["block"] = args.block
     if op == "pfadd":
         msg["elements"] = args.elements
     if op == "hset":
@@ -4062,7 +4234,15 @@ def main(argv: list[str] | None = None) -> int:
             msg["session_term"] = args.session_term
         if args.stale:
             msg["stale_ok"] = True
-    resp = request((host, int(port)), msg, timeout=args.timeout)
+    # A blocking xread waits on the server up to block ms (0 waits
+    # up to the server's 25s cap), so the request timeout must
+    # outlast the wait — plus headroom for the leadership
+    # confirmation and the reply — or the CLI would cut its own
+    # read off.
+    timeout = args.timeout
+    if op == "xread" and args.block is not None:
+        timeout = max(timeout, min(args.block / 1000.0, 25.0) + 10.0)
+    resp = request((host, int(port)), msg, timeout=timeout)
     status = resp.get("status")
     if status == "ok":
         if op == "get":
@@ -4114,6 +4294,8 @@ def main(argv: list[str] | None = None) -> int:
             print(resp.get("xlen"))
         elif op == "xrange":
             print(json.dumps(resp.get("entries")))
+        elif op == "xread":
+            print(json.dumps(resp.get("streams")))
         elif op == "geodist":
             dist = resp.get("distance")
             print(dist if dist is not None else "(nil)")

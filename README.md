@@ -769,8 +769,7 @@ logic and the failure handling, not the key-value API on top.
   is a pipeline op too. The honest limit is the growth itself:
   there is no MAXLEN trimming yet, so a stream grows without
   bound — every entry stays in the one blob, and the blob rides
-  every snapshot and replay whole — and there is no XREAD yet,
-  so a blocking read of new entries is still missing.
+  every snapshot and replay whole.
 - **Streams (XLEN / XRANGE)** — since v0.64.0 `xlen key`
   (`Session.xlen(k)`, `client.xlen(addr, k)`, `xlen key` on the
   CLI) answers the number of entries in the stream at the key, 0
@@ -795,8 +794,39 @@ logic and the failure handling, not the key-value API on top.
   they are reads, so neither is a pipeline op. The honest limit
   is the same growth as xadd: the whole stream is one blob, so
   a range still reads the blob to filter it — there is no index
-  over entries — and there is still no XREAD, so a client that
-  wants new entries has to poll XRANGE.
+  over entries.
+- **Streams (XREAD)** — since v0.65.0 `xread key id [key id ...]
+  [COUNT n] [BLOCK ms]` (`Session.xread(keys, ids, count, block)`,
+  `client.xread(addr, keys, ids, count, block)`, `xread k1 0-0 k2
+  $ [--count n] [--block ms]` on the CLI) answers the entries
+  appended to one or more streams after one ID per stream — Redis
+  XREAD — as [[key, [[id, {field: value}], ...]], ...], only the
+  streams that hold at least one entry after their id riding
+  along, in the order the keys were given, so a stream with
+  nothing new is simply absent. Each id is "$" (only entries after
+  the stream's top at the read index), a bare millisecond (that
+  millisecond, sequence 0), or a full "ms-seq"; COUNT caps how
+  many entries one stream returns, like Redis's COUNT — None means
+  no cap, 0 answers nothing for that stream. BLOCK waits up to
+  that many milliseconds for a new entry when the first read finds
+  none — the leader long-polls the watched stream keys, the same
+  watch/condition pattern a watch RPC uses, so the wait holds no
+  lock — and the reply carries `timed_out` when the wait expired
+  with no new entry; BLOCK 0 (wait forever) is capped at 25s,
+  like a watch, since the transport socket times out at 30s. A
+  "$" is resolved once, at the read index, so a blocking read that
+  wakes on a new entry still measures from the top the call
+  started with. It is a pure read through the same ReadIndex path
+  as a `get`, so it is exactly as linearizable and a session read
+  after its own xadd shows the entry that xadd appended — but a
+  stale read from a follower lease answers immediately with
+  current data and never blocks. A plain string value is a client
+  error, not a list, and a bad key, id, count, or block is one
+  too. Like hget and geodist it is a read, so it is not a pipeline
+  op. The honest limit is the same growth as xadd: the whole
+  stream is one blob, so a read still scans the blob to filter
+  it — there is no index over entries — and there are no consumer
+  groups yet, so XREADGROUP is still missing.
 - **HyperLogLog** — since v0.47.0 `pfadd key element [element ...]`
   (`Session.pfadd(k, *elements)`, `client.pfadd(addr, k, *elements)`,
   `pfadd key element ...` on the CLI) adds elements to the
@@ -3568,3 +3598,44 @@ entries left in `log.jsonl` are dropped by their index on reload.
   a new roadmap item grounded in this project's purpose,
   proposed by the next run — candidates: XREAD (blocking reads
   of new entries), or XTRIM (MAXLEN trimming).
+- ~~Streams (XREAD)~~ — done in v0.65.0,
+  Nov 27, 2026: `xread key id [key id ...] [COUNT n] [BLOCK ms]`
+  answers the entries appended to one or more streams after one
+  ID per stream — Redis XREAD — as [[key, [[id, {field: value}],
+  ...]], ...], only the streams that hold at least one entry after
+  their id riding along, in the order the keys were given. Each id
+  is "$" (only entries after the stream's top at the read index),
+  a bare millisecond, or a full "ms-seq"; COUNT caps how many
+  entries one stream returns — None means no cap, 0 answers
+  nothing for that stream. BLOCK waits up to that many
+  milliseconds for a new entry when the first read finds none —
+  the leader long-polls the watched stream keys, the same
+  watch/condition pattern a watch RPC uses, so the wait holds no
+  lock — and the reply carries `timed_out` when the wait expired
+  with no new entry; BLOCK 0 (wait forever) is capped at 25s,
+  like a watch, since the transport socket times out at 30s. A
+  "$" is resolved once, at the read index, so a blocking read that
+  wakes on a new entry still measures from the top the call
+  started with. It is a pure read through the same ReadIndex path
+  as a `get`, so it is exactly as linearizable and a stale read is
+  served from a follower lease like a stale `get` — except a stale
+  read never blocks, it answers immediately with current data. A
+  plain string value is a client error, not a list, and a bad key,
+  id, count, or block is one too. `Session.xread`,
+  `client.xread`, and `xread` on the CLI; like other reads, it is
+  not a pipeline op.
+  `tests/test_streams.py` proves it: store-level multi-stream
+  reads, "$" resolving to the top, COUNT capping per stream and 0
+  answering nothing, missing keys and streams with nothing new
+  absent from the reply, wrongtype leaving the value untouched,
+  and bad keys, ids, and counts raising; and cluster-level reads
+  from a follower redirecting to the leader, a BLOCK that returns
+  as soon as an entry lands, a BLOCK with "$" that sees only the
+  entry appended after the call, a BLOCK that times out empty,
+  wrongtype and bad arguments as client errors with no log entry,
+  session read-your-writes, the module function from a follower,
+  and the CLI end to end.
+  The roadmap is exhausted again, so the next real thing is
+  a new roadmap item grounded in this project's purpose,
+  proposed by the next run — candidates: XTRIM (MAXLEN trimming),
+  or XREADGROUP (consumer groups).
