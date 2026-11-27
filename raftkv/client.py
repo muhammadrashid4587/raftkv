@@ -1242,7 +1242,9 @@ class Session:
     def xreadgroup_multi(self, streams: list, group: str,
                          consumer: str, count: int | None = None,
                          noack: bool = False,
-                         block: int | None = None) -> dict:
+                         block: int | None = None,
+                         claim_min_idle_ms: int | None = None,
+                         ) -> dict:
         """Read entries for one consumer of one group across
         several streams in a single call, Redis XREADGROUP with
         STREAMS: ``streams`` is a list of [key, id] pairs — one
@@ -1264,6 +1266,20 @@ class Session:
         ``timed_out`` when the wait expired with no new entry;
         with explicit IDs only the block is ignored and the read
         answers at once, like a single-stream explicit-ID read.
+        With ``claim_min_idle_ms`` a ">" read on each stream first
+        claims the pending entries idle at least that many
+        milliseconds — Redis 8.4's XREADGROUP CLAIM, from any
+        consumer, longest idle first — and then reads new entries;
+        COUNT is one shared budget across the claim and the new
+        entries on every stream, and the reply carries ``claimed``
+        — one [key, [{id, idle_ms, deliveries}, ...]] pair per
+        stream that claimed at least one entry, in the order the
+        streams were given — alongside ``streams``, claimed first,
+        then new, like Redis. With an explicit ID on a stream the
+        claim is ignored on that stream, like Redis, and NOACK
+        does not apply to claimed entries: the transfer of
+        ownership is the point, so they stay pending, now held by
+        this consumer.
         The reply carries ``streams`` — the [key, [[id, {field:
         value}], ...]] pairs for every stream that handed out at
         least one entry, in the order the streams were given, like
@@ -1273,20 +1289,19 @@ class Session:
         ``no_group``, and a plain string value fails with reason
         ``wrongtype`` — and the failure is decided before anything
         is delivered, so a failed call writes nothing on any
-        stream. A bad group, consumer, stream list, count, or
-        noack never goes on the wire and returns the server's
-        error shape instead. This is a write, not a read: the whole
+        stream. A bad group, consumer, stream list, count, block,
+        claim, or noack never goes on the wire and returns the
+        server's error shape instead. This is a write, not a read: the whole
         call is one log entry, so the deliveries across streams
         are atomic, and a retry with the same session id returns
         the first attempt's streams instead of delivering them
         twice. A successful read keeps every key's TTL deadline,
         like an xadd, and advances the write watermark from the
         reply's index, like any other write — and so does a failed
-        one, since it still committed its entry. There is no CLAIM
-        on the multi-stream read in this version: the claim rides
-        the single-stream readgroup. A blocking multi-stream read
-        goes one-shot, not over a pooled connection, so a long wait
-        never pins one — like a blocking readgroup."""
+        one, since it still committed its entry. A blocking
+        multi-stream read goes one-shot, not over a pooled
+        connection, so a long wait never pins one — like a
+        blocking readgroup."""
         if not isinstance(group, str) or not group:
             return {"type": "client_response", "status": "error",
                     "error": "xreadgroup_multi group must be a "
@@ -1319,6 +1334,14 @@ class Session:
                     "error": "xreadgroup_multi block must be a "
                              "non-negative integer number of "
                              "milliseconds"}
+        if claim_min_idle_ms is not None and (
+                not isinstance(claim_min_idle_ms, int)
+                or isinstance(claim_min_idle_ms, bool)
+                or claim_min_idle_ms < 0):
+            return {"type": "client_response", "status": "error",
+                    "error": "xreadgroup_multi claim must be a "
+                             "non-negative integer number of "
+                             "milliseconds"}
         msg: dict = {"type": "client", "op": "xreadgroup_multi",
                      "streams": [[k, i] for k, i in streams],
                      "group": group, "consumer": consumer}
@@ -1328,6 +1351,8 @@ class Session:
             msg["noack"] = True
         if block is not None:
             msg["block"] = block
+        if claim_min_idle_ms is not None:
+            msg["claim_min_idle_ms"] = claim_min_idle_ms
         # A blocking multi-stream readgroup waits on the server up
         # to block ms (0 waits up to the server's 25s cap), so the
         # request timeout must outlast the wait — plus headroom for
@@ -4329,6 +4354,7 @@ def xreadgroup_multi(node_addr: tuple[str, int], streams: list,
                      count: int | None = None,
                      noack: bool = False,
                      block: int | None = None,
+                     claim_min_idle_ms: int | None = None,
                      timeout: float | None = None) -> dict:
     """Read entries for one consumer of one group across several
     streams in a single call, following leader redirects like
@@ -4354,14 +4380,25 @@ def xreadgroup_multi(node_addr: tuple[str, int], streams: list,
     entry on any of its ">" streams when no stream has anything to
     hand out yet — 0 waits up to the server's 25s cap, like a watch
     — and the reply then carries ``timed_out``; with explicit IDs
-    only the block is ignored and the read answers at once. A bad
-    group, consumer, stream list, count, or block never goes on the
+    only the block is ignored and the read answers at once. With
+    ``claim_min_idle_ms`` a ">" read on each stream first claims
+    the pending entries idle at least that many milliseconds —
+    Redis 8.4's XREADGROUP CLAIM, from any consumer, longest idle
+    first — and then reads new entries; COUNT is one shared budget
+    across the claim and the new entries on every stream, and the
+    reply carries ``claimed`` — one [key, [{id, idle_ms,
+    deliveries}, ...]] pair per stream that claimed at least one
+    entry, in the order the streams were given — alongside
+    ``streams``, claimed first, then new. With an explicit ID on a
+    stream the claim is ignored on that stream, like Redis, and
+    NOACK does not apply to claimed entries. A bad group,
+    consumer, stream list, count, block, or claim never goes on the
     wire and returns the server's error shape instead. This is a
     write, not a read: the whole call is one log entry, so the
     deliveries across streams are atomic, and a retry with the same
     session id returns the first attempt's streams instead of
-    delivering them twice. There is no CLAIM on the multi-stream
-    read in this version."""
+    delivering them twice. There is no pipeline op on the
+    multi-stream read."""
     if not isinstance(group, str) or not group:
         return {"type": "client_response", "status": "error",
                 "error": "xreadgroup_multi group must be a "
@@ -4394,6 +4431,14 @@ def xreadgroup_multi(node_addr: tuple[str, int], streams: list,
                 "error": "xreadgroup_multi block must be a "
                          "non-negative integer number of "
                          "milliseconds"}
+    if claim_min_idle_ms is not None and (
+            not isinstance(claim_min_idle_ms, int)
+            or isinstance(claim_min_idle_ms, bool)
+            or claim_min_idle_ms < 0):
+        return {"type": "client_response", "status": "error",
+                "error": "xreadgroup_multi claim must be a "
+                         "non-negative integer number of "
+                         "milliseconds"}
     msg: dict = {"type": "client", "op": "xreadgroup_multi",
                  "streams": [[k, i] for k, i in streams],
                  "group": group, "consumer": consumer}
@@ -4403,6 +4448,8 @@ def xreadgroup_multi(node_addr: tuple[str, int], streams: list,
         msg["noack"] = True
     if block is not None:
         msg["block"] = block
+    if claim_min_idle_ms is not None:
+        msg["claim_min_idle_ms"] = claim_min_idle_ms
     if timeout is None:
         timeout = 12.0
         if block is not None:
@@ -5930,6 +5977,14 @@ def main(argv: list[str] | None = None) -> int:
                                          "stream has anything to hand "
                                          "out yet (0 waits up to the "
                                          "server's 25s cap)")
+    p_xreadgroup_multi.add_argument("--claim", type=int, default=None,
+                                    help="with a new-entry read only, "
+                                         "first claim the pending entries "
+                                         "idle at least this many "
+                                         "milliseconds on each such "
+                                         "stream, longest idle first, "
+                                         "then read new entries (COUNT "
+                                         "is one shared budget)")
     p_xreadgroup_multi.add_argument("--client-id", default=None,
                                     help="session id for at-most-once "
                                          "writes: a retry with the same "
@@ -6524,6 +6579,8 @@ def main(argv: list[str] | None = None) -> int:
             msg["noack"] = True
         if args.block is not None:
             msg["block"] = args.block
+        if args.claim is not None:
+            msg["claim_min_idle_ms"] = args.claim
     if op == "xack":
         msg["group"] = args.group
         msg["ids"] = args.ids

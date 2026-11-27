@@ -2579,10 +2579,17 @@ class KVStore:
             # logging the delivery, for a new entry on any of its
             # ">" streams (see RaftNode._on_client); the wait is
             # not part of this apply, which still decides the
-            # delivery at this exact point in the log. There is
-            # still no CLAIM — the claim rides the single-stream
-            # readgroup — so a reaper that needs one still uses
-            # the single-stream readgroup or XAUTOCLAIM.
+            # delivery at this exact point in the log. Since
+            # v0.79.0 the call may also carry CLAIM — Redis 8.4's
+            # XREADGROUP CLAIM, per ">" stream: before handing out
+            # new entries on that stream, take over the pending
+            # entries idle at least ``claim_min_idle_ms``, from any
+            # consumer, longest idle first, like the single-stream
+            # readgroup — so a reaper that needs one no longer has
+            # to use the single-stream readgroup or XAUTOCLAIM.
+            # There is still no pipeline op, so a multi-stream
+            # read goes as its own request, like a blocking
+            # readgroup.
             group = command.get("group")
             consumer = command.get("consumer")
             if not isinstance(group, str) or not group:
@@ -2622,6 +2629,14 @@ class KVStore:
                 raise ValueError(
                     "xreadgroup_multi seen_ms must be a "
                     "non-negative integer number of milliseconds")
+            claim_min_idle_ms = command.get("claim_min_idle_ms")
+            if claim_min_idle_ms is not None and (
+                    not isinstance(claim_min_idle_ms, int)
+                    or isinstance(claim_min_idle_ms, bool)
+                    or claim_min_idle_ms < 0):
+                raise ValueError(
+                    "xreadgroup_multi claim_min_idle_ms must be a "
+                    "non-negative integer number of milliseconds")
             noack = bool(command.get("noack"))
             # Resolve every stream first, before delivering
             # anything: a failure on any stream fails the whole
@@ -2652,6 +2667,9 @@ class KVStore:
                                      f"group {group!r}"}
             remaining = count
             streams_out: list = []
+            claimed_out: list = []
+            has_gt = any(id_str == ">"
+                         for _key, id_str in streams)
             for key, id_str in streams:
                 # Re-resolve the stream here, not from the
                 # resolve pass above: a key named twice in one
@@ -2660,9 +2678,61 @@ class KVStore:
                 # stale parse.
                 stream = _stream_data(self._data[key])
                 state = stream["groups"][group]
-                handed = _xreadgroup_deliver(
+                claimed_entries: list[tuple[str, dict]] = []
+                claimed_here: list[dict] = []
+                if id_str == ">" and claim_min_idle_ms is not None:
+                    # Claim first, Redis 8.4's CLAIM: before
+                    # handing out new entries on this stream, take
+                    # over the pending entries idle at least
+                    # ``claim_min_idle_ms`` — from any consumer,
+                    # longest idle first — moving each one to this
+                    # consumer, raising its delivery count by one,
+                    # and re-stamping its delivery time to
+                    # ``seen_ms``, like an xclaim inline in the
+                    # read. COUNT is one shared budget across the
+                    # claim and the new entries on every stream,
+                    # like Redis: a claim that fills it leaves no
+                    # room for new entries, on this stream or a
+                    # later one. NOACK does not apply to claimed
+                    # entries — the transfer of ownership is the
+                    # point, so they stay pending, now held by
+                    # this consumer — only the new entries ride
+                    # NOACK. With an explicit ID the claim is
+                    # ignored, like Redis: that read re-reads this
+                    # consumer's own pending entries, and there is
+                    # nothing new to claim into.
+                    by_id = {eid: fields
+                             for eid, fields in stream["entries"]}
+                    for idle, eid in _claimable_pending(
+                            state["pending"], by_id,
+                            claim_min_idle_ms, seen_ms):
+                        if (remaining is not None
+                                and len(claimed_entries) >= remaining):
+                            break
+                        info = state["pending"][eid]
+                        claimed_here.append(
+                            {"id": eid, "idle_ms": idle,
+                             "deliveries": info["deliveries"]})
+                        info["consumer"] = consumer
+                        info["deliveries"] += 1
+                        info["delivered_ms"] = seen_ms
+                        claimed_entries.append((eid, by_id[eid]))
+                # New entries after the claim: the claim took its
+                # share of the COUNT budget, so what is left of it
+                # is what the new entries may take.
+                stream_remaining = (
+                    None if remaining is None
+                    else max(0, remaining - len(claimed_entries)))
+                chosen = _xreadgroup_deliver(
                     stream["entries"], state, consumer, id_str,
-                    remaining, noack, seen_ms)
+                    stream_remaining, noack, seen_ms)
+                # Claimed entries ride first, longest idle first,
+                # then the new entries in ID order, like Redis —
+                # and the reply names which were claimed, with
+                # each one's idle at claim time and how many times
+                # it had been delivered before, like Redis's reply
+                # extension for claimed entries.
+                handed = claimed_entries + chosen
                 if remaining is not None:
                     remaining = max(0, remaining - len(handed))
                 if handed:
@@ -2675,8 +2745,13 @@ class KVStore:
                     streams_out.append(
                         [key, [[eid, dict(fields)]
                                for eid, fields in handed]])
-            return {"type": "client_response", "status": "ok",
-                    "streams": streams_out}
+                    if claimed_here:
+                        claimed_out.append([key, claimed_here])
+            reply: dict = {"type": "client_response", "status": "ok",
+                           "streams": streams_out}
+            if claim_min_idle_ms is not None and has_gt:
+                reply["claimed"] = claimed_out
+            return reply
         elif op == "xack":
             # Acknowledge entries for a consumer group, Redis
             # XACK: every ID in ``ids`` that is pending in the
@@ -4087,19 +4162,28 @@ class KVStore:
     def xreadgroup_multi_peek(self, streams, group: str,
                               consumer: str,
                               count: int | None = None,
-                              noack: bool = False) -> list | None:
+                              noack: bool = False,
+                              claim_min_idle_ms: int | None = None,
+                              seen_ms: int | None = None,
+                              ) -> list | None:
         """The streams a multi-stream xreadgroup would hand out
         right now — the [key, [[id, {field: value}], ...]] pairs
         for every stream that would hand out at least one entry,
         in the order the streams were given, sharing one count
         budget across them, exactly as the apply path hands them
-        out. None when any stream's key does not exist, holds a
+        out. With ``claim_min_idle_ms`` the claimable pending
+        entries on each \">\" stream ride first, longest idle
+        first, sharing the count budget with the new entries,
+        exactly as the apply path claims them — so a blocked CLAIM
+        read answers at once when idle entries are already there
+        to claim; with an explicit ID the claim is ignored, like
+        Redis. None when any stream's key does not exist, holds a
         plain string, or has no such group: nothing to wait for,
         since the write itself answers the error at apply time.
         An empty list when every stream exists and has its group
         but none has anything for this consumer. Raises
-        ValueError for a bad group, consumer, stream list, or
-        count. Pure read: no log entry, no state change — the
+        ValueError for a bad group, consumer, stream list, count,
+        or claim. Pure read: no log entry, no state change — the
         delivery step runs against freshly parsed stream blobs
         that are never written back, so a peek can never hand
         anything out, and a key named twice reads the first
@@ -4134,6 +4218,13 @@ class KVStore:
             raise ValueError(
                 "xreadgroup_multi count must be a non-negative "
                 "integer")
+        if claim_min_idle_ms is not None and (
+                not isinstance(claim_min_idle_ms, int)
+                or isinstance(claim_min_idle_ms, bool)
+                or claim_min_idle_ms < 0):
+            raise ValueError(
+                "xreadgroup_multi claim_min_idle_ms must be a "
+                "non-negative integer number of milliseconds")
         # Resolve every stream first, before peeking any of
         # them: a failure on any stream fails the whole call,
         # so there is nothing to wait for.
@@ -4151,11 +4242,38 @@ class KVStore:
                 parsed[key] = _stream_data(self._data[key])
             stream = parsed[key]
             state = stream["groups"][group]
+            claimed_entries: list = []
+            if id_str == ">" and claim_min_idle_ms is not None:
+                # The claimable pending entries ride first,
+                # longest idle first, sharing the count budget
+                # with the new entries, exactly as the apply path
+                # claims them — and the claim is simulated in the
+                # parsed copy, so a key named twice reads the
+                # first pass's claim on the second, like the apply
+                # path: the parsed blobs are never written back,
+                # so this can never hand anything out.
+                by_id = {eid: fields
+                         for eid, fields in stream["entries"]}
+                for _idle, eid in _claimable_pending(
+                        state["pending"], by_id,
+                        claim_min_idle_ms, seen_ms):
+                    if (remaining is not None
+                            and len(claimed_entries) >= remaining):
+                        break
+                    claimed_entries.append([eid, dict(by_id[eid])])
+                    info = state["pending"][eid]
+                    info["consumer"] = consumer
+                    info["deliveries"] += 1
+                    info["delivered_ms"] = seen_ms
+                if remaining is not None:
+                    remaining = max(
+                        0, remaining - len(claimed_entries))
             handed = _xreadgroup_deliver(
                 stream["entries"], state, consumer, id_str,
                 remaining, noack, None)
             if remaining is not None:
                 remaining = max(0, remaining - len(handed))
+            handed = claimed_entries + handed
             if handed:
                 out.append([key, [[eid, dict(fields)]
                                   for eid, fields in handed]])
