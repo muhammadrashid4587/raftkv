@@ -894,9 +894,14 @@ logic and the failure handling, not the key-value API on top.
   any other ID ("0", a bare millisecond, or a full "ms-seq") it
   re-reads the consumer's own pending entries at or after the ID,
   and each re-read raises that entry's delivery count by one, so a
-  consumer can tell a first delivery from a retry. NOACK delivers
-  without recording the entries pending, though the last delivery
-  still advances. Since v0.68.0 a ">" readgroup may carry BLOCK:
+  consumer can tell a first delivery from a retry. A NOACK re-read
+  is the exception: it hands the entries back without raising the
+  delivery count or re-stamping the delivery time, so it reads as
+  a peek — the entry's idle keeps running from its last real
+  delivery — while the consumer's own last-seen stamp still
+  moves. NOACK delivers without recording the entries pending,
+  though the last delivery still advances. Since v0.68.0 a ">"
+  readgroup may carry BLOCK:
   when the group has nothing to hand out yet it waits up to that
   many milliseconds for a new entry — the leader long-polls the
   watched stream key, the same watch/condition pattern a watch RPC
@@ -4352,3 +4357,43 @@ entries left in `log.jsonl` are dropped by their index on reload.
   a new roadmap item grounded in this project's purpose,
   proposed by the next run — candidate: XREADGROUP with
   NOACK re-reads of pending entries by consumer.
+- ~~Streams (XREADGROUP NOACK re-reads)~~ — done in v0.75.0,
+  Nov 27, 2026: a NOACK re-read of a consumer's own pending
+  entries — `xreadgroup key group consumer 0 [--count n] [--noack]`
+  — hands the entries back without touching the pending record at
+  all: the delivery count stays where the last real delivery left
+  it and the delivery stamp is not re-stamped, so the entry's idle
+  keeps running from that delivery instead of resetting on a mere
+  peek, and a NOACK re-read is distinguishable from a fresh ">"
+  delivery and from a plain re-read in XPENDING's per-entry form.
+  The consumer's own last-seen stamp still moves — the consumer
+  interacted and received entries — and its lag record still takes
+  the newest entry handed, never moving backwards, like any other
+  delivery; the entries stay pending afterwards, still ackable,
+  and still claimable once idle long enough. This is a deliberate
+  departure from Redis, where NOACK is ignored for a history read
+  and the re-read still counts as a delivery: here NOACK means the
+  delivery is not recorded, whichever ID form the read takes. No
+  new RPC and no new Session, client, or CLI surface: NOACK already
+  rides the existing `xreadgroup` everywhere, and the change is
+  entirely in the store's apply path, so it replicates through the
+  log like any other delivery.
+  `tests/test_xreadgroup_noack.py` proves it: store-level a NOACK
+  re-read returning the entries with the delivery count and stamp
+  untouched and the idle un-reset, a plain re-read still raising
+  the count and re-stamping, a NOACK re-read capped by COUNT with
+  the entries still pending and ackable afterwards, and a NOACK
+  re-read returning only the consumer's own pending entries; and
+  cluster-level the NOACK re-read replicated to every node with
+  the delivery counts and stamps unchanged on each one, and a
+  plain re-read after it still raising the count everywhere. The
+  honest limit is the one the departure creates: a consumer that
+  re-reads with NOACK and then crashes leaves no record that it
+  ever saw the entries a second time — the count says one
+  delivery, not two — so a reaper judging by delivery count alone
+  undercounts the attempts.
+  The roadmap is exhausted again, so the next real thing is
+  a new roadmap item grounded in this project's purpose,
+  proposed by the next run — candidate: XREADGROUP CLAIM, claiming
+  idle pending entries inline during a read, Redis 7.2's CLAIM
+  option.

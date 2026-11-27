@@ -2223,7 +2223,17 @@ class KVStore:
             # and not yet acked, with an ID at or after the given
             # one — in ID order, at most ``count`` of them, and
             # each re-read raises its delivery count by one, so a
-            # consumer can tell a first delivery from a retry.
+            # consumer can tell a first delivery from a retry —
+            # unless ``noack`` rides along: a NOACK re-read hands
+            # the entries back without touching the pending record
+            # at all, no delivery count and no new delivery stamp,
+            # so it reads as a peek rather than a redelivery and
+            # the entry's idle keeps running from its last real
+            # delivery. That is a deliberate departure from Redis,
+            # where NOACK is ignored for a history read and the
+            # re-read still counts as a delivery: here NOACK means
+            # the delivery is not recorded, whichever ID form the
+            # read takes.
             # The reply carries ``entries`` — the [id, {field:
             # value}] pairs in ID order, an empty list when the
             # group has nothing for this consumer. A missing key
@@ -2347,8 +2357,14 @@ class KVStore:
             else:
                 # Pending entries: the consumer's own unacked
                 # ones, at or after the given ID — in ID order,
-                # each re-read raising its delivery count. An
-                # entry trimmed away under KEEPREF is still
+                # each re-read raising its delivery count, unless
+                # NOACK rides along: a NOACK re-read hands the
+                # entries back without touching the pending record
+                # at all, so the delivery count stays where the
+                # last real delivery left it and the delivery
+                # stamp is not re-stamped, and the entry's idle
+                # keeps running from that delivery. An entry
+                # trimmed away under KEEPREF is still
                 # pending but its data is gone, so it is skipped:
                 # there is nothing left to return for it.
                 start = parse_stream_range_bound(id_str)
@@ -2366,9 +2382,10 @@ class KVStore:
                     if count is not None and len(chosen) >= count:
                         break
                     chosen.append((eid, by_id[eid]))
-                    info["deliveries"] += 1
-                    if seen_ms is not None:
-                        info["delivered_ms"] = seen_ms
+                    if not noack:
+                        info["deliveries"] += 1
+                        if seen_ms is not None:
+                            info["delivered_ms"] = seen_ms
             if chosen:
                 if seen_ms is not None:
                     _stamp_consumer_delivery(state, consumer, seen_ms,

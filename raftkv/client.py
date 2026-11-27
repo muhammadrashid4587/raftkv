@@ -1143,7 +1143,10 @@ class Session:
         consumer's own pending entries — the ones already handed
         to this consumer and not yet acked, at or after the given
         ID — and each re-read raises that entry's delivery count
-        by one. With ``noack`` the entries are delivered without
+        by one, unless ``noack`` rides along: a NOACK re-read hands
+        the entries back without raising the delivery count or
+        re-stamping the delivery time, so it reads as a peek. With
+        ``noack`` the entries are delivered without
         being recorded pending, though the last delivery still
         advances. ``block`` waits that many milliseconds for a new
         entry when a ">" read has nothing to hand out yet — 0
@@ -4106,7 +4109,10 @@ def xreadgroup(node_addr: tuple[str, int], key: str, group: str,
     each one pending for that consumer; with any other ID ("0", a
     bare millisecond, or a full "ms-seq") it re-reads the
     consumer's own pending entries at or after the given ID, and
-    each re-read raises that entry's delivery count by one. With
+    each re-read raises that entry's delivery count by one, unless
+    ``noack`` rides along: a NOACK re-read hands the entries back
+    without raising the delivery count or re-stamping the delivery
+    time, so it reads as a peek. With
     ``noack`` the entries are delivered without being recorded
     pending, though the last delivery still advances. ``count``
     caps how many entries one call returns, like Redis's COUNT —
