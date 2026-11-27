@@ -1729,6 +1729,84 @@ class KVStore:
             return 0
         return (raw[byte_index] >> (7 - offset % 8)) & 1
 
+    def bitcount(self, key: str, start: int | None = None,
+                 end: int | None = None,
+                 mode: str = "BYTE") -> int:
+        """The number of bits set to 1 in the string value at
+        ``key``, Redis BITCOUNT: a missing key holds no bits, so
+        it counts 0, and an empty value counts 0 too. With no
+        range the whole value is counted; with ``start`` and
+        ``end`` only that slice is — in BYTE mode the indexes
+        name bytes, in BIT mode they name bits, bit 0 the most
+        significant bit of the first byte, exactly like getbit's
+        numbering. A negative index counts back from the end of
+        the value (or of its bits), and an index past either end
+        is clamped, like a getrange — so a range with start past
+        end counts 0 rather than raising. Raises TypeError when
+        the value is not a byte string, like getbit, and
+        ValueError for a bad ``mode`` or a non-integer bound:
+        a bool is not an integer, and only BYTE and BIT are
+        modes. Pure read: no log entry, no state change."""
+        if mode not in ("BYTE", "BIT"):
+            raise ValueError(
+                "bitcount mode must be BYTE or BIT")
+        for name, bound in (("start", start), ("end", end)):
+            if (bound is not None
+                    and (not isinstance(bound, int)
+                         or isinstance(bound, bool))):
+                raise ValueError(
+                    f"bitcount {name} must be an integer")
+        value = self._data.get(key)
+        if value is None:
+            return 0
+        if not isinstance(value, str):
+            raise TypeError(
+                f"bitcount failed: value of {key!r} is not a byte "
+                "string")
+        try:
+            raw = value.encode("latin-1")
+        except UnicodeEncodeError:
+            raise TypeError(
+                f"bitcount failed: value of {key!r} is not a byte "
+                "string")
+        # Redis's getRange normalization, in bytes or in bits:
+        # a negative bound counts back from the end, a bound
+        # still past either end after that is clamped to the
+        # edge, and a start past the end counts 0.
+        total = len(raw) if mode == "BYTE" else len(raw) * 8
+        if start is None:
+            start = 0
+        if end is None:
+            end = total - 1
+        if start < 0:
+            start += total
+        if end < 0:
+            end += total
+        if start < 0:
+            start = 0
+        if end < 0:
+            end = 0
+        if end >= total:
+            end = total - 1
+        if start > end or total == 0:
+            return 0
+        if mode == "BYTE":
+            return sum(b.bit_count() for b in raw[start:end + 1])
+        # BIT mode: count the bits from ``start`` to ``end``
+        # inclusive — bit 0 the most significant bit of the
+        # first byte — so a range inside one byte masks just
+        # those bits, and a range across bytes counts the two
+        # partial edges plus every whole byte between them.
+        count = 0
+        first = start // 8
+        last = end // 8
+        for i in range(first, last + 1):
+            low = start % 8 if i == first else 0
+            high = end % 8 if i == last else 7
+            mask = ((0xFF >> low) & (0xFF << (7 - high))) & 0xFF
+            count += (raw[i] & mask).bit_count()
+        return count
+
     def strlen(self, key: str) -> int:
         """Length of the string value at ``key`` — 0 when the key
         does not exist, Redis STRLEN. Raises TypeError when the

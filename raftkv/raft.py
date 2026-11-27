@@ -2436,7 +2436,8 @@ class RaftNode:
                       "incr", "incrbyfloat", "setnx", "getset",
                       "append", "strlen",
                       "getdel", "getrange", "setrange", "getex",
-                      "setbit", "getbit", "bitop", "pfadd", "pfcount",
+                      "setbit", "getbit", "bitop", "bitcount",
+                      "pfadd", "pfcount",
                       "hset", "hget", "hdel", "hgetall",
                       "hlen", "hexists", "hkeys", "hvals", "hmget",
                       "hscan",
@@ -2448,7 +2449,7 @@ class RaftNode:
                              "incr/incrbyfloat/setnx/getset/append/"
                              "strlen/getdel/"
                              "getrange/setrange/getex/setbit/getbit/"
-                             "bitop/"
+                             "bitop/bitcount/"
                              "pfadd/pfcount/hset/hget/hdel/hgetall/"
                              "hlen/hexists/hkeys/hvals/hmget/hscan/"
                              "setex "
@@ -2530,6 +2531,67 @@ class RaftNode:
                 return error
             return self._serve_read(getbit_key=key,
                                     getbit_offset=offset,
+                                    min_index=min_index,
+                                    session_term=session_term,
+                                    stale_ok=bool(msg.get("stale_ok")))
+        if op == "bitcount":
+            # A count of set bits: how many bits are 1 in the
+            # string value at this key — 0 when the key does not
+            # exist, Redis BITCOUNT. It rides the same
+            # ReadIndex/lease path as a ``get`` — one leadership
+            # confirmation, one apply wait — so the count
+            # reflects the committed state as of the read index
+            # it names, exactly as linearizable, and a session
+            # read carries the same watermark a get would. The
+            # range is validated here, on the leader, before
+            # anything is served: ``start`` and ``end`` must be
+            # integers (a bool is not one) and come as a pair,
+            # and ``mode`` — when given — must be BYTE or BIT,
+            # matched case-insensitively and normalized to upper
+            # case before it is served, so every node counts the
+            # same range. Negative bounds are legal — they count
+            # from the end — and are clamped at serve time, like
+            # a getrange. A mode with no range is a client
+            # error: the mode only says how the range is read.
+            start = msg.get("start")
+            end = msg.get("end")
+            mode = msg.get("mode")
+            for field, bound in (("start", start), ("end", end)):
+                if (bound is not None
+                        and (not isinstance(bound, int)
+                             or isinstance(bound, bool))):
+                    return {"type": "client_response",
+                            "status": "error",
+                            "error": f"bitcount {field} must be an "
+                                     "integer"}
+            if (start is None) != (end is None):
+                return {"type": "client_response", "status": "error",
+                        "error": "bitcount start and end must be "
+                                 "given together"}
+            if mode is not None:
+                if not isinstance(mode, str):
+                    return {"type": "client_response",
+                            "status": "error",
+                            "error": "bitcount mode must be BYTE "
+                                     "or BIT"}
+                mode = mode.upper()
+                if mode not in ("BYTE", "BIT"):
+                    return {"type": "client_response",
+                            "status": "error",
+                            "error": "bitcount mode must be BYTE "
+                                     "or BIT"}
+                if start is None:
+                    return {"type": "client_response",
+                            "status": "error",
+                            "error": "bitcount mode needs a start "
+                                     "and end"}
+            min_index, session_term, error = self._parse_read_params(msg)
+            if error is not None:
+                return error
+            return self._serve_read(bitcount_key=key,
+                                    bitcount_start=start,
+                                    bitcount_end=end,
+                                    bitcount_mode=mode or "BYTE",
                                     min_index=min_index,
                                     session_term=session_term,
                                     stale_ok=bool(msg.get("stale_ok")))
@@ -3874,6 +3936,10 @@ class RaftNode:
                     getrange_end: int | None = None,
                     getbit_key: str | None = None,
                     getbit_offset: int | None = None,
+                    bitcount_key: str | None = None,
+                    bitcount_start: int | None = None,
+                    bitcount_end: int | None = None,
+                    bitcount_mode: str = "BYTE",
                     pfcount_key: str | None = None,
                     hget_key: str | None = None,
                     hget_field: str | None = None,
@@ -3920,6 +3986,16 @@ class RaftNode:
         same way, so it is exactly as linearizable as a ``get``;
         a missing key holds no bits, so any offset of it is 0,
         and an offset past the end of the value is 0 too.
+        ``bitcount_key`` serves a count of set bits instead —
+        how many bits are 1 in the string value at that key,
+        0 for a missing key, Redis BITCOUNT — read off the
+        applied state machine the same way, so it is exactly
+        as linearizable as a ``get``. ``bitcount_start`` /
+        ``bitcount_end`` name the slice to count — bytes in
+        BYTE mode, bits in BIT mode, negative bounds counting
+        back from the end and out-of-range bounds clamped,
+        like a getrange — and None for both counts the whole
+        value.
         ``pfcount_key`` serves a cardinality estimate instead —
         the HyperLogLog estimate at that key, 0 for a missing
         key, Redis PFCOUNT — read off the applied state machine
@@ -4130,6 +4206,21 @@ class RaftNode:
                     return {"bit": self.sm.getbit(
                         getbit_key, getbit_offset)}
                 except TypeError as e:
+                    return {"status": "error", "error": str(e)}
+            if bitcount_key is not None:
+                # A count of set bits: how many bits are 1 in the
+                # string value at this key — Redis BITCOUNT — with
+                # the same wrongtype rule as getbit: a value that
+                # is not a byte string is a client error, not a
+                # count, carried the same way, overriding the
+                # "ok" in the response literal. A bad mode or a
+                # non-integer bound is the same kind of error,
+                # from the store's own validation.
+                try:
+                    return {"bitcount": self.sm.bitcount(
+                        bitcount_key, bitcount_start, bitcount_end,
+                        bitcount_mode)}
+                except (TypeError, ValueError) as e:
                     return {"status": "error", "error": str(e)}
             if pfcount_key is not None:
                 # A cardinality estimate: the HyperLogLog estimate

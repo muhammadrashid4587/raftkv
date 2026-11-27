@@ -32,8 +32,19 @@ result — or a ``del`` event when the empty result deletes the
 destination. Like a setbit, its outcome is decided at apply time, so
 a retry returns the first attempt's length instead of combining
 twice, and a non-byte-string source fails with ``bitop_failed`` /
-``wrongtype``. These spin up real nodes (real TCP, real threads,
-real disk) on localhost, like the rest of the suite.
+``wrongtype``.
+
+``bitcount key [start end [BYTE|BIT]]`` counts the bits set to 1 in
+the string at the key — 0 when the key does not exist, Redis
+BITCOUNT — a pure read through the same ReadIndex path as a ``get``.
+With ``start`` and ``end`` only that slice is counted: bytes in
+BYTE mode, bits in BIT mode (bit 0 the most significant bit of the
+first byte, like getbit's numbering), negative bounds counting back
+from the end and out-of-range bounds clamped, like a getrange, so a
+range with start past end counts 0. A value that is not a byte
+string is a client error, not a count, like a getbit on it. These
+spin up real nodes (real TCP, real threads, real disk) on localhost,
+like the rest of the suite.
 """
 
 import contextlib
@@ -43,6 +54,7 @@ import unittest
 
 from harness import Cluster, client_request, wait_for_key
 from raftkv.client import Session, main as client_main
+from raftkv.client import bitcount as client_bitcount
 from raftkv.client import bitop as client_bitop
 from raftkv.client import getbit as client_getbit
 from raftkv.client import setbit as client_setbit
@@ -63,6 +75,17 @@ def setbit(addr, key="k", offset=0, bit=1, client_id=None,
 def getbit(addr, key="k", offset=0):
     return client_request(addr, {"type": "client", "op": "getbit",
                                  "key": key, "offset": offset})
+
+
+def bitcount(addr, key="k", start=None, end=None, mode=None):
+    msg = {"type": "client", "op": "bitcount", "key": key}
+    if start is not None:
+        msg["start"] = start
+    if end is not None:
+        msg["end"] = end
+    if mode is not None:
+        msg["mode"] = mode
+    return client_request(addr, msg)
 
 
 def bitop(addr, operation="AND", dest="dest", keys=("a", "b"),
@@ -1126,6 +1149,359 @@ class TestBitopCluster(unittest.TestCase):
                                   "dest", "a", "b"])
             self.assertEqual(rc, 1)
             self.assertIn("NOT", err.getvalue())
+        finally:
+            cluster.stop_all()
+
+
+class TestBitcountStore(unittest.TestCase):
+    def _abc(self):
+        store = KVStore()
+        store.apply({"op": "set", "key": "k", "value": "ab"})
+        return store
+
+    def test_bitcount_whole_value(self):
+        """The whole value is counted: 'a' is 0x61 (3 bits set),
+        'b' is 0x62 (3 bits), so "ab" counts 6; a missing key
+        counts 0, an empty value counts 0, and "\\xff\\x00\\x81"
+        counts 8 + 0 + 2."""
+        store = self._abc()
+        self.assertEqual(store.bitcount("k"), 6)
+        self.assertEqual(store.bitcount("missing"), 0)
+        store.apply({"op": "set", "key": "e", "value": ""})
+        self.assertEqual(store.bitcount("e"), 0)
+        store.apply({"op": "set", "key": "f", "value": "\xff\x00\x81"})
+        self.assertEqual(store.bitcount("f"), 10)
+
+    def test_bitcount_byte_range(self):
+        """A byte range counts only those bytes: each byte of
+        "ab" holds 3 set bits, so one byte counts 3 and both
+        count 6; negative bounds count back from the end, and
+        out-of-range bounds clamp, like a getrange — so a range
+        with start past end counts 0 rather than raising."""
+        store = self._abc()
+        self.assertEqual(store.bitcount("k", 0, 0), 3)
+        self.assertEqual(store.bitcount("k", 1, 1), 3)
+        self.assertEqual(store.bitcount("k", 0, 1), 6)
+        self.assertEqual(store.bitcount("k", -1, -1), 3)
+        self.assertEqual(store.bitcount("k", 0, -1), 6)
+        self.assertEqual(store.bitcount("k", -2, -1), 6)
+        self.assertEqual(store.bitcount("k", -100, 100), 6)
+        self.assertEqual(store.bitcount("k", 5, 9), 0)
+        self.assertEqual(store.bitcount("k", 1, 0), 0)
+        # An end still before the start after normalization
+        # clamps to the first byte, like Redis's getRange.
+        self.assertEqual(store.bitcount("k", 0, -100), 3)
+
+    def test_bitcount_bit_mode(self):
+        """In BIT mode the bounds name bits, bit 0 the most
+        significant bit of the first byte: 'a' is 0x61 =
+        01100001, so bits 1, 2, and 7 are set — bits 1..2 count
+        2, bits 6..7 count 1, bits 3..6 count 0 — and a range
+        across the byte boundary counts the partial edges plus
+        the whole bytes between them."""
+        store = self._abc()
+        self.assertEqual(store.bitcount("k", 0, 7, "BIT"), 3)
+        self.assertEqual(store.bitcount("k", 0, 0, "BIT"), 0)
+        self.assertEqual(store.bitcount("k", 1, 2, "BIT"), 2)
+        self.assertEqual(store.bitcount("k", 6, 7, "BIT"), 1)
+        self.assertEqual(store.bitcount("k", 3, 6, "BIT"), 0)
+        self.assertEqual(store.bitcount("k", 0, 15, "BIT"), 6)
+        # Bits 6..9: bit 7 of 'a' and bit 9 of 'b' are set.
+        self.assertEqual(store.bitcount("k", 6, 9, "BIT"), 2)
+        # Negative bit bounds count back from the end.
+        self.assertEqual(store.bitcount("k", -8, -1, "BIT"), 3)
+        self.assertEqual(store.bitcount("k", -16, -9, "BIT"), 3)
+        self.assertEqual(store.bitcount("k", 8, 7, "BIT"), 0)
+
+    def test_bitcount_wrongtype_raises(self):
+        """A value holding a character above U+00FF has no byte
+        form: bitcount on it raises TypeError, whole or ranged,
+        in either mode."""
+        store = KVStore()
+        store.apply({"op": "set", "key": "k", "value": "€"})
+        with self.assertRaises(TypeError):
+            store.bitcount("k")
+        with self.assertRaises(TypeError):
+            store.bitcount("k", 0, 0)
+        with self.assertRaises(TypeError):
+            store.bitcount("k", 0, 7, "BIT")
+
+    def test_bitcount_bad_mode_and_bounds_raise(self):
+        """A bad mode, a non-integer bound, or a bool bound is a
+        programming error at the store level — the leader
+        validates all of them before serving, so a hand-built
+        call with any of them raises instead of counting
+        nonsense. The mode is case-sensitive here: the server
+        normalizes it before it reaches the store."""
+        store = self._abc()
+        with self.assertRaises(ValueError):
+            store.bitcount("k", 0, 1, "BYTES")
+        with self.assertRaises(ValueError):
+            store.bitcount("k", 0, 1, "bit")
+        with self.assertRaises(ValueError):
+            store.bitcount("k", "0", 1)
+        with self.assertRaises(ValueError):
+            store.bitcount("k", 0, True)
+
+
+class TestBitcountCluster(unittest.TestCase):
+    def test_bitcount_counts_set_bits_on_every_node(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            self.assertEqual(bitcount(addr, key="missing")
+                             .get("bitcount"), 0)
+            self.assertEqual(write(addr, value="\xff")
+                             .get("status"), "ok")
+            self.assertEqual(bitcount(addr).get("bitcount"), 8)
+            for node_id in cluster.live:
+                self.assertTrue(
+                    wait_for_key(cluster.nodes[node_id], "k", "\xff"))
+                self.assertEqual(
+                    cluster.nodes[node_id].sm.bitcount("k"), 8)
+            # Setting one more bit moves the count, on every
+            # node: "\xff" plus bit 8 is "\xff\x80", 9 bits.
+            self.assertEqual(setbit(addr, offset=8, bit=1)
+                             .get("status"), "ok")
+            self.assertEqual(bitcount(addr).get("bitcount"), 9)
+            for node_id in cluster.live:
+                self.assertTrue(
+                    wait_for_key(cluster.nodes[node_id], "k",
+                                 "\xff\x80"))
+                self.assertEqual(
+                    cluster.nodes[node_id].sm.bitcount("k"), 9)
+        finally:
+            cluster.stop_all()
+
+    def test_bitcount_from_follower_redirects(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            follower = next(n for n in cluster.live
+                            if n != leader.id)
+            addr = cluster.addrs[leader.id]
+            self.assertEqual(write(addr, value="a")
+                             .get("status"), "ok")
+            # The module function sent to a follower follows the
+            # redirect and still counts the leader's value.
+            self.assertEqual(
+                client_bitcount(cluster.addrs[follower], "k")
+                .get("bitcount"), 3)
+            self.assertEqual(
+                client_bitcount(cluster.addrs[follower], "k", 0, 0)
+                .get("bitcount"), 3)
+        finally:
+            cluster.stop_all()
+
+    def test_bitcount_range_and_bit_mode(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            self.assertEqual(write(addr, value="ab")
+                             .get("status"), "ok")
+            self.assertEqual(bitcount(addr, start=0, end=0).get("bitcount"), 3)
+            self.assertEqual(bitcount(addr, start=1, end=1).get("bitcount"), 3)
+            self.assertEqual(bitcount(addr, start=0, end=1).get("bitcount"), 6)
+            self.assertEqual(bitcount(addr, start=-1, end=-1)
+                             .get("bitcount"), 3)
+            self.assertEqual(bitcount(addr, start=5, end=9).get("bitcount"), 0)
+            self.assertEqual(bitcount(addr, start=0, end=7, mode="BIT")
+                             .get("bitcount"), 3)
+            self.assertEqual(bitcount(addr, start=1, end=2, mode="BIT")
+                             .get("bitcount"), 2)
+            self.assertEqual(bitcount(addr, start=0, end=15, mode="BIT")
+                             .get("bitcount"), 6)
+            # The mode is matched case-insensitively: "bit"
+            # counts bits like BIT.
+            self.assertEqual(bitcount(addr, start=0, end=7, mode="bit")
+                             .get("bitcount"), 3)
+        finally:
+            cluster.stop_all()
+
+    def test_invalid_bitcount_rejected_with_no_log_entry(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            before = len(leader.log)
+            # start without end, and end without start.
+            resp = client_request(
+                addr, {"type": "client", "op": "bitcount",
+                       "key": "k", "start": 0})
+            self.assertEqual(resp.get("status"), "error", resp)
+            self.assertIn("together", resp.get("error", ""), resp)
+            resp = client_request(
+                addr, {"type": "client", "op": "bitcount",
+                       "key": "k", "end": 0})
+            self.assertEqual(resp.get("status"), "error", resp)
+            self.assertIn("together", resp.get("error", ""), resp)
+            # A bad mode, and a mode with no range.
+            resp = bitcount(addr, start=0, end=1, mode="BYTES")
+            self.assertEqual(resp.get("status"), "error", resp)
+            self.assertIn("mode", resp.get("error", ""), resp)
+            resp = client_request(
+                addr, {"type": "client", "op": "bitcount",
+                       "key": "k", "mode": "BIT"})
+            self.assertEqual(resp.get("status"), "error", resp)
+            self.assertIn("mode", resp.get("error", ""), resp)
+            # A non-integer bound, and a bool bound.
+            resp = client_request(
+                addr, {"type": "client", "op": "bitcount",
+                       "key": "k", "start": "0", "end": 1})
+            self.assertEqual(resp.get("status"), "error", resp)
+            self.assertIn("start", resp.get("error", ""), resp)
+            resp = client_request(
+                addr, {"type": "client", "op": "bitcount",
+                       "key": "k", "start": True, "end": 1})
+            self.assertEqual(resp.get("status"), "error", resp)
+            self.assertIn("start", resp.get("error", ""), resp)
+            # None of the rejected reads left a key behind, and
+            # none appended a log entry — a bitcount is a read,
+            # so a rejected one appends nothing at all.
+            self.assertIsNone(read(addr).get("value"))
+            self.assertEqual(len(leader.log), before)
+        finally:
+            cluster.stop_all()
+
+    def test_bitcount_wrongtype_is_error(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            self.assertEqual(write(addr, value="€")
+                             .get("status"), "ok")
+            resp = bitcount(addr)
+            self.assertEqual(resp.get("status"), "error", resp)
+            self.assertIn("byte string", resp.get("error", ""), resp)
+            resp = bitcount(addr, start=0, end=7, mode="BIT")
+            self.assertEqual(resp.get("status"), "error", resp)
+            self.assertIn("byte string", resp.get("error", ""), resp)
+        finally:
+            cluster.stop_all()
+
+    def test_bitcount_continues_after_leader_change(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            self.assertEqual(write(addr, value="\x81")
+                             .get("status"), "ok")
+            self.assertEqual(bitcount(addr).get("bitcount"), 2)
+            cluster.stop_node(leader.id)
+            new_leader = cluster.wait_for_leader()
+            addr = cluster.addrs[new_leader.id]
+            # The value survived the failover, so the count is
+            # still 2 — and a setbit after it still moves it.
+            self.assertEqual(bitcount(addr).get("bitcount"), 2)
+            self.assertEqual(setbit(addr, offset=1, bit=1)
+                             .get("status"), "ok")
+            self.assertEqual(bitcount(addr).get("bitcount"), 3)
+        finally:
+            cluster.stop_all()
+
+    def test_session_bitcount_is_read_your_writes(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            with Session(addr) as session:
+                resp = session.set("k", "\xff")
+                self.assertEqual(resp.get("status"), "ok", resp)
+                self.assertGreater(session.last_write_index, 0)
+                self.assertEqual(session.bitcount("k")
+                                 .get("bitcount"), 8)
+                self.assertEqual(session.bitcount("k", 0, 0)
+                                 .get("bitcount"), 8)
+                self.assertEqual(session.bitcount("k", 0, 7, "BIT")
+                                 .get("bitcount"), 8)
+                # A bitcount on a missing key is 0 through the
+                # session too, and still advances the read
+                # watermark.
+                self.assertEqual(session.bitcount("missing")
+                                 .get("bitcount"), 0)
+                # A setbit through the same session moves the
+                # count the session reads back.
+                resp = session.setbit("k", 8, 1)
+                self.assertEqual(resp.get("status"), "ok", resp)
+                self.assertEqual(session.bitcount("k")
+                                 .get("bitcount"), 9)
+        finally:
+            cluster.stop_all()
+
+    def test_bitcount_module_functions(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            self.assertEqual(write(addr, value="ab")
+                             .get("status"), "ok")
+            self.assertEqual(client_bitcount(addr, "k")
+                             .get("bitcount"), 6)
+            self.assertEqual(client_bitcount(addr, "k", 0, 0)
+                             .get("bitcount"), 3)
+            self.assertEqual(client_bitcount(addr, "k", 0, 15, "BIT")
+                             .get("bitcount"), 6)
+            self.assertEqual(client_bitcount(addr, "missing")
+                             .get("bitcount"), 0)
+        finally:
+            cluster.stop_all()
+
+    def test_bitcount_cli(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            host, port = cluster.addrs[leader.id]
+            node = f"{host}:{port}"
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "set", "k", "ab"])
+            self.assertEqual(rc, 0)
+            # The whole value counts 6.
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "bitcount", "k"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(out.getvalue().strip(), "6")
+            # One byte counts 3.
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "bitcount", "k",
+                                  "0", "0"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(out.getvalue().strip(), "3")
+            # In BIT mode the first byte's bits count 3.
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "bitcount", "k",
+                                  "0", "7", "--mode", "BIT"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(out.getvalue().strip(), "3")
+            # A missing key counts 0.
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "bitcount",
+                                  "missing"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(out.getvalue().strip(), "0")
+            # A start without an end is a server error, not a
+            # count.
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = client_main(["--node", node, "bitcount", "k",
+                                  "0"])
+            self.assertEqual(rc, 1)
+            self.assertIn("together", err.getvalue())
         finally:
             cluster.stop_all()
 

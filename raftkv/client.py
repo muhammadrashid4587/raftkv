@@ -697,6 +697,47 @@ class Session:
                 self.last_read_term = int(resp.get("read_term") or 0)
         return resp
 
+    def bitcount(self, key: str, start: int | None = None,
+                 end: int | None = None,
+                 mode: str | None = None) -> dict:
+        """Ask how many bits are set to 1 in the string value at
+        ``key``, Redis BITCOUNT: 0 when the key does not exist.
+        With ``start`` and ``end`` only that slice is counted —
+        bytes in BYTE mode, bits in BIT mode (``mode`` is
+        matched case-insensitively server-side), negative bounds
+        counting back from the end and out-of-range bounds
+        clamped, like a getrange — and a range with start past
+        end counts 0. It rides the same ReadIndex path as
+        ``get``, so it carries the same session watermark and
+        advances the read watermark from the reply's
+        ``read_index`` exactly the same way: a count query
+        after your own write sees the bits that write set, and
+        a later read never goes backwards past it."""
+        if self.last_read_index > self.last_write_index:
+            min_index = self.last_read_index
+            term = self.last_read_term
+        else:
+            min_index = self.last_write_index
+            term = self.last_write_term
+        msg: dict = {"type": "client", "op": "bitcount", "key": key,
+                     "client_id": self.client_id,
+                     "min_commit_index": min_index,
+                     "session_term": term}
+        if start is not None:
+            msg["start"] = start
+        if end is not None:
+            msg["end"] = end
+        if mode is not None:
+            msg["mode"] = mode
+        resp = request(self.node_addr, msg, pool=self._pooled)
+        if (resp.get("status") == "ok"
+                and resp.get("read_index") is not None):
+            read_index = int(resp["read_index"])
+            if read_index > self.last_read_index:
+                self.last_read_index = read_index
+                self.last_read_term = int(resp.get("read_term") or 0)
+        return resp
+
     def bitop(self, dest: str, operation: str,
               keys: list[str]) -> dict:
         """Combine the string values at ``keys`` bitwise and store
@@ -2252,6 +2293,35 @@ def getbit(node_addr: tuple[str, int], key: str, offset: int,
                    timeout=timeout)
 
 
+def bitcount(node_addr: tuple[str, int], key: str,
+             start: int | None = None, end: int | None = None,
+             mode: str | None = None, timeout: float = 12.0) -> dict:
+    """Ask how many bits are set to 1 in the string value at
+    ``key``, following leader redirects like ``request`` — Redis
+    BITCOUNT.
+
+    One request serves the count through the leader's ReadIndex
+    path, so it reflects the committed state as of one read
+    index, exactly as linearizable as a ``get``. The reply is the
+    plain bitcount response (``status`` ``ok`` with ``bitcount``
+    — the number of set bits — plus the ``read_index`` /
+    ``read_term`` it was measured at). A missing key counts 0.
+    With ``start`` and ``end`` only that slice is counted —
+    bytes in BYTE mode, bits in BIT mode, negative bounds
+    counting back from the end and out-of-range bounds clamped,
+    like a getrange — and a range with start past end counts 0.
+    ``start`` and ``end`` come as a pair, and ``mode`` — when
+    given — must be BYTE or BIT."""
+    msg: dict = {"type": "client", "op": "bitcount", "key": key}
+    if start is not None:
+        msg["start"] = start
+    if end is not None:
+        msg["end"] = end
+    if mode is not None:
+        msg["mode"] = mode
+    return request(node_addr, msg, timeout=timeout)
+
+
 def bitop(node_addr: tuple[str, int], dest: str, operation: str,
           keys: list[str], timeout: float = 12.0) -> dict:
     """Combine the string values at ``keys`` bitwise and store the
@@ -3103,6 +3173,27 @@ def main(argv: list[str] | None = None) -> int:
     p_getbit.add_argument("offset", type=int,
                           help="bit to read, 0-based; bit 0 is the most "
                                "significant bit of the first byte")
+    p_bitcount = sub.add_parser(
+        "bitcount",
+        help="print how many bits are set to 1 in the string at "
+             "key; 0 when the key does not exist; with start and "
+             "end only that slice is counted, bytes by default "
+             "or bits with --mode BIT")
+    p_bitcount.add_argument("key")
+    p_bitcount.add_argument("start", type=int, nargs="?",
+                            default=None,
+                            help="first byte (or bit, with --mode "
+                                 "BIT) to count, 0-based; negative "
+                                 "counts back from the end")
+    p_bitcount.add_argument("end", type=int, nargs="?",
+                            default=None,
+                            help="last byte (or bit, with --mode "
+                                 "BIT) to count, inclusive; negative "
+                                 "counts back from the end")
+    p_bitcount.add_argument("--mode", default=None,
+                            choices=("BYTE", "BIT"),
+                            help="whether start and end name bytes "
+                                 "(default) or bits")
     p_bitop = sub.add_parser(
         "bitop",
         help="combine the string values at key ... bitwise (AND, "
@@ -3329,7 +3420,7 @@ def main(argv: list[str] | None = None) -> int:
               "incrbyfloat",
               "setnx", "getset", "append", "strlen", "getdel",
               "getex", "getrange", "setrange", "setbit", "getbit",
-              "bitop",
+              "bitop", "bitcount",
               "pfadd", "pfcount", "hset", "hget", "hdel", "hgetall",
               "hlen", "hexists", "hkeys", "hvals", "hmget", "hscan",
               "setex", "expireat",
@@ -3421,6 +3512,13 @@ def main(argv: list[str] | None = None) -> int:
         msg["bit"] = args.bit
     if op == "getbit":
         msg["offset"] = args.offset
+    if op == "bitcount":
+        if args.start is not None:
+            msg["start"] = args.start
+        if args.end is not None:
+            msg["end"] = args.end
+        if args.mode is not None:
+            msg["mode"] = args.mode
     if op == "bitop":
         msg["operation"] = args.operation
         msg["keys"] = args.keys
@@ -3515,6 +3613,8 @@ def main(argv: list[str] | None = None) -> int:
             print(resp.get("old_bit"))
         elif op == "getbit":
             print(resp.get("bit"))
+        elif op == "bitcount":
+            print(resp.get("bitcount"))
         elif op == "bitop":
             print(resp.get("bitop"))
         elif op == "pfadd":

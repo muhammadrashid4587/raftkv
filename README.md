@@ -664,6 +664,31 @@ logic and the failure handling, not the key-value API on top.
   exactly like any other value. The honest limit is the same
   encoding as setbit: a value holding a character above U+00FF
   has no byte form to combine.
+- **Bit counting** — since v0.61.0 `bitcount key [start end
+  [BYTE|BIT]]` (`Session.bitcount(k, start, end, mode)`,
+  `client.bitcount(addr, k, start, end, mode)`, `bitcount key
+  [start end] [--mode BYTE|BIT]` on the CLI) answers how many
+  bits are set to 1 in the string at the key, 0 when the key
+  does not exist — Redis BITCOUNT. With no range the whole value
+  is counted; with `start` and `end` only that slice is — bytes
+  in BYTE mode (the default), bits in BIT mode, bit 0 the most
+  significant bit of the first byte, exactly like getbit's
+  numbering. A negative bound counts back from the end, an
+  out-of-range bound is clamped, like a getrange, so a range
+  with start past end counts 0 rather than raising. It is a pure
+  read — no log entry, no state change, no watch event — and it
+  rides the same ReadIndex path as a `get`, so it carries the
+  same session watermark and is exactly as linearizable, and a
+  stale bitcount is served from a follower lease exactly like a
+  stale `get`. A value that is not a byte string is a client
+  error, not a count, like a getbit on it; `start` and `end`
+  come as a pair, and a mode with no range is a client error,
+  and the mode is matched case-insensitively and normalized to
+  upper case before it is served, so every node counts the same
+  range. Like getbit and strlen it is a read, so it is not a
+  pipeline op. The honest limit is the same encoding as setbit:
+  a value holding a character above U+00FF has no byte form to
+  count.
 - **HyperLogLog** — since v0.47.0 `pfadd key element [element ...]`
   (`Session.pfadd(k, *elements)`, `client.pfadd(addr, k, *elements)`,
   `pfadd key element ...` on the CLI) adds elements to the
@@ -1161,7 +1186,7 @@ make test
 # or: python3 -m unittest discover -s tests -v
 ```
 
-691 tests, plus a smoke test for the benchmark script, all passing:
+705 tests, plus a smoke test for the benchmark script, all passing:
 
 | Test | What it proves |
 |---|---|
@@ -3279,3 +3304,34 @@ entries left in `log.jsonl` are dropped by their index on reload.
   a new roadmap item grounded in this project's purpose,
   proposed by the next run — candidates: BITCOUNT, or GEO, or
   streams.
+- ~~BITCOUNT (counting set bits)~~ — done in v0.61.0,
+  Nov 26, 2026: `bitcount key [start end [BYTE|BIT]]` counts
+  the bits set to 1 in the string at the key — 0 when the key
+  does not exist, Redis BITCOUNT. With no range the whole value
+  is counted; with `start` and `end` only that slice is — bytes
+  in BYTE mode (the default), bits in BIT mode, bit 0 the most
+  significant bit of the first byte, like getbit's numbering —
+  negative bounds counting back from the end and out-of-range
+  bounds clamped, like a getrange, so a range with start past
+  end counts 0. It is a pure read through the same ReadIndex
+  path as a `get`, so it is exactly as linearizable and a stale
+  bitcount is served from a follower lease like a stale `get`;
+  a value that is not a byte string is a client error, not a
+  count, like a getbit on it. `start` and `end` come as a pair,
+  a mode with no range is a client error, and the mode is
+  matched case-insensitively and normalized to upper case
+  before it is served. `Session.bitcount` / `client.bitcount`,
+  and `bitcount` on the CLI (`--mode BYTE|BIT`); like getbit
+  and strlen it is a read, so it is not a pipeline op.
+  `tests/test_bit_ops.py` proves it: store-level whole value,
+  byte ranges with negative and clamped bounds, BIT mode within
+  one byte and across the byte boundary, wrongtype, and bad
+  modes and bounds raising; cluster-level counting on every
+  node, redirect from a follower, ranges and BIT mode with a
+  lowercase mode, invalid bitcounts rejected with no log entry,
+  wrongtype as a client error, continuing after a leader
+  change, session read-your-writes, the module function from a
+  follower, and the CLI end to end.
+  The roadmap is exhausted again, so the next real thing is
+  a new roadmap item grounded in this project's purpose,
+  proposed by the next run — candidates: GEO, or streams.
