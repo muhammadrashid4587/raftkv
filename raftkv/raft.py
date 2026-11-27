@@ -2499,7 +2499,7 @@ class RaftNode:
                       "hlen", "hexists", "hkeys", "hvals", "hmget",
                       "hscan",
                       "geoadd", "geodist",
-                      "xadd",
+                      "xadd", "xlen", "xrange",
                       "setex") \
                 or key is None:
             return {"type": "client_response", "status": "error",
@@ -2512,7 +2512,7 @@ class RaftNode:
                              "pfadd/pfcount/hset/hget/hdel/hgetall/"
                              "hlen/hexists/hkeys/hvals/hmget/hscan/"
                              "geoadd/geodist/"
-                             "xadd/"
+                             "xadd/xlen/xrange/"
                              "setex "
                              "with a key"}
         if self._is_removed():
@@ -2923,6 +2923,71 @@ class RaftNode:
                                     hscan_cursor=cursor,
                                     hscan_match=match,
                                     hscan_count=count,
+                                    min_index=min_index,
+                                    session_term=session_term,
+                                    stale_ok=bool(msg.get("stale_ok")))
+        if op == "xlen":
+            # The size of a stream: the number of entries at this
+            # key — 0 when the key does not exist, Redis XLEN.
+            # It rides the same ReadIndex/lease path as a
+            # ``get`` — one leadership confirmation, one apply
+            # wait — so the count reflects the committed state as
+            # of the read index it names, exactly as
+            # linearizable, and a session read carries the same
+            # watermark a get would. A string key is a client
+            # error, not a count: the payload carries its own
+            # "status": "error" (see _serve_read), like hlen's
+            # wrongtype.
+            min_index, session_term, error = self._parse_read_params(msg)
+            if error is not None:
+                return error
+            return self._serve_read(xlen_key=key,
+                                    min_index=min_index,
+                                    session_term=session_term,
+                                    stale_ok=bool(msg.get("stale_ok")))
+        if op == "xrange":
+            # The entries in a stream in an ID range: the [id,
+            # {field: value}] pairs whose IDs fall in [start,
+            # end], in ID order — Redis XRANGE. It rides the
+            # same ReadIndex/lease path as a ``get`` — one
+            # leadership confirmation, one apply wait — so the
+            # entries reflect the committed state as of the read
+            # index it names, exactly as linearizable, and a
+            # session read carries the same watermark a get
+            # would. A string key is a client error, not a list:
+            # the payload carries its own "status": "error" (see
+            # _serve_read), like xlen's wrongtype. The bounds
+            # must be strings — "-" , "+", a bare millisecond,
+            # or "ms-seq" — and the count, when one is given, a
+            # non-negative integer (a bool is not one): a bad
+            # bound or count is a client error, not a list of
+            # nonsense, and the store parses the bounds itself,
+            # so a malformed bound is an error there too. The
+            # count caps how many entries one call returns, like
+            # Redis's COUNT — 0 answers an empty list, and no
+            # count means no cap.
+            start = msg.get("start", "-")
+            end = msg.get("end", "+")
+            if not isinstance(start, str):
+                return {"type": "client_response", "status": "error",
+                        "error": "xrange start must be a string"}
+            if not isinstance(end, str):
+                return {"type": "client_response", "status": "error",
+                        "error": "xrange end must be a string"}
+            count = msg.get("count")
+            if count is not None and (
+                    not isinstance(count, int)
+                    or isinstance(count, bool) or count < 0):
+                return {"type": "client_response", "status": "error",
+                        "error": "xrange count must be a "
+                                 "non-negative integer"}
+            min_index, session_term, error = self._parse_read_params(msg)
+            if error is not None:
+                return error
+            return self._serve_read(xrange_key=key,
+                                    xrange_start=start,
+                                    xrange_end=end,
+                                    xrange_count=count,
                                     min_index=min_index,
                                     session_term=session_term,
                                     stale_ok=bool(msg.get("stale_ok")))
@@ -4156,6 +4221,11 @@ class RaftNode:
                     hscan_cursor: int = 0,
                     hscan_match: str | None = None,
                     hscan_count: int = 10,
+                    xlen_key: str | None = None,
+                    xrange_key: str | None = None,
+                    xrange_start: str = "-",
+                    xrange_end: str = "+",
+                    xrange_count: int | None = None,
                     scan_prefix: str | None = None,
                     scan_limit: int = MAX_KEYS_SCAN,
                     scan_start_after: str | None = None) -> dict:
@@ -4263,6 +4333,20 @@ class RaftNode:
         value is a client error, not a page. The reply carries
         ``cursor`` — the offset to resume from, 0 when the scan
         is done — and ``pairs``, the page in sorted field order.
+        ``xlen_key`` serves the size of a stream instead — the
+        number of entries at that key, 0 for a missing key,
+        Redis XLEN — read off the applied state machine the same
+        way, so it is exactly as linearizable as a ``get``; a
+        plain string value is a client error, not a count.
+        ``xrange_key`` serves the entries of a stream in an ID
+        range instead — the [id, {field: value}] pairs whose IDs
+        fall in [``xrange_start``, ``xrange_end``], in ID order,
+        at most ``xrange_count`` of them when a count is given,
+        Redis XRANGE — read off the applied state machine the
+        same way, so it is exactly as linearizable as a ``get``;
+        a plain string value is a client error, not a list, and
+        a bad bound or count is one too. The reply carries
+        ``entries``, the pairs in ID order.
         ``scan_prefix`` serves a key enumeration instead — every key
         in the applied state machine starting with the prefix,
         sorted, at most ``scan_limit`` of them, with ``truncated``
@@ -4277,7 +4361,7 @@ class RaftNode:
         appear in a later page if it sorts ahead of the cursor.
         Everything else — the lease fast path, the pending-read wait,
         the fallback, the redirect on leadership loss — is identical
-        for all seventeen shapes, so a scan or a TTL query is exactly as
+        for all nineteen shapes, so a scan or a TTL query is exactly as
         linearizable as a single ``get``.
 
         A stale read (``stale_ok``) is the one exception to the
@@ -4559,6 +4643,32 @@ class RaftNode:
                         hscan_count)
                     return {"cursor": next_cursor, "pairs": pairs}
                 except TypeError as e:
+                    return {"status": "error", "error": str(e)}
+            if xlen_key is not None:
+                # The size of a stream: the number of entries at
+                # this key — 0 for a missing key, Redis XLEN —
+                # with the same wrongtype rule as hlen: a plain
+                # string value is a client error, not a count,
+                # carried the same way, overriding the "ok" in
+                # the response literal.
+                try:
+                    return {"xlen": self.sm.xlen(xlen_key)}
+                except TypeError as e:
+                    return {"status": "error", "error": str(e)}
+            if xrange_key is not None:
+                # The entries in a stream in an ID range: the [id,
+                # {field: value}] pairs whose IDs fall in [start,
+                # end], in ID order — Redis XRANGE — with the same
+                # wrongtype rule as xlen: a plain string value is
+                # a client error, not a list, carried the same
+                # way, overriding the "ok" in the response
+                # literal. A bad bound or count is the same kind
+                # of error, from the store's own validation.
+                try:
+                    return {"entries": self.sm.xrange(
+                        xrange_key, xrange_start, xrange_end,
+                        xrange_count)}
+                except (TypeError, ValueError) as e:
                     return {"status": "error", "error": str(e)}
             if keys is not None:
                 return {"values": [self.sm.get(k) for k in keys]}

@@ -769,9 +769,34 @@ logic and the failure handling, not the key-value API on top.
   is a pipeline op too. The honest limit is the growth itself:
   there is no MAXLEN trimming yet, so a stream grows without
   bound — every entry stays in the one blob, and the blob rides
-  every snapshot and replay whole — and there is no XREAD /
-  XRANGE / XLEN yet, so the only way to read entries back is the
-  raw blob.
+  every snapshot and replay whole — and there is no XREAD yet,
+  so a blocking read of new entries is still missing.
+- **Streams (XLEN / XRANGE)** — since v0.64.0 `xlen key`
+  (`Session.xlen(k)`, `client.xlen(addr, k)`, `xlen key` on the
+  CLI) answers the number of entries in the stream at the key, 0
+  when the key does not exist — Redis XLEN — and `xrange key
+  start end [COUNT n]` (`Session.xrange(k, start, end, count)`,
+  `client.xrange(addr, k, start, end, count)`, `xrange key start
+  end [--count n]` on the CLI) answers the entries whose IDs fall
+  in [start, end], in ID order — Redis XRANGE — as [id, {field:
+  value}] pairs. The bounds are "-", "+" (the whole stream), a
+  bare millisecond (that millisecond, sequence 0), or a full
+  "ms-seq"; a start past the end answers an empty list rather
+  than an error, like a getrange with start past end, and a
+  missing key answers 0 / an empty list. COUNT caps how many
+  entries one call returns, like Redis's COUNT — None means no
+  cap, 0 answers an empty list. Both are pure reads through the
+  same ReadIndex path as a `get`, so they are exactly as
+  linearizable and a stale xlen / xrange is served from a
+  follower lease like a stale `get`; a session read after its
+  own xadd counts and shows the entry that xadd appended. A
+  plain string value is a client error, not a count or a list,
+  and a bad bound or count is one too. Like hget and geodist
+  they are reads, so neither is a pipeline op. The honest limit
+  is the same growth as xadd: the whole stream is one blob, so
+  a range still reads the blob to filter it — there is no index
+  over entries — and there is still no XREAD, so a client that
+  wants new entries has to poll XRANGE.
 - **HyperLogLog** — since v0.47.0 `pfadd key element [element ...]`
   (`Session.pfadd(k, *elements)`, `client.pfadd(addr, k, *elements)`,
   `pfadd key element ...` on the CLI) adds elements to the
@@ -3511,5 +3536,35 @@ entries left in `log.jsonl` are dropped by their index on reload.
   module function from a follower, and the CLI end to end.
   The roadmap is exhausted again, so the next real thing is
   a new roadmap item grounded in this project's purpose,
-  proposed by the next run — candidates: XREAD / XRANGE / XLEN
-  (reading a stream back), or XTRIM (MAXLEN trimming).
+  proposed by the next run — candidates: XREAD (reading a stream
+  back), or XTRIM (MAXLEN trimming).
+- ~~Streams (XLEN / XRANGE)~~ — done in v0.64.0,
+  Nov 27, 2026: `xlen key` answers the number of entries in the
+  stream at the key, 0 when the key does not exist — Redis XLEN —
+  and `xrange key start end [COUNT n]` answers the entries whose
+  IDs fall in [start, end], in ID order, as [id, {field: value}]
+  pairs — Redis XRANGE. The bounds are "-", "+", a bare
+  millisecond (that millisecond, sequence 0), or a full "ms-seq";
+  a start past the end answers an empty list, and a missing key
+  answers 0 / an empty list. COUNT caps how many entries one call
+  returns — None means no cap, 0 answers an empty list. Both are
+  pure reads through the same ReadIndex path as a `get`, so they
+  are exactly as linearizable and a stale read is served from a
+  follower lease like a stale `get`. A plain string value is a
+  client error, not a count or a list, and a bad bound or count
+  is one too. `Session.xlen` / `Session.xrange`,
+  `client.xlen` / `client.xrange`, and `xlen` / `xrange` on the
+  CLI; like other reads, neither is a pipeline op.
+  `tests/test_streams.py` proves it: store-level counting and
+  missing keys, full and partial ranges with "-" / "+" / bare
+  milliseconds / explicit IDs, a start past the end answering
+  empty, COUNT capping and 0 answering empty, wrongtype leaving
+  the value untouched, and bad bounds and counts raising; and
+  cluster-level reads from a follower redirecting to the leader,
+  wrongtype and bad bounds as client errors with no log entry,
+  session read-your-writes, the module functions from a
+  follower, and the CLI end to end.
+  The roadmap is exhausted again, so the next real thing is
+  a new roadmap item grounded in this project's purpose,
+  proposed by the next run — candidates: XREAD (blocking reads
+  of new entries), or XTRIM (MAXLEN trimming).

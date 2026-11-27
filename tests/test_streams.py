@@ -32,6 +32,8 @@ import unittest
 from harness import Cluster, client_request, wait_for_key
 from raftkv.client import Session, main as client_main
 from raftkv.client import xadd as client_xadd
+from raftkv.client import xlen as client_xlen
+from raftkv.client import xrange as client_xrange
 from raftkv.store import KVStore, STREAM_PREFIX, is_stream
 
 ID_RE = re.compile(r"^\d+-\d+$")
@@ -45,6 +47,19 @@ def xadd(addr, key="events", pairs=(("type", "login"),), id="*",
         msg["client_id"] = client_id
     if request_id is not None:
         msg["request_id"] = request_id
+    return client_request(addr, msg)
+
+
+def xlen(addr, key="events"):
+    return client_request(addr, {"type": "client", "op": "xlen",
+                                 "key": key})
+
+
+def xrange(addr, key="events", start="-", end="+", count=None):
+    msg = {"type": "client", "op": "xrange", "key": key,
+           "start": start, "end": end}
+    if count is not None:
+        msg["count"] = count
     return client_request(addr, msg)
 
 
@@ -256,6 +271,102 @@ class TestStreamsStore(unittest.TestCase):
                                "pairs": [["a", "3"]], "id": "100-5"})
         self.assertEqual(result["status"], "xadd_failed")
         self.assertEqual(result["reason"], "id_not_greater")
+
+    def test_xlen_counts_entries_and_missing_key_is_zero(self):
+        """XLEN counts the entries in a stream — 0 on a missing
+        key — and tracks appends as they land."""
+        store = KVStore()
+        self.assertEqual(store.xlen("s"), 0)
+        store.apply({"op": "xadd", "key": "s",
+                     "pairs": [["a", "1"]], "id": "100-5"})
+        self.assertEqual(store.xlen("s"), 1)
+        store.apply({"op": "xadd", "key": "s",
+                     "pairs": [["a", "2"]], "id": "100-6"})
+        store.apply({"op": "xadd", "key": "s",
+                     "pairs": [["a", "3"]], "id": "101-0"})
+        self.assertEqual(store.xlen("s"), 3)
+
+    def test_xrange_full_and_partial_ranges(self):
+        """XRANGE with "-" / "+" returns every entry in ID order;
+        explicit bounds cut the range, a bare millisecond names
+        that millisecond with sequence 0, and a start past the
+        end answers an empty list rather than an error."""
+        store = KVStore()
+        self.assertEqual(store.xrange("s", "-", "+"), [])
+        for entry_id in ("100-5", "100-6", "101-0", "102-3"):
+            store.apply({"op": "xadd", "key": "s",
+                         "pairs": [["a", entry_id]], "id": entry_id})
+        self.assertEqual(store.xrange("s", "-", "+"),
+                         [["100-5", {"a": "100-5"}],
+                          ["100-6", {"a": "100-6"}],
+                          ["101-0", {"a": "101-0"}],
+                          ["102-3", {"a": "102-3"}]])
+        self.assertEqual(store.xrange("s", "100-6", "101-0"),
+                         [["100-6", {"a": "100-6"}],
+                          ["101-0", {"a": "101-0"}]])
+        # A bare millisecond is that millisecond, sequence 0.
+        self.assertEqual(store.xrange("s", "101", "101"),
+                         [["101-0", {"a": "101-0"}]])
+        self.assertEqual(store.xrange("s", "100", "100-6"),
+                         [["100-5", {"a": "100-5"}],
+                          ["100-6", {"a": "100-6"}]])
+        # 0-0 names the very start: it covers every entry.
+        self.assertEqual(
+            [e[0] for e in store.xrange("s", "0-0", "+")],
+            ["100-5", "100-6", "101-0", "102-3"])
+        # A start past the end is empty, not an error.
+        self.assertEqual(store.xrange("s", "102-3", "100-5"), [])
+        self.assertEqual(store.xrange("s", "200", "+"), [])
+
+    def test_xrange_count_caps_and_zero_is_empty(self):
+        """COUNT caps how many entries one call returns, in ID
+        order — and COUNT 0 answers an empty list."""
+        store = KVStore()
+        for entry_id in ("100-5", "100-6", "101-0"):
+            store.apply({"op": "xadd", "key": "s",
+                         "pairs": [["a", entry_id]], "id": entry_id})
+        self.assertEqual(store.xrange("s", "-", "+", count=2),
+                         [["100-5", {"a": "100-5"}],
+                          ["100-6", {"a": "100-6"}]])
+        self.assertEqual(store.xrange("s", "-", "+", count=0), [])
+        self.assertEqual(store.xrange("s", "-", "+", count=99),
+                         [["100-5", {"a": "100-5"}],
+                          ["100-6", {"a": "100-6"}],
+                          ["101-0", {"a": "101-0"}]])
+        # A count past the range end stops at the range end.
+        self.assertEqual(store.xrange("s", "100-6", "+", count=99),
+                         [["100-6", {"a": "100-6"}],
+                          ["101-0", {"a": "101-0"}]])
+
+    def test_xlen_xrange_wrongtype_leaves_value_untouched(self):
+        """A plain string value fails an xlen and an xrange with
+        TypeError and leaves the value untouched."""
+        store = KVStore()
+        store.apply({"op": "set", "key": "k", "value": "x"})
+        with self.assertRaises(TypeError):
+            store.xlen("k")
+        with self.assertRaises(TypeError):
+            store.xrange("k", "-", "+")
+        self.assertEqual(store.get("k"), "x")
+
+    def test_xrange_bad_bounds_and_count_raise(self):
+        """A bad bound or count raises ValueError — even on a
+        missing key, since the bounds are parsed before the key
+        is looked up."""
+        store = KVStore()
+        bad_bounds = ["bogus", "1-2-3", "", "5-",
+                      "18446744073709551616-0",
+                      "5-18446744073709551616",
+                      "18446744073709551616",
+                      5, None]
+        for bad in bad_bounds:
+            with self.assertRaises(ValueError, msg=str(bad)):
+                store.xrange("s", bad, "+")
+            with self.assertRaises(ValueError, msg=str(bad)):
+                store.xrange("s", "-", bad)
+        for bad_count in (-1, True, "2", 1.5):
+            with self.assertRaises(ValueError, msg=str(bad_count)):
+                store.xrange("s", "-", "+", count=bad_count)
 
 
 class TestStreamsCluster(unittest.TestCase):
@@ -638,6 +749,172 @@ class TestStreamsCluster(unittest.TestCase):
                     client_main(["--node", node, "xadd", "events",
                                  "*", "type"])
             self.assertEqual(cm.exception.code, 2)
+        finally:
+            cluster.stop_all()
+
+    def test_xlen_xrange_cluster(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            for entry_id in ("100-5", "100-6", "101-0"):
+                resp = xadd(addr, pairs=(("a", entry_id),),
+                            id=entry_id)
+                self.assertEqual(resp.get("status"), "ok", resp)
+            # XLEN counts the entries on every node, and XRANGE
+            # reads them back in ID order — including from a
+            # follower, which redirects to the leader.
+            for node_id in cluster.live:
+                self.assertEqual(
+                    xlen(cluster.addrs[node_id]).get("xlen"), 3)
+                resp = xrange(cluster.addrs[node_id])
+                self.assertEqual(resp.get("status"), "ok", resp)
+                self.assertEqual(resp.get("entries"),
+                                 [["100-5", {"a": "100-5"}],
+                                  ["100-6", {"a": "100-6"}],
+                                  ["101-0", {"a": "101-0"}]])
+            # A partial range and a COUNT cap, from a follower.
+            follower = next(n for n in cluster.live
+                            if n != leader.id)
+            resp = xrange(cluster.addrs[follower], start="100-6",
+                          end="101-0")
+            self.assertEqual(resp.get("entries"),
+                             [["100-6", {"a": "100-6"}],
+                              ["101-0", {"a": "101-0"}]])
+            resp = xrange(cluster.addrs[follower], count=2)
+            self.assertEqual([e[0] for e in resp.get("entries")],
+                             ["100-5", "100-6"])
+            # A missing key answers 0 / an empty list.
+            self.assertEqual(xlen(addr, key="nope").get("xlen"), 0)
+            self.assertEqual(xrange(addr, key="nope").get("entries"),
+                             [])
+            # The module functions follow redirects too.
+            resp = client_xlen(cluster.addrs[follower], "events")
+            self.assertEqual(resp.get("xlen"), 3, resp)
+            resp = client_xrange(cluster.addrs[follower], "events",
+                                 start="100-6", end="+", count=1)
+            self.assertEqual(resp.get("entries"),
+                             [["100-6", {"a": "100-6"}]], resp)
+        finally:
+            cluster.stop_all()
+
+    def test_xlen_xrange_wrongtype_and_bad_bounds(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            before = len(leader.log)
+            self.assertEqual(write(addr, key="plain",
+                                   value="v").get("status"), "ok")
+            resp = xlen(addr, key="plain")
+            self.assertEqual(resp.get("status"), "error", resp)
+            self.assertIn("stream", resp.get("error", ""), resp)
+            resp = xrange(addr, key="plain")
+            self.assertEqual(resp.get("status"), "error", resp)
+            self.assertIn("stream", resp.get("error", ""), resp)
+            # Bad bounds and counts are client errors, not reads.
+            resp = xrange(addr, start="bogus")
+            self.assertEqual(resp.get("status"), "error", resp)
+            resp = xrange(addr, end="1-2-3")
+            self.assertEqual(resp.get("status"), "error", resp)
+            resp = client_request(
+                addr, {"type": "client", "op": "xrange", "key": "s",
+                       "start": "-", "end": "+", "count": -1})
+            self.assertEqual(resp.get("status"), "error", resp)
+            # Reads append no log entries, bad or not.
+            self.assertEqual(len(leader.log), before + 1)
+        finally:
+            cluster.stop_all()
+
+    def test_session_xlen_xrange_is_read_your_writes(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            with Session(addr) as session:
+                resp = session.xadd("events", {"type": "login"},
+                                    id="100-5")
+                self.assertEqual(resp.get("status"), "ok", resp)
+                # A session read sees its own xadd's entry.
+                resp = session.xlen("events")
+                self.assertEqual(resp.get("status"), "ok", resp)
+                self.assertEqual(resp.get("xlen"), 1, resp)
+                resp = session.xrange("events")
+                self.assertEqual(resp.get("status"), "ok", resp)
+                self.assertEqual(resp.get("entries"),
+                                 [["100-5", {"type": "login"}]],
+                                 resp)
+                # A session read from a follower still sees the
+                # session's own xadd.
+                follower = next(n for n in cluster.live
+                                if n != leader.id)
+                with Session(cluster.addrs[follower],
+                             client_id=session.client_id) as other:
+                    other.last_write_index = session.last_write_index
+                    other.last_write_term = session.last_write_term
+                    resp = other.xlen("events")
+                    self.assertEqual(resp.get("xlen"), 1, resp)
+                    resp = other.xrange("events", start="100-5",
+                                        end="100-5")
+                    self.assertEqual(resp.get("entries"),
+                                     [["100-5", {"type": "login"}]],
+                                     resp)
+        finally:
+            cluster.stop_all()
+
+    def test_xlen_xrange_cli(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            host, port = cluster.addrs[leader.id]
+            node = f"{host}:{port}"
+            for entry_id in ("100-5", "100-6"):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    rc = client_main(["--node", node, "xadd", "events",
+                                      entry_id, "a", entry_id])
+                self.assertEqual(rc, 0)
+            # XLEN prints the count.
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "xlen", "events"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(out.getvalue().strip(), "2")
+            # XRANGE prints the entries as JSON.
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "xrange", "events",
+                                  "-", "+"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(out.getvalue()),
+                             [["100-5", {"a": "100-5"}],
+                              ["100-6", {"a": "100-6"}]])
+            # A range with COUNT prints just the capped page.
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "xrange", "events",
+                                  "-", "+", "--count", "1"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(out.getvalue()),
+                             [["100-5", {"a": "100-5"}]])
+            # XLEN on a missing key prints 0.
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "xlen", "nope"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(out.getvalue().strip(), "0")
+            # A bad bound fails: rc 1, and the error names the
+            # problem.
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = client_main(["--node", node, "xrange", "events",
+                                  "bogus", "+"])
+            self.assertEqual(rc, 1)
+            self.assertIn("bound", err.getvalue())
         finally:
             cluster.stop_all()
 

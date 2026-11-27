@@ -221,9 +221,9 @@ def geo_distance(lon1: float, lat1: float, lon2: float,
 # it does for a hash key. The honest limit is the growth itself:
 # there is no MAXLEN trimming yet, so a stream grows without
 # bound — every entry stays in the one blob, and the blob rides
-# every snapshot and replay whole — and there is no XREAD /
-# XRANGE / XLEN yet, so the only way to read entries back is the
-# raw blob.
+# every snapshot and replay whole — and there is no XREAD yet, so
+# a blocking read of new entries is still missing; XRANGE / XLEN
+# (v0.64.0) read the entries back.
 STREAM_PREFIX = "\x00raftkv-stream\x00"
 
 # Largest number of fields one ``xadd`` may carry. The pairs ride
@@ -268,6 +268,49 @@ def parse_stream_id(id_str) -> tuple[int | str, int | None]:
             "stream id sequence must be at most 2**64 - 1")
     if ms == 0 and seq == 0:
         raise ValueError("stream id must be greater than 0-0")
+    return ms, seq
+
+
+def parse_stream_range_bound(bound: str) -> tuple[int, int]:
+    """Parse one XRANGE bound — "-", "+", a bare millisecond, or a
+    full "ms-seq" — returning the (ms, seq) pair the bound names.
+    "-" is the start of the stream (0, 0), "+" the end
+    (2**64 - 1, 2**64 - 1), and a bare millisecond names that
+    millisecond with sequence 0, like Redis. Raises ValueError
+    on any other shape, on a half past 2**64 - 1, or on a
+    non-string. Unlike ``parse_stream_id``, 0-0 is a legal bound:
+    it names the very start, and no real entry is ever 0-0, so a
+    range from 0-0 covers every entry. A leading zero is fine —
+    "007" parses as (7, 0) — since the parts are integers, not
+    strings."""
+    if not isinstance(bound, str):
+        raise ValueError("stream range bound must be a string")
+    if bound == "-":
+        return 0, 0
+    if bound == "+":
+        return STREAM_ID_MAX, STREAM_ID_MAX
+    parts = bound.split("-")
+    if (len(parts) not in (1, 2) or not parts[0]
+            or not parts[0].isdigit()):
+        raise ValueError(
+            "stream range bound must be \"-\", \"+\", \"ms\", or "
+            "\"ms-seq\"")
+    ms = int(parts[0])
+    if ms > STREAM_ID_MAX:
+        raise ValueError(
+            "stream range bound milliseconds must be at most "
+            "2**64 - 1")
+    if len(parts) == 1:
+        return ms, 0
+    if not parts[1].isdigit():
+        raise ValueError(
+            "stream range bound must be \"-\", \"+\", \"ms\", or "
+            "\"ms-seq\"")
+    seq = int(parts[1])
+    if seq > STREAM_ID_MAX:
+        raise ValueError(
+            "stream range bound sequence must be at most "
+            "2**64 - 1")
     return ms, seq
 
 
@@ -2013,6 +2056,67 @@ class KVStore:
             raise TypeError(
                 f"hlen failed: value of {key!r} is not a hash")
         return len(_hash_fields(value))
+
+    def xlen(self, key: str) -> int:
+        """The number of entries in the stream at ``key`` — 0 when
+        the key does not exist, Redis XLEN. Raises TypeError
+        when the value is a plain string: an XLEN reads a stream,
+        not bytes, so a string key is WRONGTYPE, like an hlen on
+        a plain string. Pure read: no log entry, no state
+        change."""
+        value = self._data.get(key)
+        if value is None:
+            return 0
+        if not is_stream(value):
+            raise TypeError(
+                f"xlen failed: value of {key!r} is not a stream")
+        return len(_stream_data(value)["entries"])
+
+    def xrange(self, key: str, start: str, end: str,
+               count: int | None = None) -> list[list]:
+        """The entries in the stream at ``key`` whose IDs fall in
+        [``start``, ``end``], in ID order — Redis XRANGE.
+        ``start`` and ``end`` are "-", "+", a bare millisecond
+        (that millisecond, sequence 0), or a full "ms-seq"; a
+        start past the end answers an empty list rather than an
+        error, like a getrange with start past end. ``count``
+        caps how many entries one call returns, like Redis's
+        COUNT — None means no cap, 0 answers an empty list. A
+        missing key answers an empty list. Raises TypeError when
+        the value is a plain string: an XRANGE reads a stream,
+        not bytes, so a string key is WRONGTYPE, like an xlen on
+        a plain string. Raises ValueError for a bad bound or
+        count: a bound must be "-", "+", "ms", or "ms-seq" with
+        each half at most 2**64 - 1, and a count must be a
+        non-negative integer (a bool is not one). The bounds are
+        parsed before the key is looked up, so a bad bound is an
+        error even on a missing key, like Redis parsing its
+        arguments first. Pure read: no log entry, no state
+        change. The entries come back as [id, {field: value}]
+        pairs, in ID order — the same shape the stream blob
+        stores them in — and each field map is a fresh copy, so
+        the caller cannot mutate the stored blob's parse."""
+        if count is not None and (
+                not isinstance(count, int) or isinstance(count, bool)
+                or count < 0):
+            raise ValueError(
+                "xrange count must be a non-negative integer")
+        start_id = parse_stream_range_bound(start)
+        end_id = parse_stream_range_bound(end)
+        value = self._data.get(key)
+        if value is None:
+            return []
+        if not is_stream(value):
+            raise TypeError(
+                f"xrange failed: value of {key!r} is not a stream")
+        entries: list[list] = []
+        for entry_id, fields in _stream_data(value)["entries"]:
+            entry = parse_stream_id(entry_id)
+            if start_id <= entry <= end_id:
+                if count is not None and len(entries) >= count:
+                    break
+                entries.append([entry_id, dict(fields)])
+        return entries
 
     def hexists(self, key: str, field: str) -> int:
         """1 when ``field`` is set in the hash at ``key``, 0

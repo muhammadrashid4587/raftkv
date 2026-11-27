@@ -850,6 +850,89 @@ class Session:
                                       for f, v in fields.items()],
                             "id": id})
 
+    def xlen(self, key: str) -> dict:
+        """Ask for the number of entries in the stream at ``key``,
+        Redis XLEN: 0 when the key does not exist, and a client
+        error — not a count — when the key holds a plain string.
+        It rides the same ReadIndex path as ``get``, so it
+        carries the same session watermark and advances the read
+        watermark from the reply's ``read_index`` exactly the
+        same way: a length queried after your own xadd counts
+        the entry that xadd appended, and a later read never
+        goes backwards past it."""
+        if self.last_read_index > self.last_write_index:
+            min_index = self.last_read_index
+            term = self.last_read_term
+        else:
+            min_index = self.last_write_index
+            term = self.last_write_term
+        msg: dict = {"type": "client", "op": "xlen", "key": key,
+                     "client_id": self.client_id,
+                     "min_commit_index": min_index,
+                     "session_term": term}
+        resp = request(self.node_addr, msg, pool=self._pooled)
+        if (resp.get("status") == "ok"
+                and resp.get("read_index") is not None):
+            read_index = int(resp["read_index"])
+            if read_index > self.last_read_index:
+                self.last_read_index = read_index
+                self.last_read_term = int(resp.get("read_term") or 0)
+        return resp
+
+    def xrange(self, key: str, start: str = "-",
+               end: str = "+", count: int | None = None) -> dict:
+        """Ask for the entries in the stream at ``key`` whose IDs
+        fall in [``start``, ``end``], in ID order — Redis XRANGE:
+        ``start`` and ``end`` are "-", "+", a bare millisecond
+        (that millisecond, sequence 0), or a full "ms-seq", and
+        ``count`` caps how many entries one call returns, like
+        Redis's COUNT — None means no cap, 0 answers an empty
+        list. The reply carries ``entries`` — the [id, {field:
+        value}] pairs in ID order — an empty list when the key
+        does not exist or no entry falls in the range, and a
+        client error — not a list — when the key holds a plain
+        string. A bad bound or count never goes on the wire and
+        returns the server's error shape instead. It rides the
+        same ReadIndex path as ``get``, so it carries the same
+        session watermark and advances the read watermark from
+        the reply's ``read_index`` exactly the same way: a range
+        queried after your own xadd shows the entry that xadd
+        appended, and a later read never goes backwards past
+        it."""
+        if not isinstance(start, str):
+            return {"type": "client_response", "status": "error",
+                    "error": "xrange start must be a string"}
+        if not isinstance(end, str):
+            return {"type": "client_response", "status": "error",
+                    "error": "xrange end must be a string"}
+        if count is not None and (
+                not isinstance(count, int) or isinstance(count, bool)
+                or count < 0):
+            return {"type": "client_response", "status": "error",
+                    "error": "xrange count must be a "
+                             "non-negative integer"}
+        if self.last_read_index > self.last_write_index:
+            min_index = self.last_read_index
+            term = self.last_read_term
+        else:
+            min_index = self.last_write_index
+            term = self.last_write_term
+        msg: dict = {"type": "client", "op": "xrange", "key": key,
+                     "start": start, "end": end,
+                     "client_id": self.client_id,
+                     "min_commit_index": min_index,
+                     "session_term": term}
+        if count is not None:
+            msg["count"] = count
+        resp = request(self.node_addr, msg, pool=self._pooled)
+        if (resp.get("status") == "ok"
+                and resp.get("read_index") is not None):
+            read_index = int(resp["read_index"])
+            if read_index > self.last_read_index:
+                self.last_read_index = read_index
+                self.last_read_term = int(resp.get("read_term") or 0)
+        return resp
+
     def pfadd(self, key: str, *elements: str) -> dict:
         """Add ``elements`` to the HyperLogLog at ``key``, Redis
         PFADD: each element hashes into one of 16384 registers
@@ -2568,6 +2651,63 @@ def xadd(node_addr: tuple[str, int], key: str,
                    timeout=timeout)
 
 
+def xlen(node_addr: tuple[str, int], key: str,
+         timeout: float = 12.0) -> dict:
+    """Ask for the number of entries in the stream at ``key``,
+    following leader redirects like ``request`` — Redis XLEN.
+
+    One request serves the count through the leader's ReadIndex
+    path, so it reflects the committed state as of one read index,
+    exactly as linearizable as a ``get``. The reply is the plain
+    xlen response (``status`` ``ok`` with ``xlen`` — the number of
+    entries, 0 when the key does not exist — plus the
+    ``read_index`` / ``read_term`` it was measured at). A plain
+    string value is a client error, not a count."""
+    return request(node_addr, {"type": "client", "op": "xlen",
+                               "key": key},
+                   timeout=timeout)
+
+
+def xrange(node_addr: tuple[str, int], key: str,
+           start: str = "-", end: str = "+",
+           count: int | None = None,
+           timeout: float = 12.0) -> dict:
+    """Ask for the entries in the stream at ``key`` whose IDs fall
+    in [``start``, ``end``], in ID order, following leader
+    redirects like ``request`` — Redis XRANGE.
+
+    One request serves the entries through the leader's ReadIndex
+    path, so they reflect the committed state as of one read index,
+    exactly as linearizable as a ``get``. The reply is the plain
+    xrange response (``status`` ``ok`` with ``entries`` — the [id,
+    {field: value}] pairs in ID order, an empty list when the key
+    does not exist or no entry falls in the range — plus the
+    ``read_index`` / ``read_term`` they were measured at).
+    ``start`` and ``end`` are "-", "+", a bare millisecond, or a
+    full "ms-seq", and ``count`` caps how many entries one call
+    returns, like Redis's COUNT — None means no cap, 0 answers an
+    empty list. A plain string value is a client error, not a
+    list, and a bad bound or count never goes on the wire and
+    returns the server's error shape instead."""
+    if not isinstance(start, str):
+        return {"type": "client_response", "status": "error",
+                "error": "xrange start must be a string"}
+    if not isinstance(end, str):
+        return {"type": "client_response", "status": "error",
+                "error": "xrange end must be a string"}
+    if count is not None and (
+            not isinstance(count, int) or isinstance(count, bool)
+            or count < 0):
+        return {"type": "client_response", "status": "error",
+                "error": "xrange count must be a "
+                         "non-negative integer"}
+    msg: dict = {"type": "client", "op": "xrange", "key": key,
+                 "start": start, "end": end}
+    if count is not None:
+        msg["count"] = count
+    return request(node_addr, msg, timeout=timeout)
+
+
 def geodist(node_addr: tuple[str, int], key: str, member1: str,
             member2: str, unit: str = "m",
             timeout: float = 12.0) -> dict:
@@ -3506,6 +3646,30 @@ def main(argv: list[str] | None = None) -> int:
                              "twice")
     p_xadd.add_argument("--request-id", default=None,
                         help="id of this write within the client session")
+    p_xlen = sub.add_parser(
+        "xlen",
+        help="print the number of entries in the stream at key "
+             "(0 when the key does not exist)")
+    p_xlen.add_argument("key")
+    p_xrange = sub.add_parser(
+        "xrange",
+        help="print the entries in the stream at key in an ID "
+             "range as JSON ([[id, {field: value}], ...]); start "
+             "and end are \"-\", \"+\", a bare millisecond, or "
+             "\"ms-seq\" ([] when the key does not exist or no "
+             "entry falls in the range)")
+    p_xrange.add_argument("key")
+    p_xrange.add_argument("start",
+                          help="the first ID in the range: \"-\" for "
+                               "the start of the stream, a bare "
+                               "millisecond, or \"ms-seq\"")
+    p_xrange.add_argument("end",
+                          help="the last ID in the range: \"+\" for "
+                               "the end of the stream, a bare "
+                               "millisecond, or \"ms-seq\"")
+    p_xrange.add_argument("--count", type=int, default=None,
+                          help="at most this many entries "
+                               "(default: no cap)")
     p_pfadd = sub.add_parser(
         "pfadd",
         help="add elements to the HyperLogLog at key and print 1 "
@@ -3716,7 +3880,7 @@ def main(argv: list[str] | None = None) -> int:
               "pfadd", "pfcount", "hset", "hget", "hdel", "hgetall",
               "hlen", "hexists", "hkeys", "hvals", "hmget", "hscan",
               "geoadd", "geodist",
-              "xadd",
+              "xadd", "xlen", "xrange",
               "setex", "expireat",
               "pexpireat"):
         msg["key"] = args.key
@@ -3841,6 +4005,11 @@ def main(argv: list[str] | None = None) -> int:
         msg["id"] = args.id
         msg["pairs"] = [[args.pairs[i], args.pairs[i + 1]]
                         for i in range(0, len(args.pairs), 2)]
+    if op == "xrange":
+        msg["start"] = args.start
+        msg["end"] = args.end
+        if args.count is not None:
+            msg["count"] = args.count
     if op == "pfadd":
         msg["elements"] = args.elements
     if op == "hset":
@@ -3941,6 +4110,10 @@ def main(argv: list[str] | None = None) -> int:
             print(resp.get("geoadd"))
         elif op == "xadd":
             print(resp.get("xadd"))
+        elif op == "xlen":
+            print(resp.get("xlen"))
+        elif op == "xrange":
+            print(json.dumps(resp.get("entries")))
         elif op == "geodist":
             dist = resp.get("distance")
             print(dist if dist is not None else "(nil)")
