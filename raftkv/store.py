@@ -247,7 +247,11 @@ def geo_distance(lon1: float, lat1: float, lon2: float,
 # name to {"last_seen_ms": n} — the wall-clock millisecond of the
 # last delivery that consumer was handed, fixed by the leader at
 # log time (like an xadd auto ID), so XINFO CONSUMERS can report
-# how long each consumer has been idle. A consumer only appears there
+# how long each consumer has been idle. Since v0.74.0 the record
+# also carries "last_delivered_id" — the newest entry ID ever
+# handed to that consumer, so XINFO CONSUMERS can report the
+# consumer's lag: the entries in the stream past that ID. A
+# consumer only appears there
 # once it has been handed at least one entry: a readgroup that
 # hands out nothing writes nothing at all, so a consumer that
 # only ever polled an empty group is not listed. The groups ride
@@ -382,6 +386,33 @@ def parse_stream_range_bound(bound: str) -> tuple[int, int]:
     return ms, seq
 
 
+def _stamp_consumer_delivery(state, consumer, seen_ms,
+                             delivered_id=None):
+    """Record that ``consumer`` was handed an entry at wall-clock
+    millisecond ``seen_ms`` — fixed by the leader at log time, like
+    an xadd auto ID — in the group's "consumers" map:
+    ``last_seen_ms`` is replaced, and ``last_delivered_id`` keeps
+    the greatest entry ID ever handed to that consumer, so a
+    re-read or a claim of an older entry never moves it backwards
+    — XINFO CONSUMERS reads the consumer's lag off it. A
+    ``delivered_id`` of None leaves the last-delivered ID alone,
+    so a stamp that names no entry still records the sighting.
+    A record written before v0.74.0 carries no last-delivered ID;
+    stamping it adds one, and until then its lag reads None."""
+    consumers = state.setdefault("consumers", {})
+    record = consumers.get(consumer)
+    if record is None:
+        record = {}
+        consumers[consumer] = record
+    record["last_seen_ms"] = seen_ms
+    if delivered_id is not None:
+        previous = record.get("last_delivered_id")
+        if (previous is None
+                or _parse_stored_stream_id(delivered_id)
+                > _parse_stored_stream_id(previous)):
+            record["last_delivered_id"] = delivered_id
+
+
 def _is_group_map(groups) -> bool:
     """Whether ``groups`` is a well-formed consumer-group map:
     a dict of non-empty group name to {"last_delivered": "ms-seq"
@@ -398,11 +429,13 @@ def _is_group_map(groups) -> bool:
     "entries_read" — the count an XGROUP SETID ... ENTRIESREAD
     set, a non-negative integer, absent when no SETID ever set
     it. Since v0.70.0 a group may also carry "consumers" — a map
-    of consumer name to {"last_seen_ms": n}, the wall-clock
-    millisecond of that consumer's last delivery, a
-    non-negative integer, absent for a consumer that has never
-    been handed an entry. A plain string can only pass this by
-    being hand-built to the exact shape — the same class of
+    of consumer name to {"last_seen_ms": n, "last_delivered_id":
+    "ms-seq"} — the wall-clock millisecond of that consumer's
+    last delivery, a non-negative integer, and the newest entry
+    ID ever handed to that consumer, absent for a consumer whose
+    deliveries all came from replays of pre-v0.74.0 log entries,
+    which carry no last-delivered ID. A plain string can only pass
+    this by being hand-built to the exact shape — the same class of
     collision the hash check has — so an XREADGROUP trusts the
     shape."""
     if not isinstance(groups, dict):
@@ -435,13 +468,21 @@ def _is_group_map(groups) -> bool:
                 if not isinstance(consumer, str) or not consumer:
                     return False
                 if (not isinstance(seen, dict)
-                        or set(seen) != {"last_seen_ms"}):
+                        or not {"last_seen_ms"} <= set(seen)
+                        or not set(seen) <= {"last_seen_ms",
+                                             "last_delivered_id"}):
                     return False
                 last_seen = seen["last_seen_ms"]
                 if (not isinstance(last_seen, int)
                         or isinstance(last_seen, bool)
                         or last_seen < 0):
                     return False
+                if "last_delivered_id" in seen:
+                    try:
+                        _parse_stored_stream_id(
+                            seen["last_delivered_id"])
+                    except ValueError:
+                        return False
         pending = group["pending"]
         if not isinstance(pending, dict):
             return False
@@ -2213,14 +2254,16 @@ class KVStore:
             # (command "seen_ms", like an xadd auto ID) — in the
             # group's "consumers" map, so XINFO CONSUMERS can
             # report how long each consumer has been idle, and
-            # stamps the same millisecond on each pending entry
-            # it creates or re-delivers — its "delivered_ms" —
-            # so XPENDING in per-entry form can report how long
-            # each entry has been idle; an entry logged before
-            # v0.71.0 carries no stamp on the entry itself, so
-            # replaying one simply records no delivery time
-            # instead of failing, and a hand-built entry with a
-            # bad one still raises. A NOACK delivery stamps the
+            # records the newest entry ID it handed that
+            # consumer there too, so XINFO CONSUMERS can report
+            # the consumer's lag — and stamps the same millisecond
+            # on each pending entry it creates or re-delivers — its
+            # "delivered_ms" — so XPENDING in per-entry form can
+            # report how long each entry has been idle; an entry
+            # logged before v0.71.0 carries no stamp on the entry
+            # itself, so replaying one simply records no delivery
+            # time instead of failing, and a hand-built entry with
+            # a bad one still raises. A NOACK delivery stamps the
             # consumer's last-seen time too — the consumer
             # interacted and received entries — and so does a
             # re-read; only a read that hands out nothing
@@ -2328,8 +2371,8 @@ class KVStore:
                         info["delivered_ms"] = seen_ms
             if chosen:
                 if seen_ms is not None:
-                    state.setdefault("consumers", {})[consumer] = {
-                        "last_seen_ms": seen_ms}
+                    _stamp_consumer_delivery(state, consumer, seen_ms,
+                                             chosen[-1][0])
                 self._data[key] = _stream_value(stream)
             return {"type": "client_response", "status": "ok",
                     "entries": [[eid, dict(fields)]
@@ -2438,8 +2481,9 @@ class KVStore:
             # the first attempt's entries instead of claiming
             # them twice. A successful claim keeps the key's
             # deadline, like an xadd, stamps the claiming
-            # consumer's last-seen time, and a claim that takes
-            # nothing writes nothing at all. The group, consumer,
+            # consumer's last-seen time and records the newest
+            # entry it claimed as that consumer's last delivery,
+            # and a claim that takes nothing writes nothing at all. The group, consumer,
             # IDs, minimum idle, and options were validated on
             # the leader before the entry was logged (non-empty
             # string group and consumer; a non-empty list of at
@@ -2541,8 +2585,10 @@ class KVStore:
                 info["delivered_ms"] = seen_ms
                 claimed.append((entry_id, by_id[entry_id]))
             if claimed:
-                state.setdefault("consumers", {})[consumer] = {
-                    "last_seen_ms": seen_ms}
+                _stamp_consumer_delivery(
+                    state, consumer, seen_ms,
+                    max((eid for eid, _fields in claimed),
+                        key=_parse_stored_stream_id))
                 self._data[key] = _stream_value(stream)
             if justid:
                 return {"type": "client_response", "status": "ok",
@@ -2589,8 +2635,10 @@ class KVStore:
             # attempt's cursor and entries instead of claiming
             # them twice. A successful claim keeps the key's
             # deadline, like an xadd, stamps the claiming
-            # consumer's last-seen time, and a call that claims
-            # nothing and deletes nothing writes nothing at all.
+            # consumer's last-seen time and records the newest
+            # entry it claimed as that consumer's last delivery,
+            # and a call that claims nothing and deletes nothing
+            # writes nothing at all.
             # The group, consumer, start, minimum idle, count,
             # and options were validated on the leader before the
             # entry was logged, so by apply time they are
@@ -2689,8 +2737,10 @@ class KVStore:
                 claimed.append((entry_id, by_id[entry_id]))
             if claimed or deleted:
                 if claimed:
-                    state.setdefault("consumers", {})[consumer] = {
-                        "last_seen_ms": seen_ms}
+                    _stamp_consumer_delivery(
+                        state, consumer, seen_ms,
+                        max((eid for eid, _fields in claimed),
+                            key=_parse_stored_stream_id))
                 self._data[key] = _stream_value(stream)
             if examined >= len(after):
                 next_id = "0-0"
@@ -3598,28 +3648,41 @@ class KVStore:
         Redis XINFO CONSUMERS: one dict per consumer, sorted by
         consumer name, carrying ``name``, ``pending`` — the
         entries handed out to that consumer and not yet acked —
-        and ``idle`` — the milliseconds since that consumer was
+        ``idle`` — the milliseconds since that consumer was
         last handed an entry, None when the consumer was never
         handed one through a delivery this version stamped (a
         group created before v0.70.0, or a consumer whose entries
-        all came from replays of pre-v0.70.0 log entries). A
-        consumer only appears once it has been handed at least
-        one entry: a readgroup that hands out nothing writes
-        nothing at all, so a consumer that only ever polled an
-        empty group is not listed — and a consumer whose pending
-        entries were all acked is still listed, with pending 0,
-        until XGROUP DELCONSUMER drops it. ``now_ms`` is the
-        wall-clock millisecond the idle is measured against, so
-        the store itself never reads a clock: the caller passes
-        its own now, and the idle is clamped at 0, so a stamp
-        from a leader whose clock runs ahead never reads as a
-        negative idle. Raises TypeError when the value is a plain
-        string: an XINFO reads a stream, not bytes, so a string
-        key is WRONGTYPE, like an xlen on a plain string. Raises
-        ValueError when the key does not exist or the group does
-        not exist on it: Redis's NOGROUP, a missing group is an
-        error, not an empty list. Pure read: no log entry, no
-        state change."""
+        all came from replays of pre-v0.70.0 log entries) — and
+        ``lag`` — the entries in the stream past the newest entry
+        ever handed to that consumer, the per-consumer analogue
+        of the group's lag in XINFO GROUPS, None when the
+        consumer was never handed an entry through a delivery
+        this version stamped with a last-delivered ID (a
+        consumer whose entries all came from replays of
+        pre-v0.74.0 log entries). A consumer only appears once
+        it has been handed at least one entry: a readgroup that
+        hands out nothing writes nothing at all, so a consumer
+        that only ever polled an empty group is not listed — and
+        a consumer whose pending entries were all acked is still
+        listed, with pending 0, until XGROUP DELCONSUMER drops
+        it. ``now_ms`` is the wall-clock millisecond the idle is
+        measured against, so the store itself never reads a
+        clock: the caller passes its own now, and the idle is
+        clamped at 0, so a stamp from a leader whose clock runs
+        ahead never reads as a negative idle. Raises TypeError
+        when the value is a plain string: an XINFO reads a
+        stream, not bytes, so a string key is WRONGTYPE, like an
+        xlen on a plain string. Raises ValueError when the key
+        does not exist or the group does not exist on it:
+        Redis's NOGROUP, a missing group is an error, not an
+        empty list. Pure read: no log entry, no state change.
+        The lag is counted from the entries still in the stream,
+        like the group lag, so a trim makes it undercount the
+        entries a consumer never read — and entries handed to
+        other consumers count as lag for this one, since it has
+        not read them: the lag is how far behind the stream head
+        the consumer sits, not how many entries it still holds
+        pending."""
         value = self._data.get(key)
         if value is None:
             raise ValueError(
@@ -3628,7 +3691,9 @@ class KVStore:
         if not is_stream(value):
             raise TypeError(
                 f"xinfo failed: value of {key!r} is not a stream")
-        groups = _stream_data(value).get("groups", {})
+        stream = _stream_data(value)
+        entries = stream["entries"]
+        groups = stream.get("groups", {})
         if group not in groups:
             raise ValueError(
                 f"xinfo failed: no such key {key!r} or consumer "
@@ -3644,9 +3709,18 @@ class KVStore:
             record = seen.get(name)
             idle = (None if record is None
                     else max(0, now_ms - record["last_seen_ms"]))
+            last = (None if record is None
+                    else record.get("last_delivered_id"))
+            if last is None:
+                lag = None
+            else:
+                after = _parse_stored_stream_id(last)
+                lag = sum(1 for eid, _fields in entries
+                          if parse_stream_id(eid) > after)
             consumers.append({"name": name,
                               "pending": counts.get(name, 0),
-                              "idle": idle})
+                              "idle": idle,
+                              "lag": lag})
         return consumers
 
     def xreadgroup_peek(self, key: str, group: str,

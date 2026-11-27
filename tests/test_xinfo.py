@@ -5,13 +5,14 @@ CONSUMERS (v0.70.0).
 group count, and first / last entry. ``xinfo_groups key`` lists one
 dict per consumer group — its last-delivered ID, entries-read count,
 lag, and pending count. ``xinfo_consumers key group`` lists one dict
-per consumer — its pending count and idle time, the milliseconds since
-that consumer was last handed an entry. The idle time is tracked, not
-guessed: every xreadgroup stamps the consumer's last-seen millisecond
-— fixed by the leader at log time, like an xadd auto ID — in the
-group's "consumers" map in the stream blob, so it survives snapshots
-and replay like the rest of the group, and a DELCONSUMER drops the
-record with the consumer. A consumer only appears once it has been
+per consumer — its pending count, its idle time, the milliseconds since
+that consumer was last handed an entry, and its lag, the entries in
+the stream past the newest entry ever handed to that consumer. The idle
+time is tracked, not guessed: every xreadgroup stamps the consumer's
+last-seen millisecond — fixed by the leader at log time, like an xadd
+auto ID — in the group's "consumers" map in the stream blob, so it
+survives snapshots and replay like the rest of the group, and a
+DELCONSUMER drops the record with the consumer. A consumer only appears once it has been
 handed at least one entry: a readgroup that hands out nothing writes
 nothing at all, so a consumer that only ever polled an empty group is
 not listed. These spin up real nodes (real TCP, real threads, real
@@ -197,25 +198,104 @@ class TestXInfoStore(unittest.TestCase):
         store = _seed_store()
         self.assertEqual(
             store.xinfo_consumers("s", "g", 1700000003000),
-            [{"name": "c1", "pending": 2, "idle": 3000}])
+            [{"name": "c1", "pending": 2, "idle": 3000, "lag": 1}])
         # A consumer handed entries by a delivery this version did
         # not stamp — a replayed pre-v0.70.0 log entry carries no
         # seen_ms — is still listed, with an idle of None rather
-        # than a fabricated number.
+        # than a fabricated number, and a lag of None too: with no
+        # last-delivered ID there is nothing to count past.
         store.apply({"op": "xreadgroup", "key": "s", "group": "g",
                      "consumer": "c2", "id": ">"})
         self.assertEqual(
             store.xinfo_consumers("s", "g", 1700000003000),
-            [{"name": "c1", "pending": 2, "idle": 3000},
-             {"name": "c2", "pending": 1, "idle": None}])
+            [{"name": "c1", "pending": 2, "idle": 3000, "lag": 1},
+             {"name": "c2", "pending": 1, "idle": None,
+              "lag": None}])
         # An ack drops the pending count but the consumer stays
-        # listed, with its idle still counting.
+        # listed, with its idle still counting — and its lag
+        # unchanged, since acking does not move what it was
+        # handed last.
         store.apply({"op": "xack", "key": "s", "group": "g",
                      "ids": ["100-5"]})
         self.assertEqual(
             store.xinfo_consumers("s", "g", 1700000003000),
-            [{"name": "c1", "pending": 1, "idle": 3000},
-             {"name": "c2", "pending": 1, "idle": None}])
+            [{"name": "c1", "pending": 1, "idle": 3000, "lag": 1},
+             {"name": "c2", "pending": 1, "idle": None,
+              "lag": None}])
+
+    def test_consumers_report_lag(self):
+        """XINFO CONSUMERS answers each consumer's lag — the
+        entries in the stream past the newest entry ever handed
+        to that consumer, the per-consumer analogue of the group
+        lag: 0 when the consumer read to the head, more when
+        entries it never saw were appended after its last
+        delivery, and None when its deliveries all came from
+        replays of pre-v0.74.0 log entries, which carry no
+        last-delivered ID."""
+        store = _seed_store()
+        # c1 was handed 100-5 and 100-6; 101-0 sits past them.
+        self.assertEqual(
+            store.xinfo_consumers("s", "g", 1700000003000),
+            [{"name": "c1", "pending": 2, "idle": 3000, "lag": 1}])
+        # c2 reads the rest: its lag is 0, and c1's is unchanged —
+        # entries handed to another consumer still count as lag
+        # for c1, since it has not read them.
+        store.apply({"op": "xreadgroup", "key": "s", "group": "g",
+                     "consumer": "c2", "id": ">",
+                     "seen_ms": 1700000001000})
+        self.assertEqual(
+            store.xinfo_consumers("s", "g", 1700000003000),
+            [{"name": "c1", "pending": 2, "idle": 3000, "lag": 1},
+             {"name": "c2", "pending": 1, "idle": 2000, "lag": 0}])
+        # A NOACK delivery hands entries out without recording
+        # them pending, but it still moves the consumer's last
+        # delivery: a second group shows c3 with pending 0 and
+        # lag 2 after a one-entry NOACK read.
+        store.apply({"op": "xgroup_create", "key": "s",
+                     "group": "h", "start_id": "0"})
+        store.apply({"op": "xreadgroup", "key": "s", "group": "h",
+                     "consumer": "c3", "id": ">", "count": 1,
+                     "noack": True, "seen_ms": 1700000002000})
+        self.assertEqual(
+            store.xinfo_consumers("s", "h", 1700000003000),
+            [{"name": "c3", "pending": 0, "idle": 1000, "lag": 2}])
+        # A re-read hands c1 its pending entries again — the
+        # delivery counts rise — but never moves its last
+        # delivery past what it was handed, so its lag stays 1.
+        store.apply({"op": "xreadgroup", "key": "s", "group": "g",
+                     "consumer": "c1", "id": "0",
+                     "seen_ms": 1700000002500})
+        self.assertEqual(
+            store.xinfo_consumers("s", "g", 1700000003000),
+            [{"name": "c1", "pending": 2, "idle": 500, "lag": 1},
+             {"name": "c2", "pending": 1, "idle": 2000, "lag": 0}])
+        # A claim moves the claimed entry to its new consumer and
+        # records it as that consumer's last delivery: a fresh
+        # c4 takes 100-5 off c1, so c4's lag is 2 — every entry
+        # past 100-5 — while c1's stays 1 and c2's stays 0, since
+        # c2 already read to the head and a claim of an older
+        # entry never moves a last delivery backwards.
+        store.apply({"op": "xclaim", "key": "s", "group": "g",
+                     "consumer": "c4", "ids": ["100-5"],
+                     "min_idle_ms": 0, "force": True,
+                     "seen_ms": 1700000002800})
+        self.assertEqual(
+            store.xinfo_consumers("s", "g", 1700000003000),
+            [{"name": "c1", "pending": 1, "idle": 500, "lag": 1},
+             {"name": "c2", "pending": 1, "idle": 2000, "lag": 0},
+             {"name": "c4", "pending": 1, "idle": 200, "lag": 2}])
+        # The last-delivered IDs ride in the blob, so a snapshot
+        # load rebuilds the lags exactly.
+        loaded = KVStore()
+        loaded.load(store.items())
+        self.assertEqual(
+            loaded.xinfo_consumers("s", "g", 1700000003000),
+            [{"name": "c1", "pending": 1, "idle": 500, "lag": 1},
+             {"name": "c2", "pending": 1, "idle": 2000, "lag": 0},
+             {"name": "c4", "pending": 1, "idle": 200, "lag": 2}])
+        self.assertEqual(
+            loaded.xinfo_consumers("s", "h", 1700000003000),
+            [{"name": "c3", "pending": 0, "idle": 1000, "lag": 2}])
 
     def test_consumer_that_only_polled_is_not_listed(self):
         """A consumer that only ever polled an empty group was
@@ -293,7 +373,7 @@ class TestXInfoStore(unittest.TestCase):
              "entries_read": 9, "lag": 2, "pending": 2}])
         self.assertEqual(
             loaded.xinfo_consumers("s", "g", 1700000003000),
-            [{"name": "c1", "pending": 2, "idle": 3000}])
+            [{"name": "c1", "pending": 2, "idle": 3000, "lag": 1}])
 
 
 class TestXInfoCluster(unittest.TestCase):
@@ -393,6 +473,62 @@ class TestXInfoCluster(unittest.TestCase):
             resp = xinfo(addr, sub="STREAM")
             self.assertEqual(resp.get("length"), 3, resp)
             self.assertEqual(resp.get("groups"), 0, resp)
+        finally:
+            cluster.stop_all()
+
+    def test_consumers_report_lag_replicated(self):
+        """XINFO CONSUMERS reports each consumer's lag on every
+        node: the entries past the newest entry that consumer was
+        handed — 1 for a consumer that stopped one entry short of
+        the head, 0 for one that read to it — and the lag grows
+        when a new entry is appended past a consumer that has
+        stopped reading."""
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            for entry_id in ("100-5", "100-6", "101-0"):
+                self.assertEqual(
+                    xadd(addr, pairs=(("a", entry_id),),
+                         id=entry_id).get("status"), "ok")
+            self.assertEqual(
+                xgroup_create(addr, start_id="0").get("status"), "ok")
+            self.assertEqual(
+                [e[0] for e in xreadgroup(addr, consumer="c1",
+                                          count=2).get("entries")],
+                ["100-5", "100-6"])
+            self.assertEqual(
+                [e[0] for e in xreadgroup(addr, consumer="c2")
+                 .get("entries")],
+                ["101-0"])
+            # Both consumers' lags replicate to every node.
+            for node_id in cluster.live:
+                self.assertTrue(
+                    wait_for_key(cluster.nodes[node_id], "events",
+                                 cluster.nodes[leader.id].sm.get(
+                                     "events")))
+                by_name = {
+                    c["name"]: c
+                    for c in cluster.nodes[node_id].sm
+                    .xinfo_consumers("events", "workers",
+                                     int(time.time() * 1000))}
+                self.assertEqual(by_name["c1"]["lag"], 1, by_name)
+                self.assertEqual(by_name["c2"]["lag"], 0, by_name)
+            # One more entry past c1, which has stopped reading:
+            # its lag grows to 2, and c2's stays 0 once it reads
+            # the new entry too.
+            self.assertEqual(
+                xadd(addr, pairs=(("a", "102-0"),),
+                     id="102-0").get("status"), "ok")
+            self.assertEqual(
+                [e[0] for e in xreadgroup(addr, consumer="c2")
+                 .get("entries")],
+                ["102-0"])
+            resp = xinfo(addr, sub="CONSUMERS", group="workers")
+            by_name = {c["name"]: c for c in resp.get("consumers")}
+            self.assertEqual(by_name["c1"]["lag"], 2, resp)
+            self.assertEqual(by_name["c2"]["lag"], 0, resp)
         finally:
             cluster.stop_all()
 
@@ -625,7 +761,9 @@ class TestXInfoCluster(unittest.TestCase):
             # The group survived the snapshot + restart with its
             # rewound position, entries-read count, and the
             # consumer's last-seen stamp: the idle is real, not
-            # None, and the entry is still pending for c1.
+            # None, and the entry is still pending for c1 — and
+            # the lag survived too: c1 was handed 100-5, the only
+            # entry, so it sits at 0.
             resp = xinfo(addr, sub="GROUPS")
             self.assertEqual(resp.get("groups"), [
                 {"name": "workers", "last_delivered_id": "0-0",
@@ -634,6 +772,7 @@ class TestXInfoCluster(unittest.TestCase):
             self.assertEqual(len(resp.get("consumers")), 1, resp)
             self.assertEqual(resp["consumers"][0]["name"], "c1", resp)
             self.assertEqual(resp["consumers"][0]["pending"], 1, resp)
+            self.assertEqual(resp["consumers"][0]["lag"], 0, resp)
             self.assertIsInstance(resp["consumers"][0]["idle"], int,
                                   resp)
         finally:
@@ -691,6 +830,7 @@ class TestXInfoCluster(unittest.TestCase):
             self.assertEqual(len(consumers), 1)
             self.assertEqual(consumers[0]["name"], "c1")
             self.assertEqual(consumers[0]["pending"], 1)
+            self.assertEqual(consumers[0]["lag"], 0)
             self.assertIsInstance(consumers[0]["idle"], int)
             # A missing key errors, and CONSUMERS without a group
             # is a usage error, not a request.

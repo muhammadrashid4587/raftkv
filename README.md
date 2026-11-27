@@ -1094,40 +1094,56 @@ logic and the failure handling, not the key-value API on top.
   the entries handed out and not yet acked. CONSUMERS reports one
   dict per consumer of the group, sorted by consumer name: `name`,
   `pending` — the entries handed out to that consumer and not yet
-  acked — and `idle` — the milliseconds since that consumer was
-  last handed an entry, None when it was never handed one through
-  a delivery this version stamped. The idle time is tracked, not
-  guessed: every xreadgroup stamps the consumer's last-seen
-  millisecond — fixed by the leader at log time, like an xadd auto
-  ID, so every replica records the same stamp and a replay or a
-  snapshot restores it exactly — in the group's `consumers` map in
-  the stream blob, so it survives snapshots and replay like the
-  rest of the group. A NOACK delivery stamps it too, and so does a
-  re-read; only a read that hands out nothing records nothing,
-  since it writes nothing at all — so a consumer only appears once
-  it has been handed at least one entry, and a consumer whose
-  pending entries were all acked is still listed, with pending 0,
-  until XGROUP DELCONSUMER drops it, record and all (the reply
-  carries `consumer_dropped` 1 when a last-seen record went, so a
-  delete that only dropped a sighting still fires its watch
-  event). All three are pure reads through the same ReadIndex path
-  as a `get`, so they are exactly as linearizable and a stale
-  read from a follower lease is served like a stale `get`; like
-  other reads, none is a pipeline op. A missing key fails all
-  three as a client error, not an empty report, a missing group
-  fails CONSUMERS the same way, and a plain string value fails all
-  three with `wrongtype`. The subcommand is matched
-  case-insensitively and normalized to upper case before it is
-  served, so every node reports the same spelling. The honest
-  limits are the same growth as xadd — the whole stream is one
-  blob, so a report still reads the blob whole — and the scope:
-  the lag is counted from the entries still in the stream, so a
-  trim makes it undercount the entries a group never read; there
-  is no entries-added counter, so STREAM reports no `entries-added`
-  and no `max-deleted-entry-id`, and no radix tree, so no
+  acked — `idle` — the milliseconds since that consumer was last
+  handed an entry, None when it was never handed one through a
+  delivery this version stamped — and, since v0.74.0, `lag` — the
+  entries in the stream past the newest entry ever handed to that
+  consumer, the per-consumer analogue of the group's lag, None
+  when its deliveries all came from replays of pre-v0.74.0 log
+  entries, which carry no last-delivered ID. The idle time is
+  tracked, not guessed: every xreadgroup stamps the consumer's
+  last-seen millisecond — fixed by the leader at log time, like an
+  xadd auto ID, so every replica records the same stamp and a
+  replay or a snapshot restores it exactly — in the group's
+  `consumers` map in the stream blob, so it survives snapshots
+  and replay like the rest of the group, and a delivery records
+  the newest entry ID it handed that consumer there too, so the
+  lag is tracked the same way. A NOACK delivery stamps it too,
+  and so does a re-read — and a claim records the newest entry it
+  claimed as the claiming consumer's last delivery, though never
+  moving a last delivery backwards past an entry the consumer was
+  already handed; only a read that hands out nothing records
+  nothing, since it writes nothing at all — so a consumer only
+  appears once it has been handed at least one entry, and a
+  consumer whose pending entries were all acked is still listed,
+  with pending 0, until XGROUP DELCONSUMER drops it, record and
+  all (the reply carries `consumer_dropped` 1 when a last-seen
+  record went, so a delete that only dropped a sighting still
+  fires its watch event). All three are pure reads through the
+  same ReadIndex path as a `get`, so they are exactly as
+  linearizable and a stale read from a follower lease is served
+  like a stale `get`; like other reads, none is a pipeline op. A
+  missing key fails all three as a client error, not an empty
+  report, a missing group fails CONSUMERS the same way, and a
+  plain string value fails all three with `wrongtype`. The
+  subcommand is matched case-insensitively and normalized to upper
+  case before it is served, so every node reports the same
+  spelling. The honest limits are the same growth as xadd — the
+  whole stream is one blob, so a report still reads the blob whole
+  — and the scope: the lag is counted from the entries still in
+  the stream, so a trim makes it undercount the entries a group
+  or a consumer never read, and entries handed to other consumers
+  count as lag for this one, since it has not read them — the lag
+  is how far behind the stream head the consumer sits, not how
+  many entries it still holds pending; there is no entries-added
+  counter, so STREAM reports no `entries-added` and no
+  `max-deleted-entry-id`, and no radix tree, so no
   `radix-tree-keys` / `radix-tree-nodes`; and an idle of None is
   the honest answer for a consumer whose deliveries all came from
-  replays of pre-v0.70.0 log entries, which carry no stamp.
+  replays of pre-v0.70.0 log entries, which carry no stamp, and a
+  lag of None the honest answer for one whose deliveries all came
+  from replays of pre-v0.74.0 log entries, which carry no
+  last-delivered ID.
 - **HyperLogLog** — since v0.47.0 `pfadd key element [element ...]`
   (`Session.pfadd(k, *elements)`, `client.pfadd(addr, k, *elements)`,
   `pfadd key element ...` on the CLI) adds elements to the
@@ -1625,7 +1641,7 @@ make test
 # or: python3 -m unittest discover -s tests -v
 ```
 
-831 tests, plus a smoke test for the benchmark script, all passing:
+893 tests, plus a smoke test for the benchmark script, all passing:
 
 | Test | What it proves |
 |---|---|
@@ -4301,8 +4317,38 @@ entries left in `log.jsonl` are dropped by their index on reload.
   and the whole stream is still one blob, so a reaper over a
   huge pending list still walks it — just a bounded slice at a
   time.
+- ~~Streams (XINFO per-consumer lag)~~ — done in v0.74.0, Nov 27,
+  2026: XINFO CONSUMERS reports `lag` per consumer — the entries
+  in the stream past the newest entry ever handed to that
+  consumer, the per-consumer analogue of the group's lag in XINFO
+  GROUPS: 0 when the consumer read to the head, more when entries
+  it never saw were appended after its last delivery. Every
+  delivery records the newest entry ID it handed the consumer in
+  the group's `consumers` map in the stream blob, alongside the
+  last-seen millisecond — a ">" read, a NOACK read, a re-read, and
+  a claim all stamp it, a re-read or a claim of an older entry
+  never moving it backwards — so the lag survives snapshots and
+  replay exactly like the idle time, and a consumer whose
+  deliveries all came from replays of pre-v0.74.0 log entries
+  reports a lag of None rather than a fabricated number, like an
+  idle of None for a pre-v0.70.0 delivery. No new RPC: the field
+  rides the existing XINFO CONSUMERS reply through the Session
+  methods, the module functions, and the CLI.
+  `tests/test_xinfo.py` proves it: store-level the lag at 1 for a
+  consumer one entry short of the head and 0 for one that read to
+  it, a NOACK delivery moving the lag with no pending entries, a
+  re-read leaving the lag alone, a claim recording the claimed
+  entry as the new consumer's last delivery without moving an
+  existing consumer's backwards, an unstamped consumer reporting
+  None, and the lags surviving a snapshot load; and cluster-level
+  the lags replicating to every node, the lag growing when a new
+  entry lands past a consumer that stopped reading, and the lag
+  surviving a snapshot + restart. The honest limit is the
+  definition itself: entries handed to other consumers count as
+  lag for this one, since it has not read them, and the lag is
+  counted from the entries still in the stream, so a trim makes
+  it undercount — the same caveat the group lag already carries.
   The roadmap is exhausted again, so the next real thing is
   a new roadmap item grounded in this project's purpose,
-  proposed by the next run — candidates: XREADGROUP with
-  NOACK re-reads of pending entries by consumer, or a
-  stream-level XINFO lag report per consumer.
+  proposed by the next run — candidate: XREADGROUP with
+  NOACK re-reads of pending entries by consumer.

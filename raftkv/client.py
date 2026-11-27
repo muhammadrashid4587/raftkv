@@ -1692,19 +1692,22 @@ class Session:
         ``key``, Redis XINFO CONSUMERS: the reply carries
         ``consumers`` — one dict per consumer, sorted by consumer
         name, each with ``name``, ``pending`` — the entries handed
-        out to that consumer and not yet acked — and ``idle`` —
-        the milliseconds since that consumer was last handed an
+        out to that consumer and not yet acked — ``idle`` — the
+        milliseconds since that consumer was last handed an
         entry, None when it was never handed one through a
-        delivery this version stamped. A missing key or group is
-        a client error — not an empty list — and a plain string
-        value is one too. A bad group never goes on the wire and
-        returns the server's error shape instead. It rides the
-        same ReadIndex path as ``get``, so it carries the same
-        session watermark and advances the read watermark from the
-        reply's ``read_index`` exactly the same way: a report
-        queried after your own xreadgroup lists the consumer that
-        read handed entries to, and a later read never goes
-        backwards past it."""
+        delivery this version stamped — and ``lag`` — the entries
+        in the stream past the newest entry ever handed to that
+        consumer, None when no stamped delivery recorded one. A
+        missing key or group is a client error — not an empty
+        list — and a plain string value is one too. A bad group
+        never goes on the wire and returns the server's error
+        shape instead. It rides the same ReadIndex path as
+        ``get``, so it carries the same session watermark and
+        advances the read watermark from the reply's
+        ``read_index`` exactly the same way: a report queried
+        after your own xreadgroup lists the consumer that read
+        handed entries to, and a later read never goes backwards
+        past it."""
         if not isinstance(group, str) or not group:
             return {"type": "client_response", "status": "error",
                     "error": "xinfo group must be a non-empty "
@@ -4558,8 +4561,10 @@ def xinfo_consumers(node_addr: tuple[str, int], key: str, group: str,
     exactly as linearizable as a ``get``. The reply is the plain
     xinfo response (``status`` ``ok`` with ``consumers`` — one
     dict per consumer, sorted by consumer name, each with
-    ``name``, ``pending``, and ``idle`` the milliseconds since
-    that consumer was last handed an entry — plus the
+    ``name``, ``pending``, ``idle`` the milliseconds since
+    that consumer was last handed an entry, and ``lag`` the
+    entries in the stream past the newest entry ever handed
+    to that consumer — plus the
     ``read_index`` / ``read_term`` they were measured at). A
     missing key or group is a client error, not an empty list,
     and a plain string value is one too. A bad group never goes
