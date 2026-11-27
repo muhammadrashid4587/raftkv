@@ -274,6 +274,7 @@ XADD_MAX_FIELDS = 1000
 # entry grow without limit — the same scale as the xadd cap, for
 # the same reason.
 XACK_MAX_IDS = 1000
+XREADGROUP_MULTI_MAX_STREAMS = 1000
 
 # How many pending entries one ``xautoclaim`` examines when the
 # caller gives no COUNT — Redis's default of 100. The count bounds
@@ -411,6 +412,76 @@ def _stamp_consumer_delivery(state, consumer, seen_ms,
                 or _parse_stored_stream_id(delivered_id)
                 > _parse_stored_stream_id(previous)):
             record["last_delivered_id"] = delivered_id
+
+
+def _xreadgroup_deliver(entries, state, consumer, id_str, count,
+                        noack, seen_ms):
+    """Hand out entries for one stream to one consumer of one
+    group — the shared delivery step of a single-stream xreadgroup
+    and a multi-stream one. With ``id`` ">" the entries appended
+    after the group's last delivery — None means the group was
+    created on an empty stream with "$", so every entry is new; a
+    bare (0, 0) floor is the same thing, since no real entry is
+    ever 0-0 — in ID order, at most ``count`` of them, each
+    recorded pending for that consumer (delivery count 1) unless
+    ``noack`` rides along, which still advances last_delivered
+    but records nothing pending. With any other ID the consumer's
+    own pending entries at or after it, in ID order, each re-read
+    raising its delivery count by one — unless ``noack`` rides
+    along: a NOACK re-read hands the entries back without touching
+    the pending record at all, so the delivery count stays where
+    the last real delivery left it and the delivery stamp is not
+    re-stamped, and the entry's idle keeps running from that
+    delivery. An entry trimmed away under KEEPREF is still pending
+    but its data is gone, so a re-read skips it: there is nothing
+    left to return for it. Mutates the group's pending list and
+    last delivery, and returns the handed [(id, fields)] pairs in
+    delivery order. It does not stamp the consumer's last-seen
+    time or write the stream blob back — the caller does that once
+    per stream, with the newest entry handed. ``count`` is the
+    budget for this stream alone: a caller sharing one budget
+    across streams passes what is left of it."""
+    if id_str == ">":
+        # New entries: everything after the group's last
+        # delivery.
+        last = state["last_delivered"]
+        after = ((0, 0) if last is None
+                 else _parse_stored_stream_id(last))
+        chosen = [(eid, fields) for eid, fields in entries
+                  if parse_stream_id(eid) > after]
+        if count is not None:
+            chosen = chosen[:count]
+        if chosen:
+            if not noack:
+                for eid, _fields in chosen:
+                    info = {"consumer": consumer,
+                            "deliveries": 1}
+                    if seen_ms is not None:
+                        info["delivered_ms"] = seen_ms
+                    state["pending"][eid] = info
+            state["last_delivered"] = chosen[-1][0]
+        return chosen
+    # Pending entries: the consumer's own unacked ones, at or
+    # after the given ID.
+    start = parse_stream_range_bound(id_str)
+    by_id = {eid: fields for eid, fields in entries}
+    chosen = []
+    for eid in sorted(state["pending"], key=parse_stream_id):
+        if parse_stream_id(eid) < start:
+            continue
+        info = state["pending"][eid]
+        if info["consumer"] != consumer:
+            continue
+        if eid not in by_id:
+            continue
+        if count is not None and len(chosen) >= count:
+            break
+        chosen.append((eid, by_id[eid]))
+        if not noack:
+            info["deliveries"] += 1
+            if seen_ms is not None:
+                info["delivered_ms"] = seen_ms
+    return chosen
 
 
 def _claimable_pending(pending, by_id, claim_min_idle_ms, seen_ms):
@@ -868,7 +939,8 @@ class KVStore:
         state at apply time — currently "set", "cas", "expire", "expireat",
         "pexpireat", "incr", "incrbyfloat", "setnx", "getset", "append", "getdel",
         "setrange", "getex", "setbit", "bitop", "pfadd", "hset", "hdel",
-        "geoadd", "xadd", "xtrim", "xgroup_create", "xreadgroup", "xack",
+        "geoadd", "xadd", "xtrim", "xgroup_create", "xreadgroup",
+        "xreadgroup_multi", "xack",
         "xclaim", "xautoclaim", "xgroup_setid", "xgroup_destroy", and
         "xgroup_delconsumer" —
         and None for del, whose outcome is always ok. The result is
@@ -2408,82 +2480,27 @@ class KVStore:
                         info["deliveries"] += 1
                         info["delivered_ms"] = seen_ms
                         claimed_entries.append((eid, by_id[eid]))
-                # New entries: everything after the group's last
-                # delivery — None means the group was created on
-                # an empty stream with "$", so every entry is
-                # new. A bare (0, 0) floor is the same thing: no
-                # real entry is ever 0-0.
-                last = state["last_delivered"]
-                after = ((0, 0) if last is None
-                         else _parse_stored_stream_id(last))
-                chosen = [(eid, fields) for eid, fields in entries
-                          if parse_stream_id(eid) > after]
+                # New entries after the claim: the claim took its
+                # share of the COUNT budget, so what is left of it
+                # is what the new entries may take.
                 remaining = (None if count is None
                              else max(0, count - len(claimed_entries)))
-                if remaining is not None:
-                    chosen = chosen[:remaining]
-                if chosen:
-                    if not noack:
-                        for eid, _fields in chosen:
-                            info = {"consumer": consumer,
-                                    "deliveries": 1}
-                            if seen_ms is not None:
-                                info["delivered_ms"] = seen_ms
-                            state["pending"][eid] = info
-                    state["last_delivered"] = chosen[-1][0]
+                chosen = _xreadgroup_deliver(
+                    entries, state, consumer, id_str, remaining,
+                    noack, seen_ms)
             else:
                 # Pending entries: the consumer's own unacked
-                # ones, at or after the given ID — in ID order,
-                # each re-read raising its delivery count, unless
-                # NOACK rides along: a NOACK re-read hands the
-                # entries back without touching the pending record
-                # at all, so the delivery count stays where the
-                # last real delivery left it and the delivery
-                # stamp is not re-stamped, and the entry's idle
-                # keeps running from that delivery. An entry
-                # trimmed away under KEEPREF is still
-                # pending but its data is gone, so it is skipped:
-                # there is nothing left to return for it.
-                # Since v0.76.0 a ">" read may carry CLAIM — Redis
-                # 8.4's XREADGROUP CLAIM, ``claim_min_idle_ms``:
-                # before handing out new entries it claims the
-                # pending entries idle at least that long — from
-                # any consumer, longest idle first — moving each
-                # one to this consumer, raising its delivery count
-                # by one, and re-stamping its delivery time, like
-                # an xclaim inline in the read. COUNT is one shared
-                # budget across the claim and the new entries, and
-                # the reply carries ``claimed`` — one dict per
-                # claimed entry, with its idle at claim time and
-                # how many times it had been delivered before —
-                # alongside ``entries``, claimed first, then new,
-                # like Redis. NOACK does not apply to claimed
-                # entries: the transfer of ownership is the point,
-                # so they stay pending, now held by this consumer.
-                # With an explicit ID the claim is ignored, like
-                # Redis, and an entry with no provable idle — its
-                # deliveries all came from replays of pre-v0.71.0
-                # log entries and so carries no stamp — is skipped,
-                # like an xclaim without FORCE.
-                start = parse_stream_range_bound(id_str)
-                by_id = {eid: fields for eid, fields in entries}
-                chosen = []
-                for eid in sorted(state["pending"],
-                                  key=parse_stream_id):
-                    if parse_stream_id(eid) < start:
-                        continue
-                    info = state["pending"][eid]
-                    if info["consumer"] != consumer:
-                        continue
-                    if eid not in by_id:
-                        continue
-                    if count is not None and len(chosen) >= count:
-                        break
-                    chosen.append((eid, by_id[eid]))
-                    if not noack:
-                        info["deliveries"] += 1
-                        if seen_ms is not None:
-                            info["delivered_ms"] = seen_ms
+                # ones, at or after the given ID. Since v0.76.0 a
+                # ">" read may carry CLAIM — Redis 8.4's
+                # XREADGROUP CLAIM — but with an explicit ID the
+                # claim is ignored, like Redis, and an entry with
+                # no provable idle — its deliveries all came from
+                # replays of pre-v0.71.0 log entries and so
+                # carries no stamp — is skipped, like an xclaim
+                # without FORCE.
+                chosen = _xreadgroup_deliver(
+                    entries, state, consumer, id_str, count,
+                    noack, seen_ms)
             # Claimed entries ride first, longest idle first,
             # then the new entries in ID order, like Redis —
             # and the reply names which were claimed, with each
@@ -2504,6 +2521,160 @@ class KVStore:
             if claim_min_idle_ms is not None and id_str == ">":
                 reply["claimed"] = claimed
             return reply
+        elif op == "xreadgroup_multi":
+            # Read entries for one consumer of one group across
+            # several streams in a single call, Redis XREADGROUP
+            # with STREAMS: one group name, one consumer, one
+            # [key, id] pair per stream — the same group must
+            # exist on every stream, like Redis, where the group
+            # is created per stream and the read names it once.
+            # Each stream reads like a single-stream xreadgroup —
+            # ">" hands out the entries appended after that
+            # group's last delivery on that stream, any other ID
+            # re-reads the consumer's own pending entries on that
+            # stream — and COUNT is one shared budget across all
+            # the streams, in the order they were given, so a
+            # stream early in the list can take the whole budget
+            # and leave nothing for the later ones. The reply
+            # carries ``streams`` — the [key, [[id, {field:
+            # value}], ...]] pairs for every stream that handed
+            # out at least one entry, in the order the streams
+            # were given, like XREAD — so a stream with nothing
+            # for this consumer is simply absent. The whole call
+            # is one log entry, so the deliveries across streams
+            # are atomic: either every stream delivers at its
+            # position in the log or none does. A missing key or
+            # a missing group on any stream fails the whole call
+            # with ``xreadgroup_failed`` / ``no_group`` — Redis's
+            # NOGROUP — and a key holding a plain string fails
+            # with WRONGTYPE, like an xadd — and the failure is
+            # decided before anything is delivered, so a failed
+            # call writes nothing on any stream. The outcome is
+            # decided here, at this exact point in the log, like
+            # a CAS, so a retry with the same session id returns
+            # the first attempt's streams instead of delivering
+            # them twice. A successful read keeps every key's
+            # deadline, like an xadd, and a read that hands out
+            # nothing writes nothing at all. The group, consumer,
+            # streams, and count were validated on the leader
+            # before the entry was logged (non-empty strings; a
+            # non-empty list of at most
+            # XREADGROUP_MULTI_MAX_STREAMS [key, id] pairs with
+            # ">" or a bound a range bound can parse; a
+            # non-negative integer count), so by apply time they
+            # are well-formed — a hand-built log entry with a bad
+            # name, stream, ID, or count still raises rather
+            # than silently delivering nonsense. A delivery also
+            # stamps the consumer's last-seen time — the
+            # wall-clock millisecond the leader fixed at log time
+            # (command "seen_ms", like an xadd auto ID) — in each
+            # stream's group, so XINFO CONSUMERS can report how
+            # long each consumer has been idle per stream, and
+            # records the newest entry ID it handed that consumer
+            # on that stream there too, so XINFO CONSUMERS can
+            # report the consumer's lag per stream; only a stream
+            # that handed out nothing records nothing on it,
+            # since it writes nothing at all. This version takes
+            # new entries and pending re-reads only: there is no
+            # BLOCK — a multi-stream wait would have to watch
+            # every stream at once — and no CLAIM — the claim
+            # rides the single-stream readgroup — so a reaper
+            # that needs either still uses the single-stream
+            # readgroup or XAUTOCLAIM.
+            group = command.get("group")
+            consumer = command.get("consumer")
+            if not isinstance(group, str) or not group:
+                raise ValueError(
+                    "xreadgroup_multi group must be a non-empty "
+                    "string")
+            if not isinstance(consumer, str) or not consumer:
+                raise ValueError(
+                    "xreadgroup_multi consumer must be a "
+                    "non-empty string")
+            streams = command.get("streams")
+            if (not isinstance(streams, list) or not streams
+                    or len(streams)
+                    > XREADGROUP_MULTI_MAX_STREAMS
+                    or any(not isinstance(pair, (list, tuple))
+                           or len(pair) != 2
+                           or not isinstance(pair[0], str)
+                           or not pair[0]
+                           or not isinstance(pair[1], str)
+                           for pair in streams)):
+                raise ValueError(
+                    "xreadgroup_multi streams must be a non-empty "
+                    "list of at most "
+                    f"{XREADGROUP_MULTI_MAX_STREAMS} [key, id] "
+                    "pairs of non-empty string key and string id")
+            count = command.get("count")
+            if count is not None and (
+                    not isinstance(count, int)
+                    or isinstance(count, bool) or count < 0):
+                raise ValueError(
+                    "xreadgroup_multi count must be a non-negative "
+                    "integer")
+            seen_ms = command.get("seen_ms")
+            if seen_ms is not None and (
+                    not isinstance(seen_ms, int)
+                    or isinstance(seen_ms, bool) or seen_ms < 0):
+                raise ValueError(
+                    "xreadgroup_multi seen_ms must be a "
+                    "non-negative integer number of milliseconds")
+            noack = bool(command.get("noack"))
+            # Resolve every stream first, before delivering
+            # anything: a failure on any stream fails the whole
+            # call, and nothing may be half-delivered.
+            for key, _id_str in streams:
+                current = self._data.get(key)
+                if current is None:
+                    return {"type": "client_response",
+                            "status": "xreadgroup_failed",
+                            "reason": "no_group",
+                            "error": "xreadgroup_multi failed: no "
+                                     f"such key {key!r} or consumer "
+                                     f"group {group!r}"}
+                if not is_stream(current):
+                    return {"type": "client_response",
+                            "status": "xreadgroup_failed",
+                            "reason": "wrongtype",
+                            "current": current,
+                            "error": "xreadgroup_multi failed: value "
+                                     f"of {key!r} is not a stream"}
+                groups = _stream_data(current).get("groups", {})
+                if group not in groups:
+                    return {"type": "client_response",
+                            "status": "xreadgroup_failed",
+                            "reason": "no_group",
+                            "error": "xreadgroup_multi failed: no "
+                                     f"such key {key!r} or consumer "
+                                     f"group {group!r}"}
+            remaining = count
+            streams_out: list = []
+            for key, id_str in streams:
+                # Re-resolve the stream here, not from the
+                # resolve pass above: a key named twice in one
+                # call reads the first delivery's effects on the
+                # second pass, instead of clobbering them with a
+                # stale parse.
+                stream = _stream_data(self._data[key])
+                state = stream["groups"][group]
+                handed = _xreadgroup_deliver(
+                    stream["entries"], state, consumer, id_str,
+                    remaining, noack, seen_ms)
+                if remaining is not None:
+                    remaining = max(0, remaining - len(handed))
+                if handed:
+                    if seen_ms is not None:
+                        _stamp_consumer_delivery(
+                            state, consumer, seen_ms,
+                            max((eid for eid, _fields in handed),
+                                key=_parse_stored_stream_id))
+                    self._data[key] = _stream_value(stream)
+                    streams_out.append(
+                        [key, [[eid, dict(fields)]
+                               for eid, fields in handed]])
+            return {"type": "client_response", "status": "ok",
+                    "streams": streams_out}
         elif op == "xack":
             # Acknowledge entries for a consumer group, Redis
             # XACK: every ID in ``ids`` that is pending in the

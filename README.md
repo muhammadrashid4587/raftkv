@@ -982,6 +982,45 @@ logic and the failure handling, not the key-value API on top.
   watch on stream changes — so it waits out its block and then
   claims whatever is idle at apply time, instead of waking the
   moment an entry becomes claimable, like Redis 8.4's wakeup does.
+- **Streams (multi-stream XREADGROUP)** — since v0.77.0
+  `xreadgroup_multi [[key, id], ...] group consumer [--count n]
+  [--noack]` (`Session.xreadgroup_multi(streams, group, consumer,
+  count, noack)`, `client.xreadgroup_multi(addr, streams, group,
+  consumer, count, noack)`, `xreadgroup-multi group consumer k1 id1
+  k2 id2 ...` on the CLI) reads entries for one consumer of one
+  group across several streams in a single call — Redis XREADGROUP
+  with STREAMS. One group name, one consumer, one [key, id] pair
+  per stream, and the same group must exist on every stream. Each
+  stream reads like a single-stream xreadgroup — ">" hands out the
+  entries appended after that group's last delivery on that stream,
+  any other ID ("0", a bare millisecond, or a full "ms-seq")
+  re-reads the consumer's own pending entries on that stream — and
+  COUNT is one shared budget across all the streams, in the order
+  they were given, so a stream early in the list can take the whole
+  budget and leave nothing for the later ones. The reply carries
+  `streams` — the [key, [[id, {field: value}], ...]] pairs for
+  every stream that handed out at least one entry, in the order the
+  streams were given, like XREAD — so a stream with nothing for
+  this consumer is simply absent. The whole call is one log entry,
+  so the deliveries across streams are atomic: a missing key or a
+  missing group on any stream fails the whole call with
+  `xreadgroup_failed` / `no_group` — and a plain string value
+  fails with `wrongtype` — and the failure is decided before
+  anything is delivered, so a failed call writes nothing on any
+  stream. A delivery stamps the consumer's last-seen time and
+  records the newest entry it handed that consumer on that stream,
+  per stream, so XINFO CONSUMERS reports the idle and the lag per
+  stream, like a single-stream delivery. It rides the same write
+  path as any other readgroup — group-commit batching, dedup (a
+  retry with the same session id returns the first attempt's
+  streams instead of delivering them twice), the response's log
+  index advancing a session's watermark. At most 1000 streams per
+  call, like an xack batch, so one entry never carries an unbounded
+  list. The honest limits are the scope: there is no BLOCK — a
+  multi-stream wait would have to watch every stream at once — and
+  no CLAIM — the claim rides the single-stream readgroup — and no
+  pipeline op, so a multi-stream read goes as its own request, like
+  a blocking readgroup.
 - **Streams (XAUTOCLAIM)** — since v0.73.0
   `xautoclaim key group consumer min-idle-ms [start] [--count n]
   [--justid]` is XAUTOCLAIM — claiming pending entries in bulk
@@ -4462,4 +4501,57 @@ entries left in `log.jsonl` are dropped by their index on reload.
   proposed by the next run — candidate: multi-stream XREADGROUP /
   XREAD, one call reading across several streams, which is the
   remaining gap between this store's single-key reads and
+  Redis's.
+- ~~Streams (multi-stream XREADGROUP)~~ — done in v0.77.0,
+  Nov 27, 2026: one call reads entries for one consumer of one
+  group across several streams — Redis XREADGROUP with STREAMS,
+  `xreadgroup_multi [[key, id], ...] group consumer [--count n]
+  [--noack]` — with one [key, id] pair per stream and the same
+  group on every stream: ">" hands out the entries appended after
+  that group's last delivery on that stream, any other ID re-reads
+  the consumer's own pending entries on that stream, COUNT is one
+  shared budget across all the streams in the order they were
+  given, and the reply carries `streams` — the [key, [[id,
+  {field: value}], ...]] pairs for every stream that handed out at
+  least one entry, in the order the streams were given, like
+  XREAD. The whole call is one log entry, so the deliveries across
+  streams are atomic: a missing key or group on any stream fails
+  the whole call with `xreadgroup_failed` / `no_group`, and a
+  plain string value fails with `wrongtype`, and the failure is
+  decided before anything is delivered, so a failed call writes
+  nothing on any stream. The single-stream delivery step is now
+  one shared helper, `_xreadgroup_deliver`, used by both the
+  single-stream readgroup and the multi-stream one, so the two
+  agree on what a delivery is. It rides the same write path as
+  any other readgroup — group-commit batching, dedup (a retry with
+  the same session id returns the first attempt's streams instead
+  of delivering them twice), the response's log index advancing a
+  session's watermark — and `Session`, `client`, and the CLI
+  (`xreadgroup-multi group consumer k1 id1 k2 id2 ...`) expose it.
+  A delivery stamps the consumer per stream, so XINFO CONSUMERS
+  reports the idle and the lag per stream. At most 1000 streams
+  per call, like an xack batch.
+  `tests/test_xreadgroup_multi.py` proves it: store-level the
+  delivery across two streams with each stream's last delivery,
+  pending list, and consumer stamp, the shared COUNT budget, a
+  stream with nothing new absent from the reply, explicit-ID
+  re-reads per stream with delivery counts rising, NOACK
+  delivering without recording pending, COUNT 0 handing out
+  nothing and writing nothing, a missing key, a missing group,
+  and a wrongtype each failing the whole call atomically, bad
+  arguments raising, and a key named twice reading the first
+  delivery's effects on the second pass; and cluster-level the
+  multi-stream read replicated to every node with XPENDING
+  agreeing per stream, the shared budget live, a dedup retry
+  delivering once, bad arguments as client errors with no log
+  entry, snapshot + restart survival, the module function from a
+  follower, and the CLI end to end. The honest limits are the
+  scope: no BLOCK — a multi-stream wait would have to watch every
+  stream at once — and no CLAIM, and no pipeline op, so a
+  multi-stream read goes as its own request, like a blocking
+  readgroup. The roadmap is exhausted again, so the next real
+  thing is a new roadmap item grounded in this project's purpose,
+  proposed by the next run — candidate: BLOCK for the
+  multi-stream XREADGROUP, waiting on any of its streams for a
+  new entry, which is the remaining gap between this read and
   Redis's.

@@ -1239,6 +1239,79 @@ class Session:
         return self._write(msg, timeout=timeout,
                            pooled=block is None)
 
+    def xreadgroup_multi(self, streams: list, group: str,
+                         consumer: str, count: int | None = None,
+                         noack: bool = False) -> dict:
+        """Read entries for one consumer of one group across
+        several streams in a single call, Redis XREADGROUP with
+        STREAMS: ``streams`` is a list of [key, id] pairs — one
+        group name, one consumer, one ID per stream — and the same
+        group must exist on every stream. Each stream reads like a
+        single-stream xreadgroup — ">" hands out the entries
+        appended after that group's last delivery on that stream,
+        any other ID ("0", a bare millisecond, or a full "ms-seq")
+        re-reads the consumer's own pending entries on that
+        stream — and ``count`` is one shared budget across all the
+        streams, in the order they were given, so a stream early
+        in the list can take the whole budget. With ``noack`` the
+        entries are delivered without being recorded pending,
+        though each stream's last delivery still advances. The
+        reply carries ``streams`` — the [key, [[id, {field:
+        value}], ...]] pairs for every stream that handed out at
+        least one entry, in the order the streams were given, like
+        XREAD — so a stream with nothing for this consumer is
+        simply absent. A missing key or group on any stream fails
+        the whole call with ``xreadgroup_failed`` and reason
+        ``no_group``, and a plain string value fails with reason
+        ``wrongtype`` — and the failure is decided before anything
+        is delivered, so a failed call writes nothing on any
+        stream. A bad group, consumer, stream list, count, or
+        noack never goes on the wire and returns the server's
+        error shape instead. This is a write, not a read: the whole
+        call is one log entry, so the deliveries across streams
+        are atomic, and a retry with the same session id returns
+        the first attempt's streams instead of delivering them
+        twice. A successful read keeps every key's TTL deadline,
+        like an xadd, and advances the write watermark from the
+        reply's index, like any other write — and so does a failed
+        one, since it still committed its entry. There is no BLOCK
+        and no CLAIM on the multi-stream read in this version: a
+        multi-stream wait would have to watch every stream at
+        once, and the claim rides the single-stream readgroup."""
+        if not isinstance(group, str) or not group:
+            return {"type": "client_response", "status": "error",
+                    "error": "xreadgroup_multi group must be a "
+                             "non-empty string"}
+        if not isinstance(consumer, str) or not consumer:
+            return {"type": "client_response", "status": "error",
+                    "error": "xreadgroup_multi consumer must be a "
+                             "non-empty string"}
+        if (not isinstance(streams, list) or not streams
+                or any(not isinstance(pair, (list, tuple))
+                       or len(pair) != 2
+                       or not isinstance(pair[0], str)
+                       or not pair[0]
+                       or not isinstance(pair[1], str)
+                       for pair in streams)):
+            return {"type": "client_response", "status": "error",
+                    "error": "xreadgroup_multi streams must be a "
+                             "non-empty list of [key, id] pairs of "
+                             "non-empty string key and string id"}
+        if count is not None and (
+                not isinstance(count, int) or isinstance(count, bool)
+                or count < 0):
+            return {"type": "client_response", "status": "error",
+                    "error": "xreadgroup_multi count must be a "
+                             "non-negative integer"}
+        msg: dict = {"type": "client", "op": "xreadgroup_multi",
+                     "streams": [[k, i] for k, i in streams],
+                     "group": group, "consumer": consumer}
+        if count is not None:
+            msg["count"] = count
+        if noack:
+            msg["noack"] = True
+        return self._write(msg)
+
     def xack(self, key: str, group: str, *ids: str) -> dict:
         """Acknowledge entries for a consumer group on the stream
         at ``key``, Redis XACK: every ID in ``ids`` that is pending
@@ -4225,6 +4298,73 @@ def xreadgroup(node_addr: tuple[str, int], key: str, group: str,
     return request(node_addr, msg, timeout=timeout)
 
 
+def xreadgroup_multi(node_addr: tuple[str, int], streams: list,
+                     group: str, consumer: str,
+                     count: int | None = None,
+                     noack: bool = False,
+                     timeout: float = 12.0) -> dict:
+    """Read entries for one consumer of one group across several
+    streams in a single call, following leader redirects like
+    ``request`` — Redis XREADGROUP with STREAMS.
+
+    One request appends the read entry, so the entries it hands out
+    are decided at the entry's position in the log: the reply is
+    the plain xreadgroup_multi response (``status`` ``ok`` with
+    ``streams`` — the [key, [[id, {field: value}], ...]] pairs for
+    every stream that handed out at least one entry, in the order
+    the streams were given — or ``xreadgroup_failed`` with reason
+    ``no_group`` when a key or the group does not exist on some
+    stream, or ``wrongtype`` when a stream's value is a plain
+    string). Each stream reads like a single-stream xreadgroup —
+    ">" hands out the entries appended after that group's last
+    delivery on that stream, any other ID ("0", a bare
+    millisecond, or a full "ms-seq") re-reads the consumer's own
+    pending entries on that stream — and ``count`` is one shared
+    budget across all the streams, in the order they were given.
+    With ``noack`` the entries are delivered without being recorded
+    pending, though each stream's last delivery still advances.
+    A bad group, consumer, stream list, or count never goes on the
+    wire and returns the server's error shape instead. This is a
+    write, not a read: the whole call is one log entry, so the
+    deliveries across streams are atomic, and a retry with the same
+    session id returns the first attempt's streams instead of
+    delivering them twice. There is no BLOCK and no CLAIM on the
+    multi-stream read in this version."""
+    if not isinstance(group, str) or not group:
+        return {"type": "client_response", "status": "error",
+                "error": "xreadgroup_multi group must be a "
+                         "non-empty string"}
+    if not isinstance(consumer, str) or not consumer:
+        return {"type": "client_response", "status": "error",
+                "error": "xreadgroup_multi consumer must be a "
+                         "non-empty string"}
+    if (not isinstance(streams, list) or not streams
+            or any(not isinstance(pair, (list, tuple))
+                   or len(pair) != 2
+                   or not isinstance(pair[0], str)
+                   or not pair[0]
+                   or not isinstance(pair[1], str)
+                   for pair in streams)):
+        return {"type": "client_response", "status": "error",
+                "error": "xreadgroup_multi streams must be a "
+                         "non-empty list of [key, id] pairs of "
+                         "non-empty string key and string id"}
+    if count is not None and (
+            not isinstance(count, int) or isinstance(count, bool)
+            or count < 0):
+        return {"type": "client_response", "status": "error",
+                "error": "xreadgroup_multi count must be a "
+                         "non-negative integer"}
+    msg: dict = {"type": "client", "op": "xreadgroup_multi",
+                 "streams": [[k, i] for k, i in streams],
+                 "group": group, "consumer": consumer}
+    if count is not None:
+        msg["count"] = count
+    if noack:
+        msg["noack"] = True
+    return request(node_addr, msg, timeout=timeout)
+
+
 def xack(node_addr: tuple[str, int], key: str, group: str,
          ids: list[str], timeout: float = 12.0) -> dict:
     """Acknowledge entries for a consumer group on the stream at
@@ -5718,6 +5858,35 @@ def main(argv: list[str] | None = None) -> int:
     p_xreadgroup.add_argument("--request-id", default=None,
                               help="id of this write within the client "
                                    "session")
+    p_xreadgroup_multi = sub.add_parser(
+        "xreadgroup-multi",
+        help="read entries for one consumer of one group across "
+             "several streams in one call and print them as JSON "
+             "([[key, [[id, {field: value}], ...]], ...]); \\\">\\\" "
+             "hands out new entries, any other ID re-reads the "
+             "consumer's own pending entries on that stream")
+    p_xreadgroup_multi.add_argument("group")
+    p_xreadgroup_multi.add_argument("consumer")
+    p_xreadgroup_multi.add_argument("streams", nargs="+",
+                                    help="key id pairs: k1 > k2 0 ... "
+                                         "(one ID per key, in the same "
+                                         "order)")
+    p_xreadgroup_multi.add_argument("--count", type=int, default=None,
+                                    help="at most this many entries "
+                                         "across all the streams "
+                                         "(default: no cap)")
+    p_xreadgroup_multi.add_argument("--noack", action="store_true",
+                                    help="deliver without recording "
+                                         "the entries pending")
+    p_xreadgroup_multi.add_argument("--client-id", default=None,
+                                    help="session id for at-most-once "
+                                         "writes: a retry with the same "
+                                         "client id + request id returns "
+                                         "the first attempt's result "
+                                         "instead of writing twice")
+    p_xreadgroup_multi.add_argument("--request-id", default=None,
+                                    help="id of this write within the "
+                                         "client session")
     p_xack = sub.add_parser(
         "xack",
         help="acknowledge entries for a consumer group on the stream "
@@ -6289,6 +6458,18 @@ def main(argv: list[str] | None = None) -> int:
             msg["block"] = args.block
         if args.claim is not None:
             msg["claim_min_idle_ms"] = args.claim
+    if op == "xreadgroup_multi":
+        if len(args.streams) % 2:
+            parser.error("xreadgroup-multi takes key id pairs: "
+                         "k1 > k2 0 ...")
+        msg["streams"] = [[args.streams[i], args.streams[i + 1]]
+                          for i in range(0, len(args.streams), 2)]
+        msg["group"] = args.group
+        msg["consumer"] = args.consumer
+        if args.count is not None:
+            msg["count"] = args.count
+        if args.noack:
+            msg["noack"] = True
     if op == "xack":
         msg["group"] = args.group
         msg["ids"] = args.ids
@@ -6370,7 +6551,8 @@ def main(argv: list[str] | None = None) -> int:
               "setex",
               "expireat",
               "pexpireat", "xadd", "xtrim", "xgroup_create",
-              "xreadgroup", "xack", "xclaim", "xautoclaim",
+              "xreadgroup", "xreadgroup_multi", "xack", "xclaim",
+              "xautoclaim",
               "xgroup_setid",
               "xgroup_destroy", "xgroup_delconsumer") \
             and args.request_id:
@@ -6464,6 +6646,8 @@ def main(argv: list[str] | None = None) -> int:
             print(resp.get("xtrim"))
         elif op == "xreadgroup":
             print(json.dumps(resp.get("entries")))
+        elif op == "xreadgroup_multi":
+            print(json.dumps(resp.get("streams")))
         elif op == "xack":
             print(resp.get("xack"))
         elif op == "xclaim":

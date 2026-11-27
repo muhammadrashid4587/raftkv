@@ -203,6 +203,11 @@ XADD_MAX_FIELDS = 1000
 # entry grow without limit — the same scale as the xadd cap above,
 # for the same reason.
 XACK_MAX_IDS = 1000
+# Largest number of streams one ``xreadgroup_multi`` may read.
+# The streams ride in one log entry and one frame, so an
+# unbounded list would let one entry grow without limit — the
+# same scale as the xack cap above, for the same reason.
+XREADGROUP_MULTI_MAX_STREAMS = 1000
 # A stream ID is two 64-bit halves, milliseconds and sequence,
 # Redis's shape: each half is an unsigned 64-bit integer, and 0-0
 # is not a valid ID.
@@ -1496,7 +1501,8 @@ class RaftNode:
                 # expireat, pexpireat, incr, incrbyfloat, setnx,
                 # getset, append, getdel, setrange, getex, setbit,
                 # bitop, pfadd, hset, hdel, geoadd, xadd, xtrim,
-                # xgroup_create, xreadgroup, xack, xclaim,
+                # xgroup_create, xreadgroup, xreadgroup_multi,
+                # xack, xclaim,
                 # xautoclaim, xgroup_setid,
                 # xgroup_destroy, and xgroup_delconsumer:
                 # their outcome is decided here, at this exact point
@@ -1779,6 +1785,23 @@ class RaftNode:
                                       self.sm.get(entry["command"]["key"]),
                                       "set",
                                       index=self.last_applied)
+                elif (op == "xreadgroup_multi" and result is not None
+                        and result.get("status") == "ok"
+                        and result.get("streams")):
+                    # A multi-stream readgroup that handed entries
+                    # out fires once per stream that handed any
+                    # out, like a set, with that stream's new
+                    # (blob) value: it changed that stream's
+                    # pending list and last delivery, so a watcher
+                    # sees the change — and a stream that handed
+                    # out nothing changed nothing, so it fires
+                    # nothing for it, like a failed xadd — and a
+                    # readgroup that handed out nothing anywhere
+                    # fires nothing at all.
+                    for skey, _entries in result["streams"]:
+                        self.watch.notify(
+                            skey, self.sm.get(skey), "set",
+                            index=self.last_applied)
                 elif (op == "xack" and result is not None
                         and result.get("status") == "ok"
                         and result.get("xack", 0) > 0):
@@ -1877,7 +1900,8 @@ class RaftNode:
                            "append", "getdel", "setrange", "getex",
                            "setbit", "bitop", "pfadd", "hset", "hdel",
                            "geoadd", "xadd", "xtrim", "xgroup_create",
-                           "xreadgroup", "xack", "xgroup_setid",
+                           "xreadgroup", "xreadgroup_multi", "xack",
+                           "xgroup_setid",
                            "xgroup_destroy", "xgroup_delconsumer",
                            "xclaim", "xautoclaim")
                         and result is not None
@@ -1893,7 +1917,8 @@ class RaftNode:
                     # index alone. Set, CAS, expire, expireat, pexpireat,
                     # incr, incrbyfloat, setnx, getset, append,
                     # getdel, setrange, getex, setbit, bitop, pfadd, hset, and
-                    # geoadd, xadd, xtrim, xgroup_create, xreadgroup, xack,
+                    # geoadd, xadd, xtrim, xgroup_create, xreadgroup,
+                    # xreadgroup_multi, xack,
                     # xgroup_setid, xgroup_destroy, and xgroup_delconsumer are
                     # the ops whose apply returns a result — a del
                     # returns None and has nothing to record.
@@ -2901,12 +2926,16 @@ class RaftNode:
                       "hscan",
                       "geoadd", "geodist",
                       "xadd", "xtrim", "xlen", "xrange",
-                      "xgroup_create", "xreadgroup", "xack",
+                      "xgroup_create", "xreadgroup",
+                      "xreadgroup_multi", "xack",
                       "xclaim", "xautoclaim",
                       "xgroup_setid", "xgroup_destroy",
                       "xgroup_delconsumer",
                       "setex") \
-                or key is None:
+                or (key is None and op != "xreadgroup_multi"):
+            # A multi-stream readgroup names its streams, not one
+            # key, so it carries no "key" — every other op must
+            # name one.
             return {"type": "client_response", "status": "error",
                     "error": "op must be set/get/del/cas/ttl/expire/"
                              "expireat/pexpireat/"
@@ -2918,7 +2947,8 @@ class RaftNode:
                              "hlen/hexists/hkeys/hvals/hmget/hscan/"
                              "geoadd/geodist/"
                              "xadd/xtrim/xlen/xrange/"
-                             "xgroup_create/xreadgroup/xack/"
+                             "xgroup_create/xreadgroup/"
+                             "xreadgroup_multi/xack/"
                              "xclaim/xautoclaim/"
                              "xgroup_setid/xgroup_destroy/"
                              "xgroup_delconsumer/"
@@ -3927,6 +3957,85 @@ class RaftNode:
                 # ignored, so the read still answers at once.
                 xreadgroup_block_ms = block
                 xreadgroup_id = id_str
+        if op == "xreadgroup_multi":
+            # Read entries for one consumer of one group across
+            # several streams in a single call, Redis XREADGROUP
+            # with STREAMS: the group and the consumer must be
+            # non-empty strings, and ``streams`` a non-empty list
+            # of at most XREADGROUP_MULTI_MAX_STREAMS [key, id]
+            # pairs — a non-empty string key and an ID of ">" (new
+            # entries, past the group's last delivery on that
+            # stream), "0", a bare millisecond, or a full
+            # "ms-seq" — so a malformed name, stream, or ID is a
+            # client error, not a log entry. "$" is not an ID here:
+            # ">" is the marker for new entries, and a "$" would
+            # mean nothing to re-read. The count, when one is
+            # given, is a non-negative integer (a bool is not
+            # one) and is one shared budget across all the
+            # streams, and ``noack`` is a bare flag: deliver
+            # without recording the entries pending. Whether the
+            # keys or the group exist is decided at apply time,
+            # like a CAS, not here. There is no BLOCK and no CLAIM
+            # on the multi-stream read in this version.
+            group = msg.get("group")
+            if not isinstance(group, str) or not group:
+                return {"type": "client_response", "status": "error",
+                        "error": "xreadgroup_multi group must be a "
+                                 "non-empty string"}
+            command["group"] = group
+            consumer = msg.get("consumer")
+            if not isinstance(consumer, str) or not consumer:
+                return {"type": "client_response", "status": "error",
+                        "error": "xreadgroup_multi consumer must be "
+                                 "a non-empty string"}
+            command["consumer"] = consumer
+            streams = msg.get("streams")
+            if (not isinstance(streams, list) or not streams
+                    or len(streams) > XREADGROUP_MULTI_MAX_STREAMS
+                    or any(not isinstance(pair, (list, tuple))
+                           or len(pair) != 2
+                           or not isinstance(pair[0], str)
+                           or not pair[0]
+                           or not isinstance(pair[1], str)
+                           for pair in streams)):
+                return {"type": "client_response", "status": "error",
+                        "error": "xreadgroup_multi streams must be "
+                                 "a non-empty list of at most "
+                                 f"{XREADGROUP_MULTI_MAX_STREAMS} "
+                                 "[key, id] pairs of non-empty "
+                                 "string key and string id"}
+            for _skey, sid in streams:
+                if sid != ">":
+                    parts = sid.split("-")
+                    if (sid in ("-", "+", "$")
+                            or len(parts) not in (1, 2)
+                            or not parts[0].isdigit()
+                            or int(parts[0]) > STREAM_ID_MAX
+                            or (len(parts) == 2
+                                and (not parts[1].isdigit()
+                                     or int(parts[1]) > STREAM_ID_MAX))):
+                        return {"type": "client_response",
+                                "status": "error",
+                                "error": "xreadgroup_multi id must "
+                                         "be \">\", \"0\", \"ms\", or "
+                                         "\"ms-seq\""}
+            command["streams"] = [[k, i] for k, i in streams]
+            count = msg.get("count")
+            if count is not None and (
+                    not isinstance(count, int)
+                    or isinstance(count, bool) or count < 0):
+                return {"type": "client_response", "status": "error",
+                        "error": "xreadgroup_multi count must be a "
+                                 "non-negative integer"}
+            if count is not None:
+                command["count"] = count
+            if msg.get("noack") is not None:
+                if msg.get("noack") is not True:
+                    return {"type": "client_response",
+                            "status": "error",
+                            "error": "xreadgroup_multi NOACK takes "
+                                     "no argument"}
+                command["noack"] = True
         if op == "xack":
             # Acknowledge entries for a consumer group, Redis
             # XACK: the group must be a non-empty string, and the
@@ -4546,7 +4655,8 @@ class RaftNode:
         for field in ("client_id", "request_id"):
             if msg.get(field):
                 command[field] = msg[field]
-        if op in ("xreadgroup", "xclaim", "xautoclaim"):
+        if op in ("xreadgroup", "xreadgroup_multi", "xclaim",
+                  "xautoclaim"):
             # The wall-clock millisecond this delivery — or this
             # claim — is stamped with, fixed here on the leader
             # just before the entry is appended — after any BLOCK
