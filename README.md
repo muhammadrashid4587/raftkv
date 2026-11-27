@@ -927,6 +927,11 @@ logic and the failure handling, not the key-value API on top.
   who holds it, how many times it has been delivered, and how
   long it has been idle, bounded by an ID range, capped by a
   count, and filterable by consumer and by a minimum idle time.
+  Since v0.72.0 XCLAIM takes a pending entry over from another
+  consumer once it has been idle long enough — FORCE regardless
+  of idle, RETRYCOUNT to set its delivery count, JUSTID to
+  answer only the claimed IDs — and a missing key or group fails
+  a claim with `no_group`, like an ack.
   The groups ride in the stream blob with the entries, so they
   survive snapshots and replay exactly like the entries, and the
   blob stays a pure function of (entries, groups), so every node
@@ -935,22 +940,23 @@ logic and the failure handling, not the key-value API on top.
   fails a readgroup or an ack with `no_group`, and a missing key
   or group fails XPENDING as a client error, not a summary of
   zeros — a typo'd group name must not read as "nothing pending".
-  A plain string value fails all four with `wrongtype`. The
+  A plain string value fails all of them with `wrongtype`. The
   outcomes are decided at apply time, at each entry's exact
   position in the log, like a CAS, so a retry with the same session
   id returns the first attempt's entries or count instead of
   delivering or acking twice — a redelivery only ever comes from a
-  fresh explicit-ID read, never from a retry. XREADGROUP and XACK
-  are writes, not reads: handing entries out and acking them
-  mutate the pending list and the last delivery, and the mutation
-  must replicate through the log like any other, so every node
-  agrees on who holds what; XPENDING is a pure read through the
-  same ReadIndex path as a `get`. Trimming drops the pending
+  fresh explicit-ID read, never from a retry. XREADGROUP, XACK,
+  and XCLAIM are writes, not reads: handing entries out, acking
+  them, and claiming them mutate the pending list and the last
+  delivery, and the mutation must replicate through the log like
+  any other, so every node agrees on who holds what; XPENDING is
+  a pure read through the same ReadIndex path as a `get`. Trimming drops the pending
   reference of a trimmed entry by default (DELREF, and no mode at
   all); KEEPREF keeps it, so the entry stays pending even though
   its data is gone, and a later explicit-ID re-read simply skips
   it. `{"op": "xgroup_create", ...}`, `{"op": "xreadgroup", ...}`,
-  and `{"op": "xack", ...}` are pipeline ops too; like other reads,
+  `{"op": "xack", ...}`, and `{"op": "xclaim", ...}` are pipeline
+  ops too; like other reads,
   XPENDING is not one. The honest limits are the same growth as
   xadd — the whole stream is one blob, so a readgroup still scans
   the blob — and the scope: XTRIM's ACKED mode behaves like
@@ -4142,8 +4148,44 @@ entries left in `log.jsonl` are dropped by their index on reload.
   arguments as client errors with no log entry, session methods,
   the module functions from a follower, snapshot + restart
   survival, and the CLI end to end.
+- ~~Streams (XCLAIM)~~ — done in v0.72.0, Nov 27, 2026:
+  `xclaim key group consumer min-idle-ms id [id ...] [--justid]
+  [--force] [--retrycount n]` is XCLAIM — taking over a pending
+  entry from a dead consumer: every named ID that is pending in
+  the group and has been idle at least the minimum — the
+  milliseconds since its last delivery, measured against the
+  wall-clock millisecond the leader fixed at log time, like an
+  xreadgroup stamp — moves to the claiming consumer, its delivery
+  count rising by one (or set to the retry count when one is
+  given), its delivery stamp re-set to the claim's time, so the
+  idle measures since this claim. FORCE claims regardless of
+  idle — even an entry delivered a moment ago, or one whose
+  deliveries all came from replays of pre-v0.71.0 log entries
+  and so carries no stamp and no provable idle. JUSTID answers
+  only the claimed IDs, not the entries. An ID that is not
+  pending, or whose entry was trimmed away under KEEPREF so
+  there is no data left to return, is simply skipped. It is a
+  write through the log like an xack, decided at apply time, so
+  a retry with the same session id returns the first attempt's
+  entries instead of claiming them twice, and a claim that takes
+  nothing writes nothing at all; a missing key or group — or a
+  plain string value, or a bad group, consumer, ID list, minimum
+  idle, or option — fails as a client error, not an empty list.
+  `Session` methods, `client` module functions, a pipelined
+  xclaim, and the `xclaim` command on the CLI.
+  `tests/test_xclaim.py` proves it: store-level the claim
+  moving entries between consumers with exact idle times from
+  fixed stamps, a too-fresh entry refused and FORCE taking it,
+  an unstamped entry refused and FORCE taking it, RETRYCOUNT
+  setting the delivery count, JUSTID answering only IDs, a
+  non-pending ID skipped, an ack dropping a claimed entry from
+  the pending list, missing keys and groups, wrongtype, and bad
+  arguments; and cluster-level the full flow replicated to every
+  node, idle times that grow as time passes, the options end to
+  end, bad arguments as client errors with no log entry, session
+  methods, the module functions from a follower, a pipelined
+  claim, snapshot + restart survival, and the CLI end to end.
   The roadmap is exhausted again, so the next real thing is
   a new roadmap item grounded in this project's purpose,
-  proposed by the next run — candidates: XCLAIM, taking over a
-  pending entry from a dead consumer, or XAUTOCLAIM, the same
-  claim in bulk.
+  proposed by the next run — candidates: XAUTOCLAIM, claiming
+  pending entries in bulk by idle time.

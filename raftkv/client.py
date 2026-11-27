@@ -1244,6 +1244,73 @@ class Session:
                             "key": key, "group": group,
                             "ids": list(ids)})
 
+    def xclaim(self, key: str, group: str, consumer: str,
+               min_idle_ms: int, *ids: str,
+               justid: bool = False, force: bool = False,
+               retrycount: int | None = None) -> dict:
+        """Claim pending entries for ``consumer`` in ``group`` on
+        the stream at ``key``, Redis XCLAIM: every ID in ``ids``
+        that is pending in the group and has been idle at least
+        ``min_idle_ms`` — the milliseconds since its last
+        delivery — moves to ``consumer``: its holder changes, its
+        delivery count rises by one (or is set to ``retrycount``
+        when one is given), and its delivery stamp is re-set to
+        the claim's time, so the idle measures since this claim.
+        With ``force`` the idle check is skipped, so even an entry
+        delivered a moment ago can be taken over. With ``justid``
+        the reply carries ``ids`` — only the claimed IDs — instead
+        of ``entries``. An ID that is not pending is simply
+        skipped. A missing key or group fails with
+        ``xclaim_failed`` and reason ``no_group``, and a plain
+        string value fails with reason ``wrongtype``. A bad group,
+        consumer, ID list, minimum idle, or option never goes on
+        the wire and returns the server's error shape instead. The
+        outcome is decided at apply time, at the entry's position
+        in the log, so a retry with the same session id returns
+        the first attempt's entries instead of claiming them
+        twice, and a successful claim keeps the key's TTL deadline,
+        like an xadd. A successful claim advances the write
+        watermark from the reply's index, like any other write —
+        and so does a failed one, since it still committed its
+        entry."""
+        if not isinstance(group, str) or not group:
+            return {"type": "client_response", "status": "error",
+                    "error": "xclaim group must be a non-empty "
+                             "string"}
+        if not isinstance(consumer, str) or not consumer:
+            return {"type": "client_response", "status": "error",
+                    "error": "xclaim consumer must be a non-empty "
+                             "string"}
+        if (not ids or len(ids) > 1000
+                or any(not isinstance(i, str) for i in ids)):
+            return {"type": "client_response", "status": "error",
+                    "error": "xclaim ids must be a list of 1 to 1000 "
+                             "stream IDs"}
+        if (not isinstance(min_idle_ms, int)
+                or isinstance(min_idle_ms, bool) or min_idle_ms < 0):
+            return {"type": "client_response", "status": "error",
+                    "error": "xclaim min_idle_ms must be a "
+                             "non-negative integer number of "
+                             "milliseconds"}
+        if retrycount is not None and (
+                not isinstance(retrycount, int)
+                or isinstance(retrycount, bool) or retrycount < 0):
+            return {"type": "client_response", "status": "error",
+                    "error": "xclaim retrycount must be a "
+                             "non-negative integer"}
+        msg: dict = {"type": "client", "op": "xclaim",
+                     "key": key, "group": group,
+                     "consumer": consumer,
+                     "min_idle_ms": min_idle_ms,
+                     "ids": list(ids)}
+        if justid:
+            msg["justid"] = True
+        if force:
+            msg["force"] = True
+        if retrycount is not None:
+            msg["retrycount"] = retrycount
+        return self._write(msg)
+
     def xgroup_setid(self, key: str, group: str, id: str = "$",
                      entries_read: int | None = None) -> dict:
         """Set a consumer group's last-delivered ID on the stream
@@ -2334,6 +2401,7 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
                     "bitop",
                     "pfadd", "geoadd", "xadd", "xtrim",
                     "xgroup_create", "xreadgroup", "xack",
+                    "xclaim",
                     "xgroup_setid", "xgroup_destroy",
                     "xgroup_delconsumer",
                     "hset", "hdel",
@@ -2345,7 +2413,7 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
                                "incr, incrbyfloat, setnx, getset, append, "
                                "getdel, getex, setrange, setbit, bitop, "
                                "pfadd, geoadd, xadd, xtrim, xgroup_create, "
-                               "xreadgroup, xack, xgroup_setid, "
+                               "xreadgroup, xack, xclaim, xgroup_setid, "
                                "xgroup_destroy, xgroup_delconsumer, hset, "
                                "hdel, setex, expireat, or "
                                "pexpireat"}
@@ -2855,6 +2923,79 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
                                        "explicit \"ms-seq\" stream IDs "
                                        "greater than 0-0"}
         msg["ids"] = list(ids)
+    if name == "xclaim":
+        # ``group``, ``consumer``, ``min_idle_ms``, ``ids``,
+        # ``justid``, ``force``, and ``retrycount`` ride along
+        # with a pipelined xclaim, validated here so a malformed
+        # one never goes on the wire: a non-empty string group and
+        # consumer, a non-empty list of at most 1000 explicit
+        # "ms-seq" IDs, a non-negative integer minimum idle, bare
+        # ``justid`` / ``force`` flags, and a non-negative integer
+        # retry count when one is given — the same shapes the
+        # server enforces.
+        group = op.get("group")
+        if not isinstance(group, str) or not group:
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline xclaim group must be a "
+                                   "non-empty string"}
+        msg["group"] = group
+        consumer = op.get("consumer")
+        if not isinstance(consumer, str) or not consumer:
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline xclaim consumer must be "
+                                   "a non-empty string"}
+        msg["consumer"] = consumer
+        ids = op.get("ids")
+        if (not isinstance(ids, list) or not ids
+                or len(ids) > 1000
+                or any(not isinstance(i, str) for i in ids)):
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline xclaim ids must be a list "
+                                   "of 1 to 1000 stream IDs"}
+        for entry_id in ids:
+            parts = entry_id.split("-")
+            if (len(parts) != 2 or not parts[0].isdigit()
+                    or not parts[1].isdigit()
+                    or int(parts[0]) > 2 ** 64 - 1
+                    or int(parts[1]) > 2 ** 64 - 1
+                    or (int(parts[0]) == 0 and int(parts[1]) == 0)):
+                return None, {"type": "client_response",
+                              "status": "error",
+                              "error": "pipeline xclaim ids must be "
+                                       "explicit \"ms-seq\" stream IDs "
+                                       "greater than 0-0"}
+        msg["ids"] = list(ids)
+        min_idle_ms = op.get("min_idle_ms")
+        if (not isinstance(min_idle_ms, int)
+                or isinstance(min_idle_ms, bool) or min_idle_ms < 0):
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline xclaim min_idle_ms must "
+                                   "be a non-negative integer number of "
+                                   "milliseconds"}
+        msg["min_idle_ms"] = min_idle_ms
+        if op.get("justid") is not None:
+            if op.get("justid") is not True:
+                return None, {"type": "client_response",
+                              "status": "error",
+                              "error": "pipeline xclaim JUSTID takes "
+                                       "no argument"}
+            msg["justid"] = True
+        if op.get("force") is not None:
+            if op.get("force") is not True:
+                return None, {"type": "client_response",
+                              "status": "error",
+                              "error": "pipeline xclaim FORCE takes no "
+                                       "argument"}
+            msg["force"] = True
+        retrycount = op.get("retrycount")
+        if retrycount is not None and (
+                not isinstance(retrycount, int)
+                or isinstance(retrycount, bool) or retrycount < 0):
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline xclaim retrycount must "
+                                   "be a non-negative integer"}
+        if retrycount is not None:
+            msg["retrycount"] = retrycount
     if name == "xgroup_setid":
         # ``group``, ``id``, and ``entries_read`` ride along with
         # a pipelined xgroup_setid, validated here so a malformed
@@ -3925,6 +4066,65 @@ def xack(node_addr: tuple[str, int], key: str, group: str,
                                "key": key, "group": group,
                                "ids": list(ids)},
                    timeout=timeout)
+
+
+def xclaim(node_addr: tuple[str, int], key: str, group: str,
+           consumer: str, min_idle_ms: int, ids: list[str],
+           justid: bool = False, force: bool = False,
+           retrycount: int | None = None,
+           timeout: float = 12.0) -> dict:
+    """Claim pending entries for ``consumer`` in ``group`` on the
+    stream at ``key``, following leader redirects like ``request``
+    — Redis XCLAIM.
+
+    One request appends the claim entry, so which entries move is
+    decided at the entry's position in the log: the reply is the
+    plain xclaim response (``status`` ``ok`` with ``entries`` —
+    the [id, {field: value}] pairs claimed, in the order the IDs
+    were given — or ``ids`` with JUSTID — or
+    ``xclaim_failed`` with reason ``no_group`` when the key or
+    the group does not exist, or ``wrongtype`` when the current
+    value is a plain string). An ID that is not pending, or not
+    idle at least ``min_idle_ms`` (unless FORCE), is simply
+    skipped. With ``retrycount`` the claimed entries' delivery
+    count is set to that number instead of rising by one. A bad
+    group, consumer, ID list, minimum idle, or option never goes
+    on the wire and returns the server's error shape instead. A
+    successful claim keeps the key's TTL deadline, like an xadd.
+    """
+    if not isinstance(group, str) or not group:
+        return {"type": "client_response", "status": "error",
+                "error": "xclaim group must be a non-empty string"}
+    if not isinstance(consumer, str) or not consumer:
+        return {"type": "client_response", "status": "error",
+                "error": "xclaim consumer must be a non-empty "
+                         "string"}
+    if (not isinstance(ids, list) or not ids or len(ids) > 1000
+            or any(not isinstance(i, str) for i in ids)):
+        return {"type": "client_response", "status": "error",
+                "error": "xclaim ids must be a list of 1 to 1000 "
+                         "stream IDs"}
+    if (not isinstance(min_idle_ms, int)
+            or isinstance(min_idle_ms, bool) or min_idle_ms < 0):
+        return {"type": "client_response", "status": "error",
+                "error": "xclaim min_idle_ms must be a non-negative "
+                         "integer number of milliseconds"}
+    if retrycount is not None and (
+            not isinstance(retrycount, int)
+            or isinstance(retrycount, bool) or retrycount < 0):
+        return {"type": "client_response", "status": "error",
+                "error": "xclaim retrycount must be a non-negative "
+                         "integer"}
+    msg: dict = {"type": "client", "op": "xclaim",
+                 "key": key, "group": group, "consumer": consumer,
+                 "min_idle_ms": min_idle_ms, "ids": list(ids)}
+    if justid:
+        msg["justid"] = True
+    if force:
+        msg["force"] = True
+    if retrycount is not None:
+        msg["retrycount"] = retrycount
+    return request(node_addr, msg, timeout=timeout)
 
 
 def xgroup_setid(node_addr: tuple[str, int], key: str, group: str,
@@ -5277,6 +5477,38 @@ def main(argv: list[str] | None = None) -> int:
                              "twice")
     p_xack.add_argument("--request-id", default=None,
                         help="id of this write within the client session")
+    p_xclaim = sub.add_parser(
+        "xclaim",
+        help="claim pending entries for a consumer of a group on the "
+             "stream at key and print them as JSON ([[id, {field: "
+             "value}], ...], or just the IDs with --justid); entries "
+             "idle at least min-idle-ms move to the new consumer")
+    p_xclaim.add_argument("key")
+    p_xclaim.add_argument("group")
+    p_xclaim.add_argument("consumer")
+    p_xclaim.add_argument("min_idle_ms", type=int,
+                          help="minimum idle milliseconds before an "
+                               "entry can be taken over")
+    p_xclaim.add_argument("ids", nargs="+",
+                          help="the entry IDs to claim: "
+                               "ms-seq ms-seq ... (at most 1000)")
+    p_xclaim.add_argument("--justid", action="store_true",
+                          help="print only the claimed IDs, not the "
+                               "entries")
+    p_xclaim.add_argument("--force", action="store_true",
+                          help="claim regardless of idle time")
+    p_xclaim.add_argument("--retrycount", type=int, default=None,
+                          help="set the claimed entries' delivery "
+                               "count to this instead of raising it "
+                               "by one")
+    p_xclaim.add_argument("--client-id", default=None,
+                          help="session id for at-most-once writes: a "
+                               "retry with the same client id + request "
+                               "id returns the first attempt's result "
+                               "instead of writing twice")
+    p_xclaim.add_argument("--request-id", default=None,
+                          help="id of this write within the client "
+                               "session")
     p_xgroup_setid = sub.add_parser(
         "xgroup_setid",
         help="set a consumer group's last-delivered ID on the "
@@ -5587,7 +5819,8 @@ def main(argv: list[str] | None = None) -> int:
               "hlen", "hexists", "hkeys", "hvals", "hmget", "hscan",
               "geoadd", "geodist",
               "xadd", "xtrim", "xlen", "xrange",
-              "xgroup_create", "xreadgroup", "xack", "xpending",
+              "xgroup_create", "xreadgroup", "xack", "xclaim",
+              "xpending",
               "xinfo",
               "xgroup_setid", "xgroup_destroy", "xgroup_delconsumer",
               "setex", "expireat",
@@ -5765,6 +5998,17 @@ def main(argv: list[str] | None = None) -> int:
     if op == "xack":
         msg["group"] = args.group
         msg["ids"] = args.ids
+    if op == "xclaim":
+        msg["group"] = args.group
+        msg["consumer"] = args.consumer
+        msg["min_idle_ms"] = args.min_idle_ms
+        msg["ids"] = args.ids
+        if args.justid:
+            msg["justid"] = True
+        if args.force:
+            msg["force"] = True
+        if args.retrycount is not None:
+            msg["retrycount"] = args.retrycount
     if op == "xgroup_setid":
         msg["group"] = args.group
         msg["id"] = args.id
@@ -5823,7 +6067,7 @@ def main(argv: list[str] | None = None) -> int:
               "setex",
               "expireat",
               "pexpireat", "xadd", "xtrim", "xgroup_create",
-              "xreadgroup", "xack", "xgroup_setid",
+              "xreadgroup", "xack", "xclaim", "xgroup_setid",
               "xgroup_destroy", "xgroup_delconsumer") \
             and args.request_id:
         # A request id without an explicit client id still dedups
@@ -5918,6 +6162,11 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(resp.get("entries")))
         elif op == "xack":
             print(resp.get("xack"))
+        elif op == "xclaim":
+            if args.justid:
+                print(json.dumps(resp.get("ids")))
+            else:
+                print(json.dumps(resp.get("entries")))
         elif op == "xgroup_destroy":
             print(resp.get("xgroup_destroy"))
         elif op == "xgroup_delconsumer":

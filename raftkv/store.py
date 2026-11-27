@@ -236,7 +236,9 @@ def geo_distance(lon1: float, lat1: float, lon2: float,
 # acked, with which consumer holds it, how many times it has been
 # delivered, and — since v0.71.0 — the wall-clock millisecond of
 # its last delivery, so XPENDING in per-entry form can report how
-# long each entry has been idle. Since v0.69.0 a group may also
+# long each entry has been idle. Since v0.72.0 XCLAIM can move a
+# pending entry to another consumer once it has been idle long
+# enough, re-stamping that same delivery time. Since v0.69.0 a group may also
 # carry "entries_read", the count an XGROUP SETID ... ENTRIESREAD
 # set — XGROUP SETID moves last_delivered (and optionally
 # entries_read), XGROUP DESTROY drops the whole group, and XGROUP
@@ -789,7 +791,8 @@ class KVStore:
         "pexpireat", "incr", "incrbyfloat", "setnx", "getset", "append", "getdel",
         "setrange", "getex", "setbit", "bitop", "pfadd", "hset", "hdel",
         "geoadd", "xadd", "xtrim", "xgroup_create", "xreadgroup", "xack",
-        "xgroup_setid", "xgroup_destroy", and "xgroup_delconsumer" —
+        "xclaim", "xgroup_setid", "xgroup_destroy", and
+        "xgroup_delconsumer" —
         and None for del, whose outcome is always ok. The result is
         what the leader hands back to the waiting client and what the
         dedup table caches for retries, so it must be a pure function
@@ -2399,6 +2402,147 @@ class KVStore:
                 self._data[key] = _stream_value(stream)
             return {"type": "client_response", "status": "ok",
                     "xack": acked}
+        elif op == "xclaim":
+            # Claim pending entries for a new consumer, Redis
+            # XCLAIM: every ID in ``ids`` that is pending in the
+            # group and has been idle at least ``min_idle_ms``
+            # — the milliseconds since its last delivery, measured
+            # against ``seen_ms``, the wall-clock millisecond the
+            # leader fixed at log time, like an xreadgroup stamp —
+            # moves to ``consumer``: its holder changes, its
+            # delivery count rises by one (or is set to
+            # ``retrycount`` when one is given), and its delivery
+            # stamp is re-set to ``seen_ms``, so the idle measures
+            # since this claim. With ``force`` the idle check is
+            # skipped — even an entry delivered a moment ago, or
+            # one whose deliveries all came from replays of
+            # pre-v0.71.0 log entries and so carries no stamp and
+            # no provable idle, can be taken over. With
+            # ``justid`` the reply carries only the claimed IDs,
+            # not the entries. An ID that is not pending, or whose
+            # entry was trimmed away under KEEPREF so there is no
+            # data left to return, is simply skipped: there is
+            # nothing to claim for it. A missing key or a missing
+            # group fails with ``xclaim_failed`` / ``no_group`` —
+            # Redis's NOGROUP — and a key holding a plain string
+            # fails with WRONGTYPE, like an xadd. The outcome is
+            # decided here, at this exact point in the log, like
+            # a CAS, so a retry with the same session id returns
+            # the first attempt's entries instead of claiming
+            # them twice. A successful claim keeps the key's
+            # deadline, like an xadd, stamps the claiming
+            # consumer's last-seen time, and a claim that takes
+            # nothing writes nothing at all. The group, consumer,
+            # IDs, minimum idle, and options were validated on
+            # the leader before the entry was logged (non-empty
+            # string group and consumer; a non-empty list of at
+            # most 1000 explicit "ms-seq" IDs; a non-negative
+            # integer minimum idle and retry count), so by apply
+            # time they are well-formed — a hand-built log entry
+            # with a bad group, consumer, ID, or option still
+            # raises rather than silently claiming nonsense — and
+            # ``seen_ms`` is required, since the idle check has
+            # no now to measure against without it.
+            key = command["key"]
+            group = command.get("group")
+            if not isinstance(group, str) or not group:
+                raise ValueError(
+                    "xclaim group must be a non-empty string")
+            consumer = command.get("consumer")
+            if not isinstance(consumer, str) or not consumer:
+                raise ValueError(
+                    "xclaim consumer must be a non-empty string")
+            ids = command.get("ids")
+            if (not isinstance(ids, list) or not ids
+                    or len(ids) > XACK_MAX_IDS
+                    or any(not isinstance(i, str) for i in ids)):
+                raise ValueError(
+                    "xclaim ids must be a non-empty list of at most "
+                    f"{XACK_MAX_IDS} stream IDs")
+            for entry_id in ids:
+                _ms, seq = parse_stream_id(entry_id)
+                if seq is None:
+                    raise ValueError(
+                        "xclaim ids must be explicit \"ms-seq\" IDs")
+            min_idle_ms = command.get("min_idle_ms")
+            if (not isinstance(min_idle_ms, int)
+                    or isinstance(min_idle_ms, bool)
+                    or min_idle_ms < 0):
+                raise ValueError(
+                    "xclaim min_idle_ms must be a non-negative "
+                    "integer number of milliseconds")
+            retrycount = command.get("retrycount")
+            if retrycount is not None and (
+                    not isinstance(retrycount, int)
+                    or isinstance(retrycount, bool)
+                    or retrycount < 0):
+                raise ValueError(
+                    "xclaim retrycount must be a non-negative "
+                    "integer")
+            seen_ms = command.get("seen_ms")
+            if (not isinstance(seen_ms, int)
+                    or isinstance(seen_ms, bool) or seen_ms < 0):
+                raise ValueError(
+                    "xclaim seen_ms must be a non-negative integer "
+                    "number of milliseconds")
+            force = bool(command.get("force"))
+            justid = bool(command.get("justid"))
+            current = self._data.get(key)
+            if current is None:
+                return {"type": "client_response",
+                        "status": "xclaim_failed",
+                        "reason": "no_group",
+                        "error": "xclaim failed: no such key "
+                                 f"{key!r} or consumer group "
+                                 f"{group!r}"}
+            if not is_stream(current):
+                return {"type": "client_response",
+                        "status": "xclaim_failed",
+                        "reason": "wrongtype",
+                        "current": current,
+                        "error": "xclaim failed: value of "
+                                 f"{key!r} is not a stream"}
+            stream = _stream_data(current)
+            groups = stream.get("groups", {})
+            if group not in groups:
+                return {"type": "client_response",
+                        "status": "xclaim_failed",
+                        "reason": "no_group",
+                        "error": "xclaim failed: no such key "
+                                 f"{key!r} or consumer group "
+                                 f"{group!r}"}
+            state = groups[group]
+            by_id = {eid: fields for eid, fields in stream["entries"]}
+            claimed: list[tuple[str, dict]] = []
+            for entry_id in ids:
+                info = state["pending"].get(entry_id)
+                if info is None:
+                    continue
+                if entry_id not in by_id:
+                    continue
+                if not force:
+                    delivered_ms = info.get("delivered_ms")
+                    idle = (None if delivered_ms is None
+                            else max(0, seen_ms - delivered_ms))
+                    if idle is None or idle < min_idle_ms:
+                        continue
+                info["consumer"] = consumer
+                if retrycount is not None:
+                    info["deliveries"] = retrycount
+                else:
+                    info["deliveries"] += 1
+                info["delivered_ms"] = seen_ms
+                claimed.append((entry_id, by_id[entry_id]))
+            if claimed:
+                state.setdefault("consumers", {})[consumer] = {
+                    "last_seen_ms": seen_ms}
+                self._data[key] = _stream_value(stream)
+            if justid:
+                return {"type": "client_response", "status": "ok",
+                        "ids": [eid for eid, _fields in claimed]}
+            return {"type": "client_response", "status": "ok",
+                    "entries": [[eid, dict(fields)]
+                                for eid, fields in claimed]}
         elif op == "xgroup_setid":
             # Set a consumer group's last-delivered ID, Redis
             # XGROUP SETID: ``id`` is "$" (the stream's top, or

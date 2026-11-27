@@ -1496,7 +1496,8 @@ class RaftNode:
                 # expireat, pexpireat, incr, incrbyfloat, setnx,
                 # getset, append, getdel, setrange, getex, setbit,
                 # bitop, pfadd, hset, hdel, geoadd, xadd, xtrim,
-                # xgroup_create, xreadgroup, xack, xgroup_setid,
+                # xgroup_create, xreadgroup, xack, xclaim,
+                # xgroup_setid,
                 # xgroup_destroy, and xgroup_delconsumer:
                 # their outcome is decided here, at this exact point
                 # in the log, so the result is recorded in the dedup
@@ -1790,6 +1791,23 @@ class RaftNode:
                                       self.sm.get(entry["command"]["key"]),
                                       "set",
                                       index=self.last_applied)
+                elif (op == "xclaim" and result is not None
+                        and result.get("status") == "ok"
+                        and (result.get("entries")
+                             or result.get("ids"))):
+                    # A claim that took entries over fires like a
+                    # set, with the new (stream blob) value: it
+                    # changed who holds the entries, so a watcher
+                    # sees the change — and a claim that took
+                    # nothing changed nothing, so it fires nothing,
+                    # like a failed xadd — and a failed claim wrote
+                    # nothing either. A JUSTID claim carries its
+                    # IDs under "ids", not "entries", so it fires
+                    # on those instead.
+                    self.watch.notify(entry["command"]["key"],
+                                      self.sm.get(entry["command"]["key"]),
+                                      "set",
+                                      index=self.last_applied)
                 elif (op == "xgroup_setid" and result is not None
                         and result.get("status") == "ok"
                         and result.get("changed")):
@@ -1840,7 +1858,8 @@ class RaftNode:
                            "setbit", "bitop", "pfadd", "hset", "hdel",
                            "geoadd", "xadd", "xtrim", "xgroup_create",
                            "xreadgroup", "xack", "xgroup_setid",
-                           "xgroup_destroy", "xgroup_delconsumer")
+                           "xgroup_destroy", "xgroup_delconsumer",
+                           "xclaim")
                         and result is not None
                         and self.role == "leader"):
                     # Record the outcome only when a local waiter is
@@ -1918,7 +1937,9 @@ class RaftNode:
         group_exists / no_group / wrongtype for an xgroup_create;
         the entries, or no_group / wrongtype for an xreadgroup;
         the count of acked entries, or no_group / wrongtype for
-        an xack; 1, or no_group / wrongtype for an xgroup_setid;
+        an xack; the claimed entries (or just their IDs with
+        JUSTID), or no_group / wrongtype for an xclaim; 1, or
+        no_group / wrongtype for an xgroup_setid;
         1 or 0, or no_group / wrongtype for an xgroup_destroy;
         the count of dropped pending entries, or no_group /
         wrongtype for an xgroup_delconsumer), so a
@@ -2858,6 +2879,7 @@ class RaftNode:
                       "geoadd", "geodist",
                       "xadd", "xtrim", "xlen", "xrange",
                       "xgroup_create", "xreadgroup", "xack",
+                      "xclaim",
                       "xgroup_setid", "xgroup_destroy",
                       "xgroup_delconsumer",
                       "setex") \
@@ -2874,6 +2896,7 @@ class RaftNode:
                              "geoadd/geodist/"
                              "xadd/xtrim/xlen/xrange/"
                              "xgroup_create/xreadgroup/xack/"
+                             "xclaim/"
                              "xgroup_setid/xgroup_destroy/"
                              "xgroup_delconsumer/"
                              "setex "
@@ -3903,6 +3926,89 @@ class RaftNode:
                                      "\"ms-seq\" stream IDs greater "
                                      "than 0-0"}
             command["ids"] = list(ids)
+        if op == "xclaim":
+            # Claim pending entries for a new consumer, Redis
+            # XCLAIM: the group and the consumer must be non-empty
+            # strings, the IDs a non-empty list of at most
+            # XACK_MAX_IDS explicit "ms-seq" IDs — the same cap as
+            # an xack, for the same reason — and ``min_idle_ms``
+            # a non-negative integer number of milliseconds, the
+            # idle an entry must have reached before it can be
+            # taken over. ``justid`` and ``force`` are bare flags:
+            # JUSTID answers only the claimed IDs, FORCE claims
+            # regardless of idle. ``retrycount`` is a non-negative
+            # integer that sets the claimed entries' delivery
+            # count instead of raising it by one. A malformed
+            # group, consumer, ID list, minimum idle, or option is
+            # a client error, not a log entry. Whether the key or
+            # the group exists (and which IDs are actually pending
+            # and idle enough) is decided at apply time, like a
+            # CAS, not here.
+            group = msg.get("group")
+            if not isinstance(group, str) or not group:
+                return {"type": "client_response", "status": "error",
+                        "error": "xclaim group must be a non-empty "
+                                 "string"}
+            command["group"] = group
+            consumer = msg.get("consumer")
+            if not isinstance(consumer, str) or not consumer:
+                return {"type": "client_response", "status": "error",
+                        "error": "xclaim consumer must be a "
+                                 "non-empty string"}
+            command["consumer"] = consumer
+            ids = msg.get("ids")
+            if (not isinstance(ids, list) or not ids
+                    or len(ids) > XACK_MAX_IDS
+                    or any(not isinstance(i, str) for i in ids)):
+                return {"type": "client_response", "status": "error",
+                        "error": "xclaim ids must be a list of 1 to "
+                                 f"{XACK_MAX_IDS} stream IDs"}
+            for entry_id in ids:
+                parts = entry_id.split("-")
+                if (len(parts) != 2 or not parts[0].isdigit()
+                        or not parts[1].isdigit()
+                        or int(parts[0]) > STREAM_ID_MAX
+                        or int(parts[1]) > STREAM_ID_MAX
+                        or (int(parts[0]) == 0
+                            and int(parts[1]) == 0)):
+                    return {"type": "client_response",
+                            "status": "error",
+                            "error": "xclaim ids must be explicit "
+                                     "\"ms-seq\" stream IDs greater "
+                                     "than 0-0"}
+            command["ids"] = list(ids)
+            min_idle_ms = msg.get("min_idle_ms")
+            if (not isinstance(min_idle_ms, int)
+                    or isinstance(min_idle_ms, bool)
+                    or min_idle_ms < 0):
+                return {"type": "client_response", "status": "error",
+                        "error": "xclaim min_idle_ms must be a "
+                                 "non-negative integer number of "
+                                 "milliseconds"}
+            command["min_idle_ms"] = min_idle_ms
+            if msg.get("justid") is not None:
+                if msg.get("justid") is not True:
+                    return {"type": "client_response",
+                            "status": "error",
+                            "error": "xclaim JUSTID takes no "
+                                     "argument"}
+                command["justid"] = True
+            if msg.get("force") is not None:
+                if msg.get("force") is not True:
+                    return {"type": "client_response",
+                            "status": "error",
+                            "error": "xclaim FORCE takes no argument"}
+                command["force"] = True
+            retrycount = msg.get("retrycount")
+            if retrycount is not None and (
+                    not isinstance(retrycount, int)
+                    or isinstance(retrycount, bool)
+                    or retrycount < 0):
+                return {"type": "client_response", "status": "error",
+                        "error": "xclaim retrycount must be a "
+                                 "non-negative integer"}
+            if retrycount is not None:
+                command["retrycount"] = retrycount
         if op == "xgroup_setid":
             # Set a consumer group's last-delivered ID, Redis
             # XGROUP SETID: the group must be a non-empty string,
@@ -4327,20 +4433,23 @@ class RaftNode:
         for field in ("client_id", "request_id"):
             if msg.get(field):
                 command[field] = msg[field]
-        if op == "xreadgroup":
-            # The wall-clock millisecond this delivery is stamped
-            # with, fixed here on the leader just before the entry
-            # is appended — after any BLOCK wait, so the stamp is
-            # the delivery's time, not the time the wait started —
-            # and stored in the command itself, so every replica
-            # records the same last-seen time and a replay or a
-            # snapshot restores it exactly: fixing it at log time
-            # (rather than at apply time, when followers would each
-            # read their own clock) is what keeps the stamp
-            # identical across nodes, the same fix-at-log-time as
-            # an xadd auto ID. A retry whose first attempt already
-            # applied never logs again, so the stamp is harmless
-            # there.
+        if op in ("xreadgroup", "xclaim"):
+            # The wall-clock millisecond this delivery — or this
+            # claim — is stamped with, fixed here on the leader
+            # just before the entry is appended — after any BLOCK
+            # wait, so the stamp is the delivery's time, not the
+            # time the wait started — and stored in the command
+            # itself, so every replica records the same last-seen
+            # time and a replay or a snapshot restores it exactly:
+            # fixing it at log time (rather than at apply time,
+            # when followers would each read their own clock) is
+            # what keeps the stamp identical across nodes, the
+            # same fix-at-log-time as an xadd auto ID. A retry
+            # whose first attempt already applied never logs again,
+            # so the stamp is harmless there. For an xclaim the
+            # same stamp is the now the idle check measures
+            # against, so every replica agrees on which entries
+            # were idle enough to take over.
             command["seen_ms"] = int(time.time() * 1000)
         timed_out: bool | None = None
         if (op == "xreadgroup" and xreadgroup_block_ms is not None
