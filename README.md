@@ -735,6 +735,43 @@ logic and the failure handling, not the key-value API on top.
   haversine, which can differ from Redis's geohash-quantized
   answer by a fraction of a metre (Palermo to Catania: 166274.26
   m here, 166274.15 m in Redis's documentation).
+- **Streams (XADD)** — since v0.63.0 `xadd key [id] field value
+  [field value ...]` (`Session.xadd(k, fields, id="*")`,
+  `client.xadd(addr, k, fields, id)`, `xadd key id f1 v1 ...` on
+  the CLI) appends one entry to the stream at the key and answers
+  with the ID the entry got — Redis XADD. The ID is `*`
+  (auto-generate), an explicit `ms-seq`, or `ms-*` (auto
+  sequence); a missing key is created as an empty stream. An
+  auto ID's millisecond is fixed by the leader at log time, so
+  every replica resolves the same ID — a millisecond past the
+  stream's top takes sequence 0, one equal to it or behind it
+  takes the top millisecond with the next sequence — so an auto
+  ID is always greater than the top, however far into the future
+  an explicit ID ran. An explicit ID must be greater than the
+  stream's top item, like Redis: one equal or smaller fails with
+  `xadd_failed` and reason `id_not_greater` and writes nothing,
+  and a field repeated in one call counts once, at its last
+  value, like an hset. The entries ride in the store as a JSON
+  blob with a marker prefix, like a hash — the JSON is the
+  entries in ID order plus the top ID, dumped with sorted keys
+  and no spaces, so the encoding is a pure function of the
+  entries and every node applying the same log computes the same
+  bytes. The outcome is decided at apply time, at the entry's
+  exact position in the log, like a CAS: a retry with the same
+  session id returns the first attempt's ID instead of appending
+  twice. A key holding a plain string fails an xadd with
+  `xadd_failed` and reason `wrongtype` instead of writing. At
+  most 1000 fields per xadd, like an hset batch, so one entry
+  never carries an unbounded list. A successful xadd keeps the
+  key's TTL deadline, like an hset, and fires a `set` watch event
+  with the new value; a failed one fires nothing.
+  `{"op": "xadd", "key": k, "pairs": [[f, v], ...], "id": id}`
+  is a pipeline op too. The honest limit is the growth itself:
+  there is no MAXLEN trimming yet, so a stream grows without
+  bound — every entry stays in the one blob, and the blob rides
+  every snapshot and replay whole — and there is no XREAD /
+  XRANGE / XLEN yet, so the only way to read entries back is the
+  raw blob.
 - **HyperLogLog** — since v0.47.0 `pfadd key element [element ...]`
   (`Session.pfadd(k, *elements)`, `client.pfadd(addr, k, *elements)`,
   `pfadd key element ...` on the CLI) adds elements to the
@@ -3434,3 +3471,45 @@ entries left in `log.jsonl` are dropped by their index on reload.
   The roadmap is exhausted again, so the next real thing is
   a new roadmap item grounded in this project's purpose,
   proposed by the next run — candidates: streams.
+- ~~Streams (XADD)~~ — done in v0.63.0,
+  Nov 27, 2026: `xadd key [id] field value [field value ...]`
+  appends one entry to the stream at the key and answers with
+  the ID the entry got — Redis XADD. The ID is `*`
+  (auto-generate), an explicit `ms-seq`, or `ms-*` (auto
+  sequence): the auto millisecond is fixed by the leader at log
+  time, so every replica resolves the same ID — a millisecond
+  past the top takes sequence 0, one equal to it or behind it
+  takes the top millisecond with the next sequence — and an
+  explicit ID must be greater than the top, or the xadd fails
+  with `xadd_failed` / `id_not_greater` and writes nothing. A
+  field repeated in one call counts once, at its last value,
+  like an hset. The entries ride in the store as a JSON blob
+  with a marker prefix, like a hash — the entries in ID order
+  plus the top ID — so they survive snapshots and replay exactly
+  like any other value. The outcome is decided at apply time, so
+  a retry with the same session id returns the first attempt's
+  ID instead of appending twice; a plain string value fails with
+  `xadd_failed` / `wrongtype`, and a bad ID, an empty pair list,
+  or more than 1000 fields is a client error that appends
+  nothing. A successful xadd keeps the key's TTL deadline, like
+  an hset, and fires a `set` watch event with the new value.
+  `Session.xadd` / `client.xadd`, and `xadd` on the CLI, plus
+  `{"op": "xadd"}` as a pipeline op. `tests/test_streams.py`
+  proves it: store-level auto IDs in order, explicit and
+  partial IDs, an auto ID after an explicit future ID taking
+  the top millisecond with the next sequence, TTL kept, the new
+  key joining the sorted index, wrongtype leaving the value
+  untouched, bad pairs and IDs raising, and the entries
+  surviving a snapshot load; cluster-level replication to every
+  node, a redirect from a follower, invalid xadds rejected with
+  no log entry, dedup of an xadd retry returning the first
+  attempt's ID and of a failed xadd retry returning the first
+  attempt's failure, the watch event on leader and follower (and
+  nothing on a failed xadd), surviving a snapshot + restart,
+  continuing after a leader change, session read-your-writes,
+  pipelined xadd ops with bad IDs and pairs in position, the
+  module function from a follower, and the CLI end to end.
+  The roadmap is exhausted again, so the next real thing is
+  a new roadmap item grounded in this project's purpose,
+  proposed by the next run — candidates: XREAD / XRANGE / XLEN
+  (reading a stream back), or XTRIM (MAXLEN trimming).

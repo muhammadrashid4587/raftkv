@@ -205,6 +205,147 @@ def geo_distance(lon1: float, lat1: float, lon2: float,
     return 2 * GEO_EARTH_RADIUS_M * math.asin(math.sqrt(a))
 
 
+# Streams (XADD), Redis-style append-only logs. A stream rides in
+# _data as a JSON object with a marker prefix, the same trick the
+# hash and the geo set use — one string in the same keyspace every
+# other value lives in, so snapshots, the sorted index, TTL expiry,
+# and `get` all treat a stream key like any other key — with the
+# prefix so an XADD can tell a stream apart from a plain string
+# and answer WRONGTYPE on the latter instead of appending to it.
+# The JSON is {"last": "ms-seq", "entries": [["ms-seq", {field:
+# value, ...}], ...]}: the entries in ID order, "last" the
+# greatest ID appended, dumped with sorted keys and no spaces, so
+# the encoding is a pure function of the entries and every node
+# applying the same log computes the same bytes. A plain `get` on
+# a stream key returns the encoded blob, not an entry, exactly as
+# it does for a hash key. The honest limit is the growth itself:
+# there is no MAXLEN trimming yet, so a stream grows without
+# bound — every entry stays in the one blob, and the blob rides
+# every snapshot and replay whole — and there is no XREAD /
+# XRANGE / XLEN yet, so the only way to read entries back is the
+# raw blob.
+STREAM_PREFIX = "\x00raftkv-stream\x00"
+
+# Largest number of fields one ``xadd`` may carry. The pairs ride
+# in one log entry and one frame, so an unbounded list would let
+# one entry grow without limit — the same scale as the hset cap,
+# for the same reason.
+XADD_MAX_FIELDS = 1000
+
+# A stream ID is two 64-bit halves, milliseconds and sequence,
+# Redis's shape: each half is an unsigned 64-bit integer, and 0-0
+# is not a valid ID — the first entry in a stream is never 0-0, so
+# an ID of 0-0 is smaller than every real entry.
+STREAM_ID_MAX = 2 ** 64 - 1
+
+
+def parse_stream_id(id_str) -> tuple[int | str, int | None]:
+    """Parse a stream ID: "*" (auto-generate), "ms-*" (auto
+    sequence), or "ms-seq" (explicit) — returning ("*", None) for
+    a fully automatic ID, (ms, None) for "ms-*", and (ms, seq) for
+    an explicit ID. Raises ValueError on any other shape, on a
+    half past 2**64 - 1, or on the 0-0 ID, which is smaller than
+    every real entry. A leading zero is fine — "007-01" parses as
+    (7, 1) — since the parts are integers, not strings."""
+    if not isinstance(id_str, str):
+        raise ValueError("stream id must be a string")
+    if id_str == "*":
+        return "*", None
+    parts = id_str.split("-")
+    if (len(parts) != 2 or not parts[0].isdigit()
+            or (parts[1] != "*" and not parts[1].isdigit())):
+        raise ValueError(
+            "stream id must be \"*\", \"ms-seq\", or \"ms-*\"")
+    ms = int(parts[0])
+    if ms > STREAM_ID_MAX:
+        raise ValueError(
+            "stream id milliseconds must be at most 2**64 - 1")
+    if parts[1] == "*":
+        return ms, None
+    seq = int(parts[1])
+    if seq > STREAM_ID_MAX:
+        raise ValueError(
+            "stream id sequence must be at most 2**64 - 1")
+    if ms == 0 and seq == 0:
+        raise ValueError("stream id must be greater than 0-0")
+    return ms, seq
+
+
+def is_stream(value) -> bool:
+    """Whether ``value`` is a stream blob: a string carrying the
+    marker prefix and a JSON object with "last" and "entries"
+    behind it. A plain string can only pass this by being
+    hand-built to the exact shape — the same class of collision
+    the hash check has — so an XADD trusts the shape."""
+    if not isinstance(value, str) or not value.startswith(STREAM_PREFIX):
+        return False
+    try:
+        data = json.loads(value[len(STREAM_PREFIX):])
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(data, dict) or set(data) != {"last", "entries"}:
+        return False
+    last = data["last"]
+    if last is not None:
+        try:
+            _, last_seq = parse_stream_id(last)
+        except ValueError:
+            return False
+        if last_seq is None:
+            # A stored top ID is always fully explicit — "ms-*"
+            # is a request, never a stored ID.
+            return False
+    entries = data["entries"]
+    return (isinstance(entries, list)
+            and all(isinstance(e, list) and len(e) == 2
+                    and isinstance(e[0], str)
+                    and isinstance(e[1], dict)
+                    and all(isinstance(f, str)
+                            and isinstance(v, str)
+                            for f, v in e[1].items())
+                    for e in entries))
+
+
+def _stream_data(value: str) -> dict:
+    """The {"last": ..., "entries": ...} dict behind a stream blob.
+    Only called on values ``is_stream`` already accepted, so the
+    JSON is a dict with a valid last ID and a list of [id, fields]
+    entries and the parse cannot fail."""
+    return json.loads(value[len(STREAM_PREFIX):])
+
+
+def _stream_value(stream: dict) -> str:
+    """A stream dict as a stored blob: the marker prefix plus the
+    JSON, keys sorted and no spaces, so the same entries always
+    encode to the same bytes on every node."""
+    return STREAM_PREFIX + json.dumps(stream, sort_keys=True,
+                                      separators=(",", ":"))
+
+
+def _next_seq_at(ms: int, seq: int) -> tuple[int, int]:
+    """(ms, seq + 1), rolling into the next millisecond when the
+    sequence would pass 2**64 - 1 — like Redis, which never lets
+    a sequence overflow its half of the ID."""
+    if seq >= STREAM_ID_MAX:
+        return ms + 1, 0
+    return ms, seq + 1
+
+
+def _auto_stream_id(auto_ms: int, last_ms: int | None,
+                    last_seq: int | None) -> tuple[int, int]:
+    """The ID an auto-generated ("*") xadd gets: the leader's
+    millisecond when it is past the stream's last one, else the
+    last millisecond with the next sequence — so the ID is always
+    greater than the last one, however far behind the leader's
+    clock the stream's top has run. A bare 0 millisecond on an
+    empty stream is 0-1, since 0-0 is not a valid ID."""
+    if last_ms is None:
+        return (0, 1) if auto_ms == 0 else (auto_ms, 0)
+    if auto_ms > last_ms:
+        return auto_ms, 0
+    return _next_seq_at(last_ms, last_seq)
+
+
 def _is_integer_string(s: str) -> bool:
     """Whether ``s`` is a Redis-style integer: an optional sign
     followed by digits only. ``int()`` alone is too lenient — it
@@ -1482,6 +1623,139 @@ class KVStore:
             self._data[key] = _geo_value(positions)
             return {"type": "client_response", "status": "ok",
                     "geoadd": added}
+        elif op == "xadd":
+            # Append one entry to a stream, Redis XADD: the entry
+            # is a list of [field, value] pairs, and the reply
+            # carries ``xadd`` — the ID the entry got, "ms-seq".
+            # The ID is "*", an explicit "ms-seq", or "ms-*" (the
+            # sequence auto-generated): the leader fixed the auto
+            # millisecond at log time (command "auto_ms"), so
+            # every replica resolves the same ID — a follower must
+            # never read its own clock here, or two nodes could
+            # append the same entry under different IDs. The
+            # resolution is a pure function of the request and the
+            # stream's last ID: an auto millisecond past the last
+            # one takes sequence 0, one equal to it or behind it
+            # takes the last millisecond with the next sequence —
+            # so an auto ID is always greater than the last ID,
+            # however far behind the leader's clock the stream's
+            # top has run — and "ms-*" takes sequence 0 past the
+            # last millisecond, the next sequence within it, and
+            # fails when its millisecond is behind the last one.
+            # An explicit ID must be greater than the last ID,
+            # like Redis: one equal or smaller fails with
+            # ``xadd_failed`` / ``id_not_greater`` and writes
+            # nothing — but it still committed its entry, so a
+            # retry with the same session id returns the first
+            # attempt's failure instead of appending again. The
+            # outcome is decided here, at this exact point in the
+            # log, like a CAS. A missing key is created as an
+            # empty stream; a key holding a plain string fails
+            # with WRONGTYPE, like an hset — an xadd must not
+            # parse bytes as entries — and writes nothing at all.
+            # A field repeated in one call counts once, at its
+            # last value, like an hset. A successful xadd keeps
+            # the key's deadline, like an hset: it is an append
+            # to the value, not a fresh set, so it must not
+            # resurrect a key that is about to expire. A new key
+            # joins the sorted index, like a set of a new key.
+            # The entries ride in _data as a JSON blob with the
+            # stream marker prefix, so they survive snapshots and
+            # replay exactly like any other value — and the stored
+            # blob is a pure function of the entries, so every
+            # node computes the same bytes. The pairs and the ID
+            # were validated on the leader before the entry was
+            # logged (a non-empty list of at most XADD_MAX_FIELDS
+            # [field, value] string pairs, an ID of "*", "ms-seq",
+            # or "ms-*" with 64-bit halves and never 0-0), so by
+            # apply time they are well-formed — a hand-built log
+            # entry with bad pairs or a bad ID still raises rather
+            # than silently writing nonsense.
+            key = command["key"]
+            pairs = command.get("pairs")
+            if (not isinstance(pairs, list) or not pairs
+                    or len(pairs) > XADD_MAX_FIELDS
+                    or any(not isinstance(p, (list, tuple))
+                           or len(p) != 2
+                           or not isinstance(p[0], str)
+                           or not isinstance(p[1], str)
+                           for p in pairs)):
+                raise ValueError(
+                    "xadd pairs must be a non-empty list of at "
+                    f"most {XADD_MAX_FIELDS} [field, value] string "
+                    "pairs")
+            ms, seq = parse_stream_id(command.get("id", "*"))
+            current = self._data.get(key)
+            if current is not None and not is_stream(current):
+                return {"type": "client_response",
+                        "status": "xadd_failed",
+                        "reason": "wrongtype",
+                        "current": current,
+                        "error": "xadd failed: value of "
+                                 f"{key!r} is not a stream"}
+            stream = (_stream_data(current)
+                      if current is not None
+                      else {"last": None, "entries": []})
+            last = stream["last"]
+            last_ms, last_seq = (parse_stream_id(last)
+                                 if last is not None else (None, None))
+            if ms == "*":
+                auto_ms = command.get("auto_ms")
+                if (not isinstance(auto_ms, int)
+                        or isinstance(auto_ms, bool)
+                        or auto_ms < 0 or auto_ms > STREAM_ID_MAX):
+                    raise ValueError(
+                        "xadd with id \"*\" needs auto_ms, a "
+                        "millisecond from 0 to 2**64 - 1, fixed by "
+                        "the leader at log time")
+                new_ms, new_seq = _auto_stream_id(auto_ms, last_ms,
+                                                  last_seq)
+            elif seq is None:
+                # "ms-*": the sequence is the next one at that
+                # millisecond — 0 past the last millisecond, the
+                # last sequence + 1 within it — and a millisecond
+                # behind the last one fails, like an explicit ID
+                # behind it. On an empty stream 0-* is 0-1, since
+                # 0-0 is not a valid ID.
+                if last_ms is None:
+                    new_ms, new_seq = ((0, 1) if ms == 0
+                                       else (ms, 0))
+                elif ms < last_ms:
+                    return {"type": "client_response",
+                            "status": "xadd_failed",
+                            "reason": "id_not_greater",
+                            "last_id": last,
+                            "error": "xadd failed: the ID specified "
+                                     "in XADD is equal or smaller "
+                                     "than the target stream top "
+                                     "item"}
+                elif ms == last_ms:
+                    new_ms, new_seq = _next_seq_at(ms, last_seq)
+                else:
+                    new_ms, new_seq = ms, 0
+            else:
+                if (last_ms is not None
+                        and (ms, seq) <= (last_ms, last_seq)):
+                    return {"type": "client_response",
+                            "status": "xadd_failed",
+                            "reason": "id_not_greater",
+                            "last_id": last,
+                            "error": "xadd failed: the ID specified "
+                                     "in XADD is equal or smaller "
+                                     "than the target stream top "
+                                     "item"}
+                new_ms, new_seq = ms, seq
+            fields = {}
+            for field, value in pairs:
+                fields[field] = value
+            new_id = f"{new_ms}-{new_seq}"
+            stream["entries"].append([new_id, fields])
+            stream["last"] = new_id
+            if key not in self._data:
+                bisect.insort(self._keys, key)
+            self._data[key] = _stream_value(stream)
+            return {"type": "client_response", "status": "ok",
+                    "xadd": new_id}
         elif op == "setrange":
             # Overwrite part of a string value, Redis SETRANGE:
             # starting at ``offset``, replace as many characters

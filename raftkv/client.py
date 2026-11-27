@@ -132,7 +132,7 @@ class Session:
                     "setrange_failed", "setbit_failed",
                     "bitop_failed",
                     "pfadd_failed", "hset_failed", "hdel_failed",
-                    "geoadd_failed")
+                    "geoadd_failed", "xadd_failed")
                 and resp.get("index") is not None):
             self.last_write_index = int(resp["index"])
             self.last_write_term = int(resp.get("term") or 0)
@@ -824,6 +824,31 @@ class Session:
                             "members": [[lon, lat, member]
                                         for lon, lat, member
                                         in members]})
+
+    def xadd(self, key: str, fields: dict[str, str],
+             id: str = "*") -> dict:
+        """Append one entry to the stream at ``key``, Redis XADD:
+        ``fields`` is a dict of field to value, and ``id`` is "*"
+        (auto-generate, the default), an explicit "ms-seq", or
+        "ms-*" (auto sequence) — the reply carries ``xadd``, the
+        ID the entry got. A missing key is created as an empty
+        stream; at most 1000 fields per call, like an hset batch.
+        The outcome is decided at apply time, at the entry's
+        position in the log, so a retry with the same session id
+        returns the first attempt's ID instead of appending twice,
+        and a successful xadd keeps the key's TTL deadline, like
+        an hset. A plain string value fails with ``xadd_failed``
+        and reason ``wrongtype`` instead of writing, and an
+        explicit ID equal to or smaller than the stream's top
+        fails with reason ``id_not_greater``. A successful xadd
+        advances the write watermark from the reply's index, like
+        any other write — and so does a failed one, since it still
+        committed its entry."""
+        return self._write({"type": "client", "op": "xadd",
+                            "key": key,
+                            "pairs": [[f, v]
+                                      for f, v in fields.items()],
+                            "id": id})
 
     def pfadd(self, key: str, *elements: str) -> dict:
         """Add ``elements`` to the HyperLogLog at ``key``, Redis
@@ -1520,6 +1545,9 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
     non-empty list of at most 1000 [lon, lat, member] triples —
     longitude a finite number in -180..180, latitude a finite
     number in -85.05112878..85.05112878, the member a string —
+    ``xadd`` a string key, a non-empty list of at most 1000
+    [field, value] string pairs, and an ID — "*" to auto-generate,
+    "ms-seq" explicit, or "ms-*" for an auto sequence —
     ``hset`` a string key and a
     non-empty list of at most 1000 [field, value] string pairs,
     ``hdel`` a string key and a non-empty list of at most 1000
@@ -1538,14 +1566,14 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
                     "setnx", "getset",
                     "append", "getdel", "getex", "setrange", "setbit",
                     "bitop",
-                    "pfadd", "geoadd", "hset", "hdel", "setex",
+                    "pfadd", "geoadd", "xadd", "hset", "hdel", "setex",
                     "expireat",
                     "pexpireat"):
         return None, {"type": "client_response", "status": "error",
                       "error": "pipeline op must be set, del, cas, "
                                "incr, incrbyfloat, setnx, getset, append, "
                                "getdel, getex, setrange, setbit, bitop, "
-                               "pfadd, geoadd, hset, hdel, setex, expireat, or "
+                               "pfadd, geoadd, xadd, hset, hdel, setex, expireat, or "
                                "pexpireat"}
     key = op.get("key")
     if not isinstance(key, str):
@@ -1816,6 +1844,54 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
                                    "-85.05112878..85.05112878"}
         msg["members"] = [[float(m[0]), float(m[1]), m[2]]
                           for m in members]
+    if name == "xadd":
+        # ``pairs`` and ``id`` ride along with a pipelined xadd,
+        # validated here so a malformed one never goes on the
+        # wire: a non-empty list of at most 1000 [field, value]
+        # string pairs, and an ID of "*", "ms-seq", or "ms-*" with
+        # 64-bit halves and never 0-0 — the same shapes the server
+        # enforces (the server also caps it, so a huge list is
+        # still a client error there, not a log entry).
+        pairs = op.get("pairs")
+        if (not isinstance(pairs, list) or not pairs
+                or len(pairs) > 1000
+                or any(not isinstance(p, (list, tuple))
+                       or len(p) != 2
+                       or not isinstance(p[0], str)
+                       or not isinstance(p[1], str)
+                       for p in pairs)):
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline xadd pairs must be a "
+                                   "list of 1 to 1000 [field, value] "
+                                   "string pairs"}
+        msg["pairs"] = [[f, v] for f, v in pairs]
+        id_str = op.get("id", "*")
+        if not isinstance(id_str, str):
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline xadd id must be a string"}
+        if id_str != "*":
+            parts = id_str.split("-")
+            if (len(parts) != 2 or not parts[0].isdigit()
+                    or (parts[1] != "*"
+                        and not parts[1].isdigit())):
+                return None, {"type": "client_response",
+                              "status": "error",
+                              "error": "pipeline xadd id must be "
+                                       "\"*\", \"ms-seq\", or \"ms-*\""}
+            if (int(parts[0]) > 2 ** 64 - 1
+                    or (parts[1] != "*"
+                        and int(parts[1]) > 2 ** 64 - 1)):
+                return None, {"type": "client_response",
+                              "status": "error",
+                              "error": "pipeline xadd id halves must "
+                                       "be at most 2**64 - 1"}
+            if (parts[1] != "*" and int(parts[0]) == 0
+                    and int(parts[1]) == 0):
+                return None, {"type": "client_response",
+                              "status": "error",
+                              "error": "pipeline xadd id must be "
+                                       "greater than 0-0"}
+        msg["id"] = id_str
     if name == "hset":
         # ``pairs`` rides along with a pipelined hset, validated
         # here so a malformed one never goes on the wire: a
@@ -2466,6 +2542,29 @@ def geoadd(node_addr: tuple[str, int], key: str,
                                "members": [[lon, lat, member]
                                            for lon, lat, member
                                            in members]},
+                   timeout=timeout)
+
+
+def xadd(node_addr: tuple[str, int], key: str,
+         fields: dict[str, str], id: str = "*",
+         timeout: float = 12.0) -> dict:
+    """Append one entry to the stream at ``key``, following leader
+    redirects like ``request`` — Redis XADD.
+
+    One request appends the entry, so the ID it returns is decided
+    at the entry's position in the log: the reply is the plain
+    xadd response (``status`` ``ok`` with ``xadd`` — the ID the
+    entry got — or ``xadd_failed`` with reason ``wrongtype`` when
+    the current value is a plain string, or ``id_not_greater``
+    when an explicit ID is equal to or smaller than the stream's
+    top item). A missing key is created as an empty stream; at
+    most 1000 fields per call. A successful xadd keeps the key's
+    TTL deadline, like an hset."""
+    return request(node_addr, {"type": "client", "op": "xadd",
+                               "key": key,
+                               "pairs": [[f, v]
+                                         for f, v in fields.items()],
+                               "id": id},
                    timeout=timeout)
 
 
@@ -3387,6 +3486,26 @@ def main(argv: list[str] | None = None) -> int:
     p_geodist.add_argument("--unit", default="m",
                            choices=("m", "km", "mi", "ft"),
                            help="the unit to measure in (default m)")
+    p_xadd = sub.add_parser(
+        "xadd",
+        help="append an entry to the stream at key and print the "
+             "ID the entry got; a missing key is created as an "
+             "empty stream")
+    p_xadd.add_argument("key")
+    p_xadd.add_argument("id",
+                        help="the entry ID: \"*\" to auto-generate, "
+                             "\"ms-seq\" for an explicit ID, or "
+                             "\"ms-*\" for an auto sequence")
+    p_xadd.add_argument("pairs", nargs="+",
+                        help="field value pairs: f1 v1 f2 v2 ... "
+                             "(at most 1000 pairs)")
+    p_xadd.add_argument("--client-id", default=None,
+                        help="session id for at-most-once writes: a retry "
+                             "with the same client id + request id returns "
+                             "the first attempt's result instead of writing "
+                             "twice")
+    p_xadd.add_argument("--request-id", default=None,
+                        help="id of this write within the client session")
     p_pfadd = sub.add_parser(
         "pfadd",
         help="add elements to the HyperLogLog at key and print 1 "
@@ -3597,6 +3716,7 @@ def main(argv: list[str] | None = None) -> int:
               "pfadd", "pfcount", "hset", "hget", "hdel", "hgetall",
               "hlen", "hexists", "hkeys", "hvals", "hmget", "hscan",
               "geoadd", "geodist",
+              "xadd",
               "setex", "expireat",
               "pexpireat"):
         msg["key"] = args.key
@@ -3714,6 +3834,13 @@ def main(argv: list[str] | None = None) -> int:
         msg["member1"] = args.member1
         msg["member2"] = args.member2
         msg["unit"] = args.unit
+    if op == "xadd":
+        if len(args.pairs) % 2:
+            parser.error("xadd takes alternating fields and values: "
+                         "f1 v1 f2 v2 ...")
+        msg["id"] = args.id
+        msg["pairs"] = [[args.pairs[i], args.pairs[i + 1]]
+                        for i in range(0, len(args.pairs), 2)]
     if op == "pfadd":
         msg["elements"] = args.elements
     if op == "hset":
@@ -3741,7 +3868,7 @@ def main(argv: list[str] | None = None) -> int:
               "setbit", "bitop", "pfadd", "geoadd", "hset", "hdel",
               "setex",
               "expireat",
-              "pexpireat") \
+              "pexpireat", "xadd") \
             and args.request_id:
         # A request id without an explicit client id still dedups
         # within the default "cli" session; the same id retried from
@@ -3812,6 +3939,8 @@ def main(argv: list[str] | None = None) -> int:
             print(resp.get("bitop"))
         elif op == "geoadd":
             print(resp.get("geoadd"))
+        elif op == "xadd":
+            print(resp.get("xadd"))
         elif op == "geodist":
             dist = resp.get("distance")
             print(dist if dist is not None else "(nil)")

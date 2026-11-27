@@ -189,6 +189,19 @@ GEO_LON_MIN = -180.0
 GEO_LON_MAX = 180.0
 GEO_LAT_MIN = -85.05112878
 GEO_LAT_MAX = 85.05112878
+# Largest number of fields one ``xadd`` may carry. The pairs ride
+# in one log entry and one frame, so an unbounded list would let
+# one entry grow without limit (and replicate that growth to every
+# node). 1,000 fields is far past a real use of one XADD call — a
+# client appending more splits the batch, like an mget client
+# splits a batch past 1000 keys — so it only rejects nonsense,
+# never a real use — the same scale as the hset cap above, for the
+# same reason.
+XADD_MAX_FIELDS = 1000
+# A stream ID is two 64-bit halves, milliseconds and sequence,
+# Redis's shape: each half is an unsigned 64-bit integer, and 0-0
+# is not a valid ID.
+STREAM_ID_MAX = 2 ** 64 - 1
 # Default and largest number of fields one ``hscan`` call
 # examines. The count is a hint, like Redis's COUNT — a page
 # examines at most that many fields, matching or not — so the
@@ -1477,7 +1490,7 @@ class RaftNode:
                 # The apply result matters for set, CAS, expire,
                 # expireat, pexpireat, incr, incrbyfloat, setnx,
                 # getset, append, getdel, setrange, getex, setbit,
-                # bitop, pfadd, hset, hdel, and geoadd:
+                # bitop, pfadd, hset, hdel, geoadd, and xadd:
                 # their outcome is decided here, at this exact point
                 # in the log, so the result is recorded in the dedup
                 # table
@@ -1699,12 +1712,22 @@ class RaftNode:
                                       self.sm.get(entry["command"]["key"]),
                                       "set",
                                       index=self.last_applied)
+                elif (op == "xadd" and result is not None
+                        and result.get("status") == "ok"):
+                    # A successful xadd fires like a set, with the
+                    # new (stream blob) value: a failed xadd wrote
+                    # nothing, so it fires nothing, like a failed
+                    # geoadd.
+                    self.watch.notify(entry["command"]["key"],
+                                      self.sm.get(entry["command"]["key"]),
+                                      "set",
+                                      index=self.last_applied)
                 if (op in ("set", "cas", "expire", "expireat",
                            "pexpireat",
                            "incr", "incrbyfloat", "setnx", "getset",
                            "append", "getdel", "setrange", "getex",
                            "setbit", "bitop", "pfadd", "hset", "hdel",
-                           "geoadd")
+                           "geoadd", "xadd")
                         and result is not None
                         and self.role == "leader"):
                     # Record the outcome only when a local waiter is
@@ -1759,7 +1782,7 @@ class RaftNode:
         for CAS, expire, expireat,
         pexpireat, incr, incrbyfloat, setnx,
         getset, append, getdel, setrange, getex, setbit, bitop,
-        pfadd, hset, hdel, and geoadd
+        pfadd, hset, hdel, geoadd, and xadd
         it is the
         apply-time outcome (success, mismatch, or missing key for a
         CAS; 1 or 0 for an expire; 1 or 0 for an expireat /
@@ -1775,7 +1798,8 @@ class RaftNode:
         the estimate, or wrongtype for a pfadd; the count of
         newly added fields, or wrongtype for an hset; the count
         of removed fields, or wrongtype for an hdel; the count of
-        newly added members, or wrongtype for a geoadd), so a
+        newly added members, or wrongtype for a geoadd; the entry
+        ID, or wrongtype / id_not_greater for an xadd), so a
         retry returns the first
         attempt's exact result. The result also carries the log
         index and term of the entry that produced it: a retried write
@@ -2475,6 +2499,7 @@ class RaftNode:
                       "hlen", "hexists", "hkeys", "hvals", "hmget",
                       "hscan",
                       "geoadd", "geodist",
+                      "xadd",
                       "setex") \
                 or key is None:
             return {"type": "client_response", "status": "error",
@@ -2487,6 +2512,7 @@ class RaftNode:
                              "pfadd/pfcount/hset/hget/hdel/hgetall/"
                              "hlen/hexists/hkeys/hvals/hmget/hscan/"
                              "geoadd/geodist/"
+                             "xadd/"
                              "setex "
                              "with a key"}
         if self._is_removed():
@@ -3134,6 +3160,65 @@ class RaftNode:
                                  "-85.05112878..85.05112878"}
             command["members"] = [[float(m[0]), float(m[1]), m[2]]
                                   for m in members]
+        if op == "xadd":
+            # Append one entry to a stream, Redis XADD: the pairs
+            # must be a non-empty list of at most XADD_MAX_FIELDS
+            # [field, value] string pairs — an empty list names
+            # nothing to append, and a longer one would ride in
+            # one frame and one log entry without bound — and the
+            # ID must be "*" (auto-generate), "ms-seq" (explicit),
+            # or "ms-*" (auto sequence), with 64-bit halves and
+            # never 0-0, so a malformed ID is a client error, not
+            # a log entry. Whether the key holds a stream (and
+            # whether an explicit ID beats the top one) is decided
+            # at apply time, like a CAS, not here. An auto ID's
+            # millisecond is fixed here, on the leader, before the
+            # command is ever logged — time.time() * 1000, stored
+            # in the command itself, so every replica resolves the
+            # same ID and a replay or a snapshot restores it
+            # exactly: fixing it at log time (rather than at apply
+            # time, when followers would each read their own
+            # clock) is what keeps the ID identical across nodes,
+            # the same fix-at-log-time as a ``setex`` deadline.
+            pairs = msg.get("pairs")
+            if (not isinstance(pairs, list) or not pairs
+                    or len(pairs) > XADD_MAX_FIELDS
+                    or any(not isinstance(p, (list, tuple))
+                           or len(p) != 2
+                           or not isinstance(p[0], str)
+                           or not isinstance(p[1], str)
+                           for p in pairs)):
+                return {"type": "client_response", "status": "error",
+                        "error": "xadd pairs must be a list of 1 to "
+                                 f"{XADD_MAX_FIELDS} [field, value] "
+                                 "string pairs"}
+            command["pairs"] = [[f, v] for f, v in pairs]
+            id_str = msg.get("id", "*")
+            if not isinstance(id_str, str):
+                return {"type": "client_response", "status": "error",
+                        "error": "xadd id must be a string"}
+            if id_str == "*":
+                command["id"] = "*"
+                command["auto_ms"] = int(time.time() * 1000)
+            else:
+                parts = id_str.split("-")
+                if (len(parts) != 2 or not parts[0].isdigit()
+                        or (parts[1] != "*"
+                            and not parts[1].isdigit())):
+                    return {"type": "client_response", "status": "error",
+                            "error": "xadd id must be \"*\", \"ms-seq\", "
+                                     "or \"ms-*\""}
+                ms = int(parts[0])
+                seq = parts[1]
+                if (ms > STREAM_ID_MAX
+                        or (seq != "*" and int(seq) > STREAM_ID_MAX)):
+                    return {"type": "client_response", "status": "error",
+                            "error": "xadd id halves must be at most "
+                                     "2**64 - 1"}
+                if seq != "*" and ms == 0 and int(seq) == 0:
+                    return {"type": "client_response", "status": "error",
+                            "error": "xadd id must be greater than 0-0"}
+                command["id"] = id_str
         if op == "setex":
             # Set a key with a wall-clock TTL, Redis SETEX: the
             # value is required, like a set's — a setex with no
