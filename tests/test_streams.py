@@ -21,7 +21,9 @@ an ID — and the top ID never moves when entries are trimmed, so
 an xadd after a trim still refuses an ID at or below the old top.
 XDEL (v0.80.0) deletes named entries — the count it returns, the
 empty stream it leaves behind with its top ID remembered, and the
-pending entries it drops from every group.
+pending entries it drops from every group. XREVRANGE (v0.81.0)
+reads a stream's entries back newest-first — the same range as
+XRANGE, in reverse ID order, with COUNT taken from the newest end.
 There is no XREADGROUP yet, so the only way to read entries back
 is XRANGE / XLEN / XREAD. These spin up
 real nodes (real TCP, real threads, real disk) on localhost, like
@@ -43,6 +45,7 @@ from raftkv.client import xdel as client_xdel
 from raftkv.client import xlen as client_xlen
 from raftkv.client import xrange as client_xrange
 from raftkv.client import xread as client_xread
+from raftkv.client import xrevrange as client_xrevrange
 from raftkv.client import xtrim as client_xtrim
 from raftkv.store import KVStore, STREAM_PREFIX, is_stream
 
@@ -68,6 +71,14 @@ def xlen(addr, key="events"):
 def xrange(addr, key="events", start="-", end="+", count=None):
     msg = {"type": "client", "op": "xrange", "key": key,
            "start": start, "end": end}
+    if count is not None:
+        msg["count"] = count
+    return client_request(addr, msg)
+
+
+def xrevrange(addr, key="events", end="+", start="-", count=None):
+    msg = {"type": "client", "op": "xrevrange", "key": key,
+           "end": end, "start": start}
     if count is not None:
         msg["count"] = count
     return client_request(addr, msg)
@@ -2314,6 +2325,235 @@ class TestXdel(unittest.TestCase):
                                   "bogus"])
             self.assertEqual(rc, 1)
             self.assertIn("ids", err.getvalue())
+        finally:
+            cluster.stop_all()
+
+
+class TestXrevrange(unittest.TestCase):
+    def _four(self):
+        """A stream with four entries, 100-5, 100-6, 101-0, 102-3."""
+        store = KVStore()
+        for entry_id in ("100-5", "100-6", "101-0", "102-3"):
+            store.apply({"op": "xadd", "key": "s",
+                         "pairs": [["a", entry_id]], "id": entry_id})
+        return store
+
+    def test_xrevrange_full_range_is_xrange_reversed(self):
+        """XREVRANGE with "+" / "-" returns every entry in
+        reverse ID order — exactly XRANGE's answer, reversed —
+        and a missing key answers an empty list."""
+        store = KVStore()
+        self.assertEqual(store.xrevrange("s", "+", "-"), [])
+        store = self._four()
+        self.assertEqual(store.xrevrange("s", "+", "-"),
+                         [["102-3", {"a": "102-3"}],
+                          ["101-0", {"a": "101-0"}],
+                          ["100-6", {"a": "100-6"}],
+                          ["100-5", {"a": "100-5"}]])
+        self.assertEqual(store.xrevrange("s", "+", "-"),
+                         list(reversed(store.xrange("s", "-", "+"))))
+
+    def test_xrevrange_partial_ranges(self):
+        """Explicit bounds cut the range, a bare millisecond
+        names that millisecond with sequence 0, and an end
+        below the start answers an empty list rather than an
+        error."""
+        store = self._four()
+        self.assertEqual(store.xrevrange("s", "101-0", "100-6"),
+                         [["101-0", {"a": "101-0"}],
+                          ["100-6", {"a": "100-6"}]])
+        # A bare millisecond is that millisecond, sequence 0.
+        self.assertEqual(store.xrevrange("s", "101", "101"),
+                         [["101-0", {"a": "101-0"}]])
+        self.assertEqual(store.xrevrange("s", "100-6", "100"),
+                         [["100-6", {"a": "100-6"}],
+                          ["100-5", {"a": "100-5"}]])
+        # "+" names the end and 0-0 the very start.
+        self.assertEqual(
+            [e[0] for e in store.xrevrange("s", "+", "0-0")],
+            ["102-3", "101-0", "100-6", "100-5"])
+        # An end below the start is empty, not an error.
+        self.assertEqual(store.xrevrange("s", "100-5", "102-3"), [])
+        self.assertEqual(store.xrevrange("s", "200", "+"), [])
+
+    def test_xrevrange_count_caps_from_newest_and_zero_is_empty(self):
+        """COUNT caps how many entries one call returns, taken
+        from the newest end — and COUNT 0 answers an empty
+        list."""
+        store = self._four()
+        self.assertEqual(store.xrevrange("s", "+", "-", count=2),
+                         [["102-3", {"a": "102-3"}],
+                          ["101-0", {"a": "101-0"}]])
+        self.assertEqual(store.xrevrange("s", "+", "-", count=0), [])
+        self.assertEqual(store.xrevrange("s", "+", "-", count=99),
+                         [["102-3", {"a": "102-3"}],
+                          ["101-0", {"a": "101-0"}],
+                          ["100-6", {"a": "100-6"}],
+                          ["100-5", {"a": "100-5"}]])
+        # A count past the range start stops at the range start.
+        self.assertEqual(store.xrevrange("s", "101-0", "-",
+                                         count=99),
+                         [["101-0", {"a": "101-0"}],
+                          ["100-6", {"a": "100-6"}],
+                          ["100-5", {"a": "100-5"}]])
+
+    def test_xrevrange_wrongtype_leaves_value_untouched(self):
+        """A plain string value fails an xrevrange with
+        TypeError and leaves the value untouched."""
+        store = KVStore()
+        store.apply({"op": "set", "key": "k", "value": "x"})
+        with self.assertRaises(TypeError):
+            store.xrevrange("k", "+", "-")
+        self.assertEqual(store.get("k"), "x")
+
+    def test_xrevrange_bad_bounds_and_count_raise(self):
+        """A bad bound or count raises ValueError — even on a
+        missing key, since the bounds are parsed before the key
+        is looked up."""
+        store = KVStore()
+        bad_bounds = ["bogus", "1-2-3", "", "5-",
+                      "18446744073709551616-0",
+                      "5-18446744073709551616",
+                      "18446744073709551616",
+                      5, None]
+        for bad in bad_bounds:
+            with self.assertRaises(ValueError, msg=str(bad)):
+                store.xrevrange("s", bad, "-")
+            with self.assertRaises(ValueError, msg=str(bad)):
+                store.xrevrange("s", "+", bad)
+        for bad_count in (-1, True, "2", 1.5):
+            with self.assertRaises(ValueError, msg=str(bad_count)):
+                store.xrevrange("s", "+", "-", count=bad_count)
+
+    def test_xrevrange_cluster(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            for entry_id in ("100-5", "100-6", "101-0"):
+                resp = xadd(addr, pairs=(("a", entry_id),),
+                            id=entry_id)
+                self.assertEqual(resp.get("status"), "ok", resp)
+            # XREVRANGE reads them back newest-first — including
+            # from a follower, which redirects to the leader.
+            for node_id in cluster.live:
+                resp = xrevrange(cluster.addrs[node_id])
+                self.assertEqual(resp.get("status"), "ok", resp)
+                self.assertEqual(resp.get("entries"),
+                                 [["101-0", {"a": "101-0"}],
+                                  ["100-6", {"a": "100-6"}],
+                                  ["100-5", {"a": "100-5"}]])
+            # A partial range and a COUNT cap from the newest
+            # end, from a follower.
+            follower = next(n for n in cluster.live
+                            if n != leader.id)
+            resp = xrevrange(cluster.addrs[follower], end="100-6",
+                             start="-")
+            self.assertEqual(resp.get("entries"),
+                             [["100-6", {"a": "100-6"}],
+                              ["100-5", {"a": "100-5"}]])
+            resp = xrevrange(cluster.addrs[follower], count=2)
+            self.assertEqual([e[0] for e in resp.get("entries")],
+                             ["101-0", "100-6"])
+            # A missing key answers an empty list.
+            self.assertEqual(xrevrange(addr, key="nope")
+                             .get("entries"), [])
+            # The module function follows redirects too.
+            resp = client_xrevrange(cluster.addrs[follower],
+                                    "events", end="100-6", start="-",
+                                    count=1)
+            self.assertEqual(resp.get("entries"),
+                             [["100-6", {"a": "100-6"}]], resp)
+            # A plain string value is a client error, not a
+            # list, and bad bounds and counts are client errors
+            # too — and reads append no log entries, bad or not.
+            self.assertEqual(write(addr, key="plain",
+                                   value="v").get("status"), "ok")
+            before = len(leader.log)
+            resp = xrevrange(addr, key="plain")
+            self.assertEqual(resp.get("status"), "error", resp)
+            self.assertIn("stream", resp.get("error", ""), resp)
+            resp = xrevrange(addr, end="bogus")
+            self.assertEqual(resp.get("status"), "error", resp)
+            resp = client_request(
+                addr, {"type": "client", "op": "xrevrange",
+                       "key": "s", "end": "+", "start": "-",
+                       "count": -1})
+            self.assertEqual(resp.get("status"), "error", resp)
+            self.assertEqual(len(leader.log), before)
+            # A session read sees its own xadd's entry, newest
+            # first, and a session read from a follower still
+            # sees it.
+            with Session(addr) as session:
+                resp = session.xadd("events", {"type": "login"},
+                                    id="102-3")
+                self.assertEqual(resp.get("status"), "ok", resp)
+                resp = session.xrevrange("events")
+                self.assertEqual(resp.get("status"), "ok", resp)
+                self.assertEqual([e[0] for e in
+                                  resp.get("entries")],
+                                 ["102-3", "101-0", "100-6",
+                                  "100-5"], resp)
+                with Session(cluster.addrs[follower],
+                             client_id=session.client_id) as other:
+                    other.last_write_index = session.last_write_index
+                    other.last_write_term = session.last_write_term
+                    resp = other.xrevrange("events", end="101-0",
+                                           start="100-6")
+                    self.assertEqual(resp.get("entries"),
+                                     [["101-0", {"a": "101-0"}],
+                                      ["100-6", {"a": "100-6"}]],
+                                     resp)
+        finally:
+            cluster.stop_all()
+
+    def test_xrevrange_cli(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            host, port = cluster.addrs[leader.id]
+            node = f"{host}:{port}"
+            for entry_id in ("100-5", "100-6"):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    rc = client_main(["--node", node, "xadd", "events",
+                                      entry_id, "a", entry_id])
+                self.assertEqual(rc, 0)
+            # XREVRANGE prints the entries as JSON, newest
+            # first.
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "xrevrange",
+                                  "events", "+", "-"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(out.getvalue()),
+                             [["100-6", {"a": "100-6"}],
+                              ["100-5", {"a": "100-5"}]])
+            # A range with COUNT prints just the newest page.
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "xrevrange",
+                                  "events", "+", "-", "--count", "1"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(out.getvalue()),
+                             [["100-6", {"a": "100-6"}]])
+            # XREVRANGE on a missing key prints [].
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "xrevrange",
+                                  "nope", "+", "-"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(out.getvalue()), [])
+            # A bad bound fails: rc 1, and the error names the
+            # problem.
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = client_main(["--node", node, "xrevrange",
+                                  "events", "bogus", "-"])
+            self.assertEqual(rc, 1)
+            self.assertIn("bound", err.getvalue())
         finally:
             cluster.stop_all()
 

@@ -2946,6 +2946,7 @@ class RaftNode:
                       "hscan",
                       "geoadd", "geodist",
                       "xadd", "xtrim", "xdel", "xlen", "xrange",
+                      "xrevrange",
                       "xgroup_create", "xreadgroup",
                       "xreadgroup_multi", "xack",
                       "xclaim", "xautoclaim",
@@ -2966,7 +2967,7 @@ class RaftNode:
                              "pfadd/pfcount/hset/hget/hdel/hgetall/"
                              "hlen/hexists/hkeys/hvals/hmget/hscan/"
                              "geoadd/geodist/"
-                             "xadd/xtrim/xdel/xlen/xrange/"
+                             "xadd/xtrim/xdel/xlen/xrange/xrevrange/"
                              "xgroup_create/xreadgroup/"
                              "xreadgroup_multi/xack/"
                              "xclaim/xautoclaim/"
@@ -3447,6 +3448,54 @@ class RaftNode:
                                     xrange_start=start,
                                     xrange_end=end,
                                     xrange_count=count,
+                                    min_index=min_index,
+                                    session_term=session_term,
+                                    stale_ok=bool(msg.get("stale_ok")))
+        if op == "xrevrange":
+            # The entries in a stream in an ID range, newest
+            # first: the [id, {field: value}] pairs whose IDs fall
+            # in [start, end], in reverse ID order — Redis
+            # XREVRANGE. The message names the range the way
+            # Redis spells it: ``end`` first, then ``start``. It
+            # rides the same ReadIndex/lease path as a ``get`` —
+            # one leadership confirmation, one apply wait — so
+            # the entries reflect the committed state as of the
+            # read index it names, exactly as linearizable, and a
+            # session read carries the same watermark a get
+            # would. A string key is a client error, not a list:
+            # the payload carries its own "status": "error" (see
+            # _serve_read), like xrange's wrongtype. The bounds
+            # must be strings — "-", "+", a bare millisecond,
+            # or "ms-seq" — and the count, when one is given, a
+            # non-negative integer (a bool is not one): a bad
+            # bound or count is a client error, not a list of
+            # nonsense, and the store parses the bounds itself,
+            # so a malformed bound is an error there too. The
+            # count caps how many entries one call returns, like
+            # Redis's COUNT — 0 answers an empty list, and no
+            # count means no cap — taken from the newest end.
+            end = msg.get("end", "+")
+            start = msg.get("start", "-")
+            if not isinstance(end, str):
+                return {"type": "client_response", "status": "error",
+                        "error": "xrevrange end must be a string"}
+            if not isinstance(start, str):
+                return {"type": "client_response", "status": "error",
+                        "error": "xrevrange start must be a string"}
+            count = msg.get("count")
+            if count is not None and (
+                    not isinstance(count, int)
+                    or isinstance(count, bool) or count < 0):
+                return {"type": "client_response", "status": "error",
+                        "error": "xrevrange count must be a "
+                                 "non-negative integer"}
+            min_index, session_term, error = self._parse_read_params(msg)
+            if error is not None:
+                return error
+            return self._serve_read(xrevrange_key=key,
+                                    xrevrange_end=end,
+                                    xrevrange_start=start,
+                                    xrevrange_count=count,
                                     min_index=min_index,
                                     session_term=session_term,
                                     stale_ok=bool(msg.get("stale_ok")))
@@ -5618,6 +5667,10 @@ class RaftNode:
                     xrange_start: str = "-",
                     xrange_end: str = "+",
                     xrange_count: int | None = None,
+                    xrevrange_key: str | None = None,
+                    xrevrange_end: str = "+",
+                    xrevrange_start: str = "-",
+                    xrevrange_count: int | None = None,
                     xread_keys: list[str] | None = None,
                     xread_ids: list[str] | None = None,
                     xread_count: int | None = None,
@@ -5755,6 +5808,16 @@ class RaftNode:
         a plain string value is a client error, not a list, and
         a bad bound or count is one too. The reply carries
         ``entries``, the pairs in ID order.
+        ``xrevrange_key`` serves the same entries newest first
+        instead — the [id, {field: value}] pairs whose IDs fall
+        in [``xrevrange_start``, ``xrevrange_end``], in reverse
+        ID order, at most ``xrevrange_count`` of them when a
+        count is given, taken from the newest end, Redis
+        XREVRANGE — read off the applied state machine the same
+        way, so it is exactly as linearizable as a ``get``; a
+        plain string value is a client error, not a list, and a
+        bad bound or count is one too. The reply carries
+        ``entries``, the pairs in reverse ID order.
         ``xread_keys`` serves new stream entries instead — the
         [key, [[id, {field: value}], ...]] pairs for every stream
         in ``xread_keys`` that holds an entry after the matching
@@ -6150,6 +6213,22 @@ class RaftNode:
                     return {"entries": self.sm.xrange(
                         xrange_key, xrange_start, xrange_end,
                         xrange_count)}
+                except (TypeError, ValueError) as e:
+                    return {"status": "error", "error": str(e)}
+            if xrevrange_key is not None:
+                # The entries in a stream in an ID range, newest
+                # first: the [id, {field: value}] pairs whose IDs
+                # fall in [start, end], in reverse ID order —
+                # Redis XREVRANGE — with the same wrongtype rule
+                # as xrange: a plain string value is a client
+                # error, not a list, carried the same way,
+                # overriding the "ok" in the response literal. A
+                # bad bound or count is the same kind of error,
+                # from the store's own validation.
+                try:
+                    return {"entries": self.sm.xrevrange(
+                        xrevrange_key, xrevrange_end,
+                        xrevrange_start, xrevrange_count)}
                 except (TypeError, ValueError) as e:
                     return {"status": "error", "error": str(e)}
             if xread_keys is not None:

@@ -945,6 +945,66 @@ class Session:
                 self.last_read_term = int(resp.get("read_term") or 0)
         return resp
 
+    def xrevrange(self, key: str, end: str = "+",
+                  start: str = "-",
+                  count: int | None = None) -> dict:
+        """Ask for the entries in the stream at ``key`` whose IDs
+        fall in [``start``, ``end``], in reverse ID order — Redis
+        XREVRANGE: the arguments name the range the way Redis
+        spells them, ``end`` first, then ``start`` — so the usual
+        whole-stream call is ``xrevrange(k)`` or
+        ``xrevrange(k, "+", "-")``, the mirror of ``xrange(k,
+        "-", "+")``. ``end`` and ``start`` are "-", "+", a bare
+        millisecond (that millisecond, sequence 0), or a full
+        "ms-seq", and ``count`` caps how many entries one call
+        returns, like Redis's COUNT — None means no cap, 0
+        answers an empty list — taken from the newest end. The
+        reply carries ``entries`` — the [id, {field: value}]
+        pairs in reverse ID order — an empty list when the key
+        does not exist or no entry falls in the range, and a
+        client error — not a list — when the key holds a plain
+        string. A bad bound or count never goes on the wire and
+        returns the server's error shape instead. It rides the
+        same ReadIndex path as ``get``, so it carries the same
+        session watermark and advances the read watermark from
+        the reply's ``read_index`` exactly the same way: a range
+        queried after your own xadd shows the entry that xadd
+        appended, and a later read never goes backwards past
+        it."""
+        if not isinstance(end, str):
+            return {"type": "client_response", "status": "error",
+                    "error": "xrevrange end must be a string"}
+        if not isinstance(start, str):
+            return {"type": "client_response", "status": "error",
+                    "error": "xrevrange start must be a string"}
+        if count is not None and (
+                not isinstance(count, int) or isinstance(count, bool)
+                or count < 0):
+            return {"type": "client_response", "status": "error",
+                    "error": "xrevrange count must be a "
+                             "non-negative integer"}
+        if self.last_read_index > self.last_write_index:
+            min_index = self.last_read_index
+            term = self.last_read_term
+        else:
+            min_index = self.last_write_index
+            term = self.last_write_term
+        msg: dict = {"type": "client", "op": "xrevrange", "key": key,
+                     "end": end, "start": start,
+                     "client_id": self.client_id,
+                     "min_commit_index": min_index,
+                     "session_term": term}
+        if count is not None:
+            msg["count"] = count
+        resp = request(self.node_addr, msg, pool=self._pooled)
+        if (resp.get("status") == "ok"
+                and resp.get("read_index") is not None):
+            read_index = int(resp["read_index"])
+            if read_index > self.last_read_index:
+                self.last_read_index = read_index
+                self.last_read_term = int(resp.get("read_term") or 0)
+        return resp
+
     def xread(self, keys: list[str], ids: list[str],
               count: int | None = None,
               block: int | None = None) -> dict:
@@ -4161,6 +4221,49 @@ def xrange(node_addr: tuple[str, int], key: str,
     return request(node_addr, msg, timeout=timeout)
 
 
+def xrevrange(node_addr: tuple[str, int], key: str,
+              end: str = "+", start: str = "-",
+              count: int | None = None,
+              timeout: float = 12.0) -> dict:
+    """Ask for the entries in the stream at ``key`` whose IDs fall
+    in [``start``, ``end``], in reverse ID order, following leader
+    redirects like ``request`` — Redis XREVRANGE.
+
+    One request serves the entries through the leader's ReadIndex
+    path, so they reflect the committed state as of one read index,
+    exactly as linearizable as a ``get``. The reply is the plain
+    xrevrange response (``status`` ``ok`` with ``entries`` — the
+    [id, {field: value}] pairs in reverse ID order, an empty list
+    when the key does not exist or no entry falls in the range —
+    plus the ``read_index`` / ``read_term`` they were measured
+    at). The arguments name the range the way Redis spells them,
+    ``end`` first, then ``start`` — so the usual whole-stream
+    call is ``xrevrange(addr, key)`` or ``xrevrange(addr, key,
+    "+", "-")``, the mirror of ``xrange(addr, key, "-", "+")`` —
+    and ``count`` caps how many entries one call returns, like
+    Redis's COUNT — None means no cap, 0 answers an empty list —
+    taken from the newest end. A plain string value is a client
+    error, not a list, and a bad bound or count never goes on the
+    wire and returns the server's error shape instead."""
+    if not isinstance(end, str):
+        return {"type": "client_response", "status": "error",
+                "error": "xrevrange end must be a string"}
+    if not isinstance(start, str):
+        return {"type": "client_response", "status": "error",
+                "error": "xrevrange start must be a string"}
+    if count is not None and (
+            not isinstance(count, int) or isinstance(count, bool)
+            or count < 0):
+        return {"type": "client_response", "status": "error",
+                "error": "xrevrange count must be a "
+                         "non-negative integer"}
+    msg: dict = {"type": "client", "op": "xrevrange", "key": key,
+                 "end": end, "start": start}
+    if count is not None:
+        msg["count"] = count
+    return request(node_addr, msg, timeout=timeout)
+
+
 def xread(node_addr: tuple[str, int], keys: list[str],
           ids: list[str], count: int | None = None,
           block: int | None = None,
@@ -5947,6 +6050,26 @@ def main(argv: list[str] | None = None) -> int:
     p_xrange.add_argument("--count", type=int, default=None,
                           help="at most this many entries "
                                "(default: no cap)")
+    p_xrevrange = sub.add_parser(
+        "xrevrange",
+        help="print the entries in the stream at key in an ID "
+             "range, newest first, as JSON ([[id, {field: value}], "
+             "...]); end and start are \"-\", \"+\", a bare "
+             "millisecond, or \"ms-seq\" ([] when the key does not "
+             "exist or no entry falls in the range)")
+    p_xrevrange.add_argument("key")
+    p_xrevrange.add_argument("end",
+                             help="the last ID in the range: \"+\" for "
+                                  "the end of the stream, a bare "
+                                  "millisecond, or \"ms-seq\"")
+    p_xrevrange.add_argument("start",
+                             help="the first ID in the range: \"-\" for "
+                                  "the start of the stream, a bare "
+                                  "millisecond, or \"ms-seq\"")
+    p_xrevrange.add_argument("--count", type=int, default=None,
+                             help="at most this many entries, taken "
+                                  "from the newest end "
+                                  "(default: no cap)")
     p_xread = sub.add_parser(
         "xread",
         help="print the entries appended to one or more streams "
@@ -6512,6 +6635,7 @@ def main(argv: list[str] | None = None) -> int:
               "hlen", "hexists", "hkeys", "hvals", "hmget", "hscan",
               "geoadd", "geodist",
               "xadd", "xtrim", "xdel", "xlen", "xrange",
+              "xrevrange",
               "xgroup_create", "xreadgroup", "xack", "xclaim",
               "xautoclaim",
               "xpending",
@@ -6644,6 +6768,11 @@ def main(argv: list[str] | None = None) -> int:
     if op == "xrange":
         msg["start"] = args.start
         msg["end"] = args.end
+        if args.count is not None:
+            msg["count"] = args.count
+    if op == "xrevrange":
+        msg["end"] = args.end
+        msg["start"] = args.start
         if args.count is not None:
             msg["count"] = args.count
     if op == "xread":
@@ -6880,6 +7009,8 @@ def main(argv: list[str] | None = None) -> int:
         elif op == "xlen":
             print(resp.get("xlen"))
         elif op == "xrange":
+            print(json.dumps(resp.get("entries")))
+        elif op == "xrevrange":
             print(json.dumps(resp.get("entries")))
         elif op == "xread":
             print(json.dumps(resp.get("streams")))

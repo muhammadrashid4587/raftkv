@@ -795,6 +795,31 @@ logic and the failure handling, not the key-value API on top.
   is the same growth as xadd: the whole stream is one blob, so
   a range still reads the blob to filter it — there is no index
   over entries.
+- **Streams (XREVRANGE)** — since v0.81.0 `xrevrange key end
+  start [COUNT n]` (`Session.xrevrange(k, end, start, count)`,
+  `client.xrevrange(addr, k, end, start, count)`, `xrevrange key
+  end start [--count n]` on the CLI) answers the entries whose
+  IDs fall in [start, end], in reverse ID order — Redis
+  XREVRANGE — as [id, {field: value}] pairs. The arguments name
+  the range the way Redis spells them, end first, then start —
+  so the usual whole-stream call is `xrevrange key + -`, the
+  mirror of `xrange key - +`. The bounds are the same "-", "+",
+  bare millisecond, and full "ms-seq" as XRANGE; an end below
+  the start answers an empty list rather than an error, like an
+  xrange with a start past the end, and a missing key answers an
+  empty list. COUNT caps how many entries one call returns, like
+  Redis's COUNT — None means no cap, 0 answers an empty list —
+  taken from the newest end, so COUNT 2 answers the two newest
+  entries in the range. It is a pure read through the same
+  ReadIndex path as a `get`, so it is exactly as linearizable
+  and a stale xrevrange is served from a follower lease like a
+  stale `get`; a session read after its own xadd shows the entry
+  that xadd appended, newest first. A plain string value is a
+  client error, not a list, and a bad bound or count is one too.
+  Like xrange it is a read, so it is not a pipeline op. The
+  honest limit is the same growth as xadd: the whole stream is
+  one blob, so a reverse range still reads the blob to filter
+  it — there is no index over entries.
 - **Streams (XREAD)** — since v0.65.0 `xread key id [key id ...]
   [COUNT n] [BLOCK ms]` (`Session.xread(keys, ids, count, block)`,
   `client.xread(addr, keys, ids, count, block)`, `xread k1 0-0 k2
@@ -4761,4 +4786,42 @@ entries left in `log.jsonl` are dropped by their index on reload.
   roadmap item grounded in this project's purpose, proposed by the
   next run — candidate: XREVRANGE, reading a stream's entries
   newest-first, the remaining gap between this store's range reads
+  and Redis's.
+- **Streams (XREVRANGE)** — done in v0.81.0,
+  Nov 27, 2026: `xrevrange key end start [COUNT n]` answers the
+  entries whose IDs fall in [start, end], in reverse ID order, as
+  [id, {field: value}] pairs — Redis XREVRANGE. The arguments name
+  the range the way Redis spells them, end first, then start, so
+  the usual whole-stream call is `xrevrange key + -`, the mirror
+  of `xrange key - +`; the bounds are the same "-", "+", bare
+  millisecond, and full "ms-seq" as XRANGE, an end below the start
+  answers an empty list, and a missing key answers an empty list.
+  COUNT caps how many entries one call returns — None means no cap,
+  0 answers an empty list — taken from the newest end, so COUNT 2
+  answers the two newest entries in the range. It is a pure read
+  through the same ReadIndex path as a `get`, so it is exactly as
+  linearizable and a stale read is served from a follower lease
+  like a stale `get`. A plain string value is a client error, not
+  a list, and a bad bound or count is one too. `Session.xrevrange`,
+  `client.xrevrange`, and `xrevrange` on the CLI; like xrange, it
+  is a read, so it is not a pipeline op.
+  `tests/test_streams.py` (TestXrevrange) proves it: store-level
+  the full range as XRANGE reversed, partial ranges with explicit
+  and bare-millisecond bounds, an end below the start answering
+  empty, COUNT capping from the newest end and 0 answering empty,
+  wrongtype leaving the value untouched, and bad bounds and counts
+  raising; and cluster-level the reverse read from every node with
+  a follower redirect, a partial range and a COUNT cap from a
+  follower, a missing key answering empty, the module function from
+  a follower, wrongtype and bad bounds as client errors with no log
+  entry, session read-your-writes from the leader and a follower,
+  and the CLI end to end.
+  The honest limit is the same growth as xadd: the whole stream is
+  still one blob, so a reverse range still reads the blob to filter
+  it — there is no index over entries.
+  The roadmap is exhausted again, so the next real thing is a new
+  roadmap item grounded in this project's purpose, proposed by the
+  next run — candidate: XPENDING in per-entry form, listing the
+  pending entries themselves with their idle times and delivery
+  counts, the remaining gap between this store's pending summary
   and Redis's.

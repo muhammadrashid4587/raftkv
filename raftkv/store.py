@@ -3776,6 +3776,60 @@ class KVStore:
                 entries.append([entry_id, dict(fields)])
         return entries
 
+    def xrevrange(self, key: str, end: str, start: str,
+                  count: int | None = None) -> list[list]:
+        """The entries in the stream at ``key`` whose IDs fall in
+        [``start``, ``end``], in reverse ID order — Redis
+        XREVRANGE. The arguments name the range the way Redis
+        spells them: ``end`` first, then ``start`` — so the
+        usual whole-stream call is ``xrevrange(key, "+", "-")``,
+        the mirror of ``xrange(key, "-", "+")``. ``end`` and
+        ``start`` are "-", "+", a bare millisecond (that
+        millisecond, sequence 0), or a full "ms-seq"; an end
+        below the start answers an empty list rather than an
+        error, like an xrange with a start past the end. ``count``
+        caps how many entries one call returns, like Redis's
+        COUNT — None means no cap, 0 answers an empty list —
+        and the cap is taken from the newest end, so COUNT 2 on
+        a four-entry stream answers the two newest entries in
+        the range. A missing key answers an empty list. Raises
+        TypeError when the value is a plain string: an XREVRANGE
+        reads a stream, not bytes, so a string key is WRONGTYPE,
+        like an xrange on a plain string. Raises ValueError for
+        a bad bound or count: a bound must be "-", "+", "ms", or
+        "ms-seq" with each half at most 2**64 - 1, and a count
+        must be a non-negative integer (a bool is not one). The
+        bounds are parsed before the key is looked up, so a bad
+        bound is an error even on a missing key, like Redis
+        parsing its arguments first. Pure read: no log entry, no
+        state change. The entries come back as [id, {field:
+        value}] pairs, in reverse ID order — the same shape the
+        stream blob stores them in — and each field map is a
+        fresh copy, so the caller cannot mutate the stored blob's
+        parse."""
+        if count is not None and (
+                not isinstance(count, int) or isinstance(count, bool)
+                or count < 0):
+            raise ValueError(
+                "xrevrange count must be a non-negative integer")
+        end_id = parse_stream_range_bound(end)
+        start_id = parse_stream_range_bound(start)
+        value = self._data.get(key)
+        if value is None:
+            return []
+        if not is_stream(value):
+            raise TypeError(
+                f"xrevrange failed: value of {key!r} is not a stream")
+        entries: list[list] = []
+        for entry_id, fields in _stream_data(value)["entries"]:
+            entry = parse_stream_id(entry_id)
+            if start_id <= entry <= end_id:
+                entries.append([entry_id, dict(fields)])
+        entries.reverse()
+        if count is not None:
+            entries = entries[:count]
+        return entries
+
     def stream_top(self, key: str) -> str | None:
         """The top ID of the stream at ``key`` — None when the key
         does not exist. Raises TypeError when the value is a plain
