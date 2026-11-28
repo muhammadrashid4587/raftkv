@@ -945,8 +945,8 @@ class KVStore:
         "setrange", "getex", "setbit", "bitop", "pfadd", "hset", "hdel",
         "geoadd", "xadd", "xtrim", "xdel", "xgroup_create", "xreadgroup",
         "xreadgroup_multi", "xack",
-        "xclaim", "xautoclaim", "xgroup_setid", "xgroup_destroy", and
-        "xgroup_delconsumer" —
+        "xclaim", "xautoclaim", "xgroup_setid", "xgroup_destroy",
+        "xgroup_delconsumer", and "xgroup_createconsumer" —
         and None for del, whose outcome is always ok. The result is
         what the leader hands back to the waiting client and what the
         dedup table caches for retries, so it must be a pure function
@@ -3457,6 +3457,92 @@ class KVStore:
             if consumer_dropped:
                 result["consumer_dropped"] = 1
             return result
+        elif op == "xgroup_createconsumer":
+            # Create a consumer in a consumer group without handing
+            # it anything, Redis XGROUP CREATECONSUMER: the
+            # consumer joins the group's "consumers" map with the
+            # wall-clock millisecond the leader fixed at log time
+            # (command "seen_ms", like an xadd auto ID) as its
+            # last-seen time — so XINFO CONSUMERS lists it at
+            # once, with pending 0, an idle measured from its
+            # creation, and a lag of None, since it has never been
+            # handed an entry — and the reply carries
+            # ``xgroup_createconsumer`` 1. A consumer that already
+            # exists — in the map, or holding pending entries from
+            # replays of pre-v0.70.0 log entries, which carry no
+            # sighting — answers 0 and writes nothing at all,
+            # like a SETID to the ID the group already holds. A
+            # missing key or a missing group fails with
+            # ``xgroup_createconsumer_failed`` / ``no_group`` —
+            # Redis's NOGROUP — and a key holding a plain string
+            # fails with WRONGTYPE, like an xadd. The outcome is
+            # decided here, at this exact point in the log, like
+            # a CAS, so a retry with the same session id returns
+            # the first attempt's result instead of creating the
+            # consumer twice — a retry after a successful create
+            # answers 0, the consumer already there. A successful
+            # create keeps the key's TTL deadline, like an xadd.
+            # The group and consumer were validated on the leader
+            # before the entry was logged (non-empty strings),
+            # and so was the stamp (a non-negative integer
+            # millisecond) — a hand-built log entry with a bad
+            # name or stamp still raises rather than silently
+            # creating nonsense.
+            key = command["key"]
+            group = command.get("group")
+            consumer = command.get("consumer")
+            if not isinstance(group, str) or not group:
+                raise ValueError(
+                    "xgroup_createconsumer group must be a "
+                    "non-empty string")
+            if not isinstance(consumer, str) or not consumer:
+                raise ValueError(
+                    "xgroup_createconsumer consumer must be a "
+                    "non-empty string")
+            seen_ms = command.get("seen_ms")
+            if (not isinstance(seen_ms, int)
+                    or isinstance(seen_ms, bool) or seen_ms < 0):
+                raise ValueError(
+                    "xgroup_createconsumer seen_ms must be a "
+                    "non-negative integer number of milliseconds")
+            current = self._data.get(key)
+            if current is None:
+                return {"type": "client_response",
+                        "status": "xgroup_createconsumer_failed",
+                        "reason": "no_group",
+                        "error": "xgroup_createconsumer failed: no "
+                                 "such key "
+                                 f"{key!r} or consumer group "
+                                 f"{group!r}"}
+            if not is_stream(current):
+                return {"type": "client_response",
+                        "status": "xgroup_createconsumer_failed",
+                        "reason": "wrongtype",
+                        "current": current,
+                        "error": "xgroup_createconsumer failed: "
+                                 f"value of {key!r} is not a stream"}
+            stream = _stream_data(current)
+            groups = stream.get("groups", {})
+            if group not in groups:
+                return {"type": "client_response",
+                        "status": "xgroup_createconsumer_failed",
+                        "reason": "no_group",
+                        "error": "xgroup_createconsumer failed: no "
+                                 "such key "
+                                 f"{key!r} or consumer group "
+                                 f"{group!r}"}
+            state = groups[group]
+            consumers = state.get("consumers", {})
+            holds_pending = any(
+                info["consumer"] == consumer
+                for info in state["pending"].values())
+            if consumer in consumers or holds_pending:
+                return {"type": "client_response", "status": "ok",
+                        "xgroup_createconsumer": 0}
+            _stamp_consumer_delivery(state, consumer, seen_ms)
+            self._data[key] = _stream_value(stream)
+            return {"type": "client_response", "status": "ok",
+                    "xgroup_createconsumer": 1}
         elif op == "setrange":
             # Overwrite part of a string value, Redis SETRANGE:
             # starting at ``offset``, replace as many characters

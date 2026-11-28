@@ -1504,7 +1504,8 @@ class RaftNode:
                 # xdel, xgroup_create, xreadgroup, xreadgroup_multi,
                 # xack, xclaim,
                 # xautoclaim, xgroup_setid,
-                # xgroup_destroy, and xgroup_delconsumer:
+                # xgroup_destroy, xgroup_delconsumer, and
+                # xgroup_createconsumer:
                 # their outcome is decided here, at this exact point
                 # in the log, so the result is recorded in the dedup
                 # table
@@ -1911,6 +1912,20 @@ class RaftNode:
                                       self.sm.get(entry["command"]["key"]),
                                       "set",
                                       index=self.last_applied)
+                elif (op == "xgroup_createconsumer"
+                        and result is not None
+                        and result.get("status") == "ok"
+                        and result.get("xgroup_createconsumer", 0) > 0):
+                    # A create that added the consumer fires like
+                    # a set, with the new (stream blob) value: a
+                    # create of a consumer that was already there
+                    # changed nothing, so it fires nothing, like
+                    # a failed xadd — and a failed create wrote
+                    # nothing either.
+                    self.watch.notify(entry["command"]["key"],
+                                      self.sm.get(entry["command"]["key"]),
+                                      "set",
+                                      index=self.last_applied)
                 if (op in ("set", "cas", "expire", "expireat",
                            "pexpireat",
                            "incr", "incrbyfloat", "setnx", "getset",
@@ -1921,6 +1936,7 @@ class RaftNode:
                            "xreadgroup", "xreadgroup_multi", "xack",
                            "xgroup_setid",
                            "xgroup_destroy", "xgroup_delconsumer",
+                           "xgroup_createconsumer",
                            "xclaim", "xautoclaim")
                         and result is not None
                         and self.role == "leader"):
@@ -1938,7 +1954,8 @@ class RaftNode:
                     # geoadd, xadd, xtrim, xdel, xgroup_create,
                     # xreadgroup,
                     # xreadgroup_multi, xack,
-                    # xgroup_setid, xgroup_destroy, and xgroup_delconsumer are
+                    # xgroup_setid, xgroup_destroy, xgroup_delconsumer,
+                    # and xgroup_createconsumer are
                     # the ops whose apply returns a result — a del
                     # returns None and has nothing to record.
                     key = _dedup_key(entry["command"])
@@ -2010,7 +2027,8 @@ class RaftNode:
         no_group / wrongtype for an xgroup_setid;
         1 or 0, or no_group / wrongtype for an xgroup_destroy;
         the count of dropped pending entries, or no_group /
-        wrongtype for an xgroup_delconsumer), so a
+        wrongtype for an xgroup_delconsumer; 1 or 0, or no_group /
+        wrongtype for an xgroup_createconsumer), so a
         retry returns the first
         attempt's exact result. The result also carries the log
         index and term of the entry that produced it: a retried write
@@ -2951,7 +2969,7 @@ class RaftNode:
                       "xreadgroup_multi", "xack",
                       "xclaim", "xautoclaim",
                       "xgroup_setid", "xgroup_destroy",
-                      "xgroup_delconsumer",
+                      "xgroup_delconsumer", "xgroup_createconsumer",
                       "setex") \
                 or (key is None and op != "xreadgroup_multi"):
             # A multi-stream readgroup names its streams, not one
@@ -2973,6 +2991,7 @@ class RaftNode:
                              "xclaim/xautoclaim/"
                              "xgroup_setid/xgroup_destroy/"
                              "xgroup_delconsumer/"
+                             "xgroup_createconsumer/"
                              "setex "
                              "with a key"}
         if self._is_removed():
@@ -4456,6 +4475,26 @@ class RaftNode:
                         "error": "xgroup_delconsumer consumer must "
                                  "be a non-empty string"}
             command["consumer"] = consumer
+        if op == "xgroup_createconsumer":
+            # Create a consumer in a consumer group without handing
+            # it anything, Redis XGROUP CREATECONSUMER: the group
+            # and the consumer must both be non-empty strings, so
+            # a malformed name is a client error, not a log entry.
+            # Whether the key or the group exists (and whether the
+            # consumer is already there) is decided at apply time,
+            # like a CAS, not here.
+            group = msg.get("group")
+            if not isinstance(group, str) or not group:
+                return {"type": "client_response", "status": "error",
+                        "error": "xgroup_createconsumer group must "
+                                 "be a non-empty string"}
+            command["group"] = group
+            consumer = msg.get("consumer")
+            if not isinstance(consumer, str) or not consumer:
+                return {"type": "client_response", "status": "error",
+                        "error": "xgroup_createconsumer consumer "
+                                 "must be a non-empty string"}
+            command["consumer"] = consumer
         if op == "setex":
             # Set a key with a wall-clock TTL, Redis SETEX: the
             # value is required, like a set's — a setex with no
@@ -4800,9 +4839,10 @@ class RaftNode:
             if msg.get(field):
                 command[field] = msg[field]
         if op in ("xreadgroup", "xreadgroup_multi", "xclaim",
-                  "xautoclaim"):
+                  "xautoclaim", "xgroup_createconsumer"):
             # The wall-clock millisecond this delivery — or this
-            # claim — is stamped with, fixed here on the leader
+            # claim, or this consumer creation — is stamped with,
+            # fixed here on the leader
             # just before the entry is appended — after any BLOCK
             # wait, so the stamp is the delivery's time, not the
             # time the wait started — and stored in the command
@@ -4816,7 +4856,10 @@ class RaftNode:
             # so the stamp is harmless there. For an xclaim — or
             # an xautoclaim — the same stamp is the now the idle
             # check measures against, so every replica agrees on
-            # which entries were idle enough to take over.
+            # which entries were idle enough to take over. For an
+            # xgroup_createconsumer it is the consumer's creation
+            # time, so every replica agrees on how long the new
+            # consumer has been idle.
             command["seen_ms"] = int(time.time() * 1000)
         timed_out: bool | None = None
         if (op == "xreadgroup" and xreadgroup_block_ms is not None

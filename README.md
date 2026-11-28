@@ -1172,17 +1172,21 @@ logic and the failure handling, not the key-value API on top.
   and the whole stream is still one blob, so a reaper over a
   huge pending list still walks it — just a bounded slice at a
   time.
-- **Streams (XGROUP SETID / DESTROY / DELCONSUMER)** — since
+- **Streams (XGROUP SETID / DESTROY / DELCONSUMER /
+  CREATECONSUMER)** — since
   v0.69.0 `xgroup_setid key group [id] [--entries-read n]`,
-  `xgroup_destroy key group`, and `xgroup_delconsumer key group
-  consumer` (`Session.xgroup_setid(k, group, id, entries_read)`,
-  `Session.xgroup_destroy(k, group)`,
+  `xgroup_destroy key group`, `xgroup_delconsumer key group
+  consumer`, and — since v0.82.0 — `xgroup_createconsumer key
+  group consumer` (`Session.xgroup_setid(k, group, id,
+  entries_read)`, `Session.xgroup_destroy(k, group)`,
   `Session.xgroup_delconsumer(k, group, consumer)`,
+  `Session.xgroup_createconsumer(k, group, consumer)`,
   `client.xgroup_setid(addr, k, group, id, entries_read)`,
   `client.xgroup_destroy(addr, k, group)`,
-  `client.xgroup_delconsumer(addr, k, group, consumer)`, and the
-  same three on the CLI) manage consumer groups — Redis XGROUP
-  SETID / DESTROY / DELCONSUMER. SETID moves a group's
+  `client.xgroup_delconsumer(addr, k, group, consumer)`,
+  `client.xgroup_createconsumer(addr, k, group, consumer)`, and
+  the same four on the CLI) manage consumer groups — Redis XGROUP
+  SETID / DESTROY / DELCONSUMER / CREATECONSUMER. SETID moves a group's
   last-delivered ID — "$" (the stream's top at apply time), "0"
   (from the very first entry), a bare millisecond, or a full
   "ms-seq", even one past the stream's top, so a later ">" read
@@ -1203,21 +1207,28 @@ logic and the failure handling, not the key-value API on top.
   scratch. DELCONSUMER drops one consumer and every entry it held
   pending — the entries themselves stay in the stream, only their
   pending record goes — and answers how many pending entries the
-  consumer held, 0 when it held none or did not exist at all. All
-  three are writes, not reads: the mutation replicates through the
+  consumer held, 0 when it held none or did not exist at all.
+  CREATECONSUMER creates a consumer in a group without handing it
+  anything — so it shows up in XINFO CONSUMERS at once, with
+  pending 0 and an idle measured from its creation — and answers 1
+  when it was created, 0 when it already existed, including a
+  consumer holding pending entries from replays of pre-v0.70.0 log
+  entries, which carry no sighting. All four are writes, not reads: the mutation replicates through the
   log like any other, so every node agrees on the groups, and the
   outcome is decided at apply time, at the entry's exact position
   in the log, like a CAS, so a retry with the same session id
   returns the first attempt's result instead of managing twice —
   a retry after a successful destroy answers 0, the group already
-  gone. A missing key or group fails a setid or a delconsumer
-  with `no_group`, and a plain string value fails all three with
-  `wrongtype`. A setid that moves the read position, a destroy
-  that removes a group, and a delete that drops pending entries
-  each fire a `set` watch event with the new blob value; a no-op
-  one fires nothing. `{"op": "xgroup_setid", ...}`,
-  `{"op": "xgroup_destroy", ...}`, and
-  `{"op": "xgroup_delconsumer", ...}` are pipeline ops too. The
+  gone. A missing key or group fails a setid, a delconsumer, or a
+  createconsumer with `no_group`, and a plain string value fails
+  all four with `wrongtype`. A setid that moves the read position,
+  a destroy that removes a group, a delete that drops pending
+  entries, and a create that adds a consumer each fire a `set`
+  watch event with the new blob value; a no-op one fires nothing.
+  `{"op": "xgroup_setid", ...}`,
+  `{"op": "xgroup_destroy", ...}`,
+  `{"op": "xgroup_delconsumer", ...}`, and
+  `{"op": "xgroup_createconsumer", ...}` are pipeline ops too. The
   honest limits are the same growth as xadd — the whole stream is
   one blob, so a SETID still rewrites the blob whole — and the
   scope: the entries-read count is stored but never reported back
@@ -4824,4 +4835,45 @@ entries left in `log.jsonl` are dropped by their index on reload.
   next run — candidate: XPENDING in per-entry form, listing the
   pending entries themselves with their idle times and delivery
   counts, the remaining gap between this store's pending summary
-  and Redis's.
+  and Redis's.- ~~Streams (XGROUP CREATECONSUMER)~~ — done in v0.82.0,
+  Nov 27, 2026: `xgroup_createconsumer key group consumer`
+  creates a consumer in a consumer group without handing it
+  anything — Redis XGROUP CREATECONSUMER. The consumer joins the
+  group's "consumers" map with the wall-clock millisecond the
+  leader fixed at log time as its last-seen time, so XINFO
+  CONSUMERS lists it at once, with pending 0, an idle measured
+  from its creation, and a lag of None, since it has never been
+  handed an entry — and the reply carries
+  ``xgroup_createconsumer`` 1. A consumer that already exists —
+  in the map, or holding pending entries from replays of
+  pre-v0.70.0 log entries, which carry no sighting — answers 0
+  and writes nothing at all, like a SETID to the ID the group
+  already holds, and fires no watch event. A missing key or group
+  fails with ``xgroup_createconsumer_failed`` / ``no_group``, and
+  a plain string value fails with ``wrongtype``. It is a write, so
+  the mutation replicates through the log like any other, and the
+  outcome is decided at apply time, so a retry with the same
+  session id returns the first attempt's result instead of
+  creating the consumer twice — a retry after a successful create
+  answers 0, the consumer already there. `Session` methods,
+  `client` module functions, and the `xgroup_createconsumer`
+  command on the CLI; it is a pipeline op too.
+  `tests/test_xgroup_manage.py` proves it: store-level the
+  created consumer listed in XINFO CONSUMERS with pending 0, an
+  exact idle from its creation stamp, and a lag of None, a second
+  create answering 0 with a byte-identical blob, a consumer
+  holding pending entries without a sighting answering 0, a
+  create after a DELCONSUMER re-creating the consumer, missing
+  keys and groups, wrongtype, and bad arguments; the created
+  consumer surviving a snapshot load with its stamp; and
+  cluster-level the full flow replicated to every node with the
+  same stamp everywhere, dedup retries creating once, bad
+  arguments as client errors with no log entry, session methods,
+  the module functions from a follower, a pipelined create in
+  position, snapshot + restart survival, watch events for a
+  create — and none for a duplicate — and the CLI end to end.
+  The roadmap is exhausted again, so the next real thing is
+  a new roadmap item grounded in this project's purpose,
+  proposed by the next run — candidate: XGROUP CREATE with
+  ENTRIESREAD, letting a group start with a preset entries-read
+  count instead of only setting it later with SETID.

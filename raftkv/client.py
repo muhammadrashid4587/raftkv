@@ -1744,6 +1744,42 @@ class Session:
                             "key": key, "group": group,
                             "consumer": consumer})
 
+    def xgroup_createconsumer(self, key: str, group: str,
+                              consumer: str) -> dict:
+        """Create a consumer in a consumer group on the stream at
+        ``key`` without handing it anything, Redis XGROUP
+        CREATECONSUMER: the consumer joins the group with no
+        pending entries, and the reply carries
+        ``xgroup_createconsumer`` 1 when it was created, 0 when
+        the consumer already existed. A missing key or group
+        fails with ``xgroup_createconsumer_failed`` and reason
+        ``no_group``, and a plain string value fails with reason
+        ``wrongtype``. A bad group or consumer never goes on the
+        wire and returns the server's error shape instead. The
+        outcome is decided at apply time, at the entry's position
+        in the log, so a retry with the same session id returns
+        the first attempt's result instead of creating the
+        consumer twice — a retry after a successful create
+        answers 0, the consumer already there — and a successful
+        create keeps the key's TTL deadline, like an xadd. A
+        successful create advances the write watermark from the
+        reply's index, like any other write — and so does a
+        failed one, since it still committed its entry. XINFO
+        CONSUMERS lists the new consumer at once, with pending 0
+        and an idle measured from its creation."""
+        if not isinstance(group, str) or not group:
+            return {"type": "client_response", "status": "error",
+                    "error": "xgroup_createconsumer group must be "
+                             "a non-empty string"}
+        if not isinstance(consumer, str) or not consumer:
+            return {"type": "client_response", "status": "error",
+                    "error": "xgroup_createconsumer consumer must "
+                             "be a non-empty string"}
+        return self._write({"type": "client",
+                            "op": "xgroup_createconsumer",
+                            "key": key, "group": group,
+                            "consumer": consumer})
+
     def xpending(self, key: str, group: str) -> dict:
         """Ask for the pending-entries summary for ``group`` on the
         stream at ``key``, Redis XPENDING, summary form: the reply
@@ -2709,7 +2745,8 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
     non-negative integer ``entries_read``, ``xgroup_destroy`` a
     string key and a non-empty string group, ``xgroup_delconsumer``
     a string key, a non-empty string group, and a non-empty string
-    consumer,
+    consumer, ``xgroup_createconsumer`` a string key, a non-empty
+    string group, and a non-empty string consumer,
     ``hset`` a string key and a
     non-empty list of at most 1000 [field, value] string pairs,
     ``hdel`` a string key and a non-empty list of at most 1000
@@ -2732,7 +2769,7 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
                     "xgroup_create", "xreadgroup", "xack",
                     "xclaim", "xautoclaim",
                     "xgroup_setid", "xgroup_destroy",
-                    "xgroup_delconsumer",
+                    "xgroup_delconsumer", "xgroup_createconsumer",
                     "hset", "hdel",
                     "setex",
                     "expireat",
@@ -2745,7 +2782,8 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
                                "xgroup_create, xreadgroup, xack, xclaim, "
                                "xautoclaim, "
                                "xgroup_setid, "
-                               "xgroup_destroy, xgroup_delconsumer, hset, "
+                               "xgroup_destroy, xgroup_delconsumer, "
+                               "xgroup_createconsumer, hset, "
                                "hdel, setex, expireat, or "
                                "pexpireat"}
     key = op.get("key")
@@ -3485,6 +3523,24 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
         if not isinstance(consumer, str) or not consumer:
             return None, {"type": "client_response", "status": "error",
                           "error": "pipeline xgroup_delconsumer "
+                                   "consumer must be a non-empty "
+                                   "string"}
+        msg["consumer"] = consumer
+    if name == "xgroup_createconsumer":
+        # ``group`` and ``consumer`` ride along with a pipelined
+        # xgroup_createconsumer, validated here so a malformed one
+        # never goes on the wire: non-empty string group and
+        # consumer — the same shapes the server enforces.
+        group = op.get("group")
+        if not isinstance(group, str) or not group:
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline xgroup_createconsumer "
+                                   "group must be a non-empty string"}
+        msg["group"] = group
+        consumer = op.get("consumer")
+        if not isinstance(consumer, str) or not consumer:
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline xgroup_createconsumer "
                                    "consumer must be a non-empty "
                                    "string"}
         msg["consumer"] = consumer
@@ -4919,6 +4975,41 @@ def xgroup_delconsumer(node_addr: tuple[str, int], key: str,
                          "non-empty string"}
     return request(node_addr, {"type": "client",
                                "op": "xgroup_delconsumer",
+                               "key": key, "group": group,
+                               "consumer": consumer},
+                   timeout=timeout)
+
+
+def xgroup_createconsumer(node_addr: tuple[str, int], key: str,
+                          group: str, consumer: str,
+                          timeout: float = 12.0) -> dict:
+    """Create a consumer in a consumer group on the stream at
+    ``key`` without handing it anything, following leader
+    redirects like ``request`` — Redis XGROUP CREATECONSUMER.
+
+    One request appends the create entry, so whether the consumer
+    is new is decided at the entry's position in the log: the
+    reply is the plain xgroup_createconsumer response (``status``
+    ``ok`` with ``xgroup_createconsumer`` 1 when the consumer was
+    created, 0 when it already existed — or
+    ``xgroup_createconsumer_failed`` with reason ``no_group`` when
+    the key or the group does not exist, or ``wrongtype`` when the
+    current value is a plain string). A bad group or consumer
+    never goes on the wire and returns the server's error shape
+    instead. A successful create keeps the key's TTL deadline,
+    like an xadd. XINFO CONSUMERS lists the new consumer at once,
+    with pending 0 and an idle measured from its creation.
+    """
+    if not isinstance(group, str) or not group:
+        return {"type": "client_response", "status": "error",
+                "error": "xgroup_createconsumer group must be a "
+                         "non-empty string"}
+    if not isinstance(consumer, str) or not consumer:
+        return {"type": "client_response", "status": "error",
+                "error": "xgroup_createconsumer consumer must be "
+                         "a non-empty string"}
+    return request(node_addr, {"type": "client",
+                               "op": "xgroup_createconsumer",
                                "key": key, "group": group,
                                "consumer": consumer},
                    timeout=timeout)
@@ -6384,6 +6475,26 @@ def main(argv: list[str] | None = None) -> int:
     p_xgroup_delconsumer.add_argument("--request-id", default=None,
                                       help="id of this write within the "
                                            "client session")
+    p_xgroup_createconsumer = sub.add_parser(
+        "xgroup_createconsumer",
+        help="create a consumer in a consumer group on the stream "
+             "at key without handing it anything, and print 1 when "
+             "it was created, 0 when it already existed")
+    p_xgroup_createconsumer.add_argument("key")
+    p_xgroup_createconsumer.add_argument("group")
+    p_xgroup_createconsumer.add_argument("consumer")
+    p_xgroup_createconsumer.add_argument("--client-id", default=None,
+                                         help="session id for "
+                                              "at-most-once writes: a "
+                                              "retry with the same "
+                                              "client id + request id "
+                                              "returns the first "
+                                              "attempt's result "
+                                              "instead of writing "
+                                              "twice")
+    p_xgroup_createconsumer.add_argument("--request-id", default=None,
+                                         help="id of this write within "
+                                              "the client session")
     p_xpending = sub.add_parser(
         "xpending",
         help="print the pending-entries summary for a consumer "
@@ -6641,6 +6752,7 @@ def main(argv: list[str] | None = None) -> int:
               "xpending",
               "xinfo",
               "xgroup_setid", "xgroup_destroy", "xgroup_delconsumer",
+              "xgroup_createconsumer",
               "setex", "expireat",
               "pexpireat"):
         msg["key"] = args.key
@@ -6871,6 +6983,9 @@ def main(argv: list[str] | None = None) -> int:
     if op == "xgroup_delconsumer":
         msg["group"] = args.group
         msg["consumer"] = args.consumer
+    if op == "xgroup_createconsumer":
+        msg["group"] = args.group
+        msg["consumer"] = args.consumer
     if op == "xpending":
         msg["group"] = args.group
         if args.start is not None:
@@ -7043,6 +7158,8 @@ def main(argv: list[str] | None = None) -> int:
             print(resp.get("xgroup_destroy"))
         elif op == "xgroup_delconsumer":
             print(resp.get("xgroup_delconsumer"))
+        elif op == "xgroup_createconsumer":
+            print(resp.get("xgroup_createconsumer"))
         elif op == "xpending":
             if args.start is not None:
                 print(json.dumps(resp.get("entries")))

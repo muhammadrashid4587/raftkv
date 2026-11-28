@@ -1,5 +1,5 @@
 """Tests for raftkv consumer-group management: XGROUP SETID / DESTROY /
-DELCONSUMER (v0.69.0).
+DELCONSUMER / CREATECONSUMER (v0.69.0, v0.82.0).
 
 ``xgroup_setid key group id [ENTRIESREAD n]`` moves a group's
 last-delivered ID — "$" (the stream's top), "0" (from the very first
@@ -9,12 +9,16 @@ entries are untouched. ``xgroup_destroy key group`` drops the whole
 group, pending entries and all, answering 1 when the group existed and
 0 when it did not. ``xgroup_delconsumer key group consumer`` drops one
 consumer and every entry it held pending, answering how many pending
-entries the consumer held, 0 when it held none or did not exist. The
-groups ride in the stream blob with the entries, so the management
-survives snapshots and replay exactly like the entries — and a
-SETID to the ID the group already holds writes nothing at all. These
-spin up real nodes (real TCP, real threads, real disk) on localhost,
-like the rest of the suite.
+entries the consumer held, 0 when it held none or did not exist.
+``xgroup_createconsumer key group consumer`` creates a consumer in a
+group without handing it anything, answering 1 when it was created and
+0 when it already existed — and XINFO CONSUMERS lists it at once, with
+pending 0 and an idle measured from its creation. The groups ride in
+the stream blob with the entries, so the management survives snapshots
+and replay exactly like the entries — and a SETID to the ID the group
+already holds writes nothing at all. These spin up real nodes (real
+TCP, real threads, real disk) on localhost, like the rest of the
+suite.
 """
 
 import contextlib
@@ -29,6 +33,8 @@ from raftkv.client import Session, main as client_main
 from raftkv.client import xack as client_xack
 from raftkv.client import xadd as client_xadd
 from raftkv.client import xgroup_create as client_xgroup_create
+from raftkv.client import xgroup_createconsumer as \
+    client_xgroup_createconsumer
 from raftkv.client import xgroup_delconsumer as client_xgroup_delconsumer
 from raftkv.client import xgroup_destroy as client_xgroup_destroy
 from raftkv.client import xgroup_setid as client_xgroup_setid
@@ -113,6 +119,24 @@ def xgroup_delconsumer(addr, key="events", group="workers",
     if request_id is not None:
         msg["request_id"] = request_id
     return client_request(addr, msg)
+
+
+def xgroup_createconsumer(addr, key="events", group="workers",
+                          consumer="c1", client_id=None,
+                          request_id=None):
+    msg = {"type": "client", "op": "xgroup_createconsumer",
+           "key": key, "group": group, "consumer": consumer}
+    if client_id is not None:
+        msg["client_id"] = client_id
+    if request_id is not None:
+        msg["request_id"] = request_id
+    return client_request(addr, msg)
+
+
+def xinfo_consumers(addr, key="events", group="workers"):
+    return client_request(addr, {"type": "client", "op": "xinfo",
+                                 "sub": "CONSUMERS", "key": key,
+                                 "group": group})
 
 
 def xpending(addr, key="events", group="workers"):
@@ -412,10 +436,127 @@ class TestXGroupManageStore(unittest.TestCase):
             with self.assertRaises(ValueError, msg=bad):
                 store.apply(cmd)
 
+    def test_createconsumer_lists_consumer_in_xinfo(self):
+        """Creating a consumer lists it in XINFO CONSUMERS at once
+        — pending 0, an idle measured from its creation stamp, and
+        a lag of None, since it has never been handed an entry —
+        while a second create answers 0 and writes nothing at all;
+        and the pre-created consumer reads normally afterwards."""
+        store = _seed_store()
+        result = store.apply({"op": "xgroup_createconsumer",
+                              "key": "s", "group": "g",
+                              "consumer": "c2", "seen_ms": 2000})
+        self.assertEqual(result["status"], "ok", result)
+        self.assertEqual(result["xgroup_createconsumer"], 1, result)
+        consumers = store.xinfo_consumers("s", "g", 2500)
+        self.assertEqual(
+            [c for c in consumers if c["name"] == "c2"],
+            [{"name": "c2", "pending": 0, "idle": 500, "lag": None}])
+        # c1, handed entries by the seed read without a stamp,
+        # is still listed with no provable idle.
+        self.assertEqual(
+            [c for c in consumers if c["name"] == "c1"],
+            [{"name": "c1", "pending": 2, "idle": None, "lag": None}])
+        # A second create answers 0 and the blob is byte-identical.
+        before = store.get("s")
+        result = store.apply({"op": "xgroup_createconsumer",
+                              "key": "s", "group": "g",
+                              "consumer": "c2", "seen_ms": 3000})
+        self.assertEqual(result["status"], "ok", result)
+        self.assertEqual(result["xgroup_createconsumer"], 0, result)
+        self.assertEqual(store.get("s"), before)
+        # The pre-created consumer reads ">" like any other.
+        result = store.apply({"op": "xreadgroup", "key": "s",
+                              "group": "g", "consumer": "c2",
+                              "id": ">", "seen_ms": 3000})
+        self.assertEqual(result["entries"],
+                         [["101-0", {"a": "101-0"}]])
+        consumers = store.xinfo_consumers("s", "g", 3500)
+        self.assertEqual(
+            [c for c in consumers if c["name"] == "c2"],
+            [{"name": "c2", "pending": 1, "idle": 500, "lag": 0}])
+
+    def test_createconsumer_errors(self):
+        """Creating a consumer on a missing key or group fails as
+        no_group, on a plain string as wrongtype, and a bad group,
+        consumer, or stamp raises instead of creating anything."""
+        store = _seed_store()
+        result = store.apply({"op": "xgroup_createconsumer",
+                              "key": "nope", "group": "g",
+                              "consumer": "c1", "seen_ms": 2000})
+        self.assertEqual(result["status"],
+                         "xgroup_createconsumer_failed", result)
+        self.assertEqual(result["reason"], "no_group", result)
+        result = store.apply({"op": "xgroup_createconsumer",
+                              "key": "s", "group": "nope",
+                              "consumer": "c1", "seen_ms": 2000})
+        self.assertEqual(result["status"],
+                         "xgroup_createconsumer_failed", result)
+        self.assertEqual(result["reason"], "no_group", result)
+        store.apply({"op": "set", "key": "plain", "value": "v"})
+        result = store.apply({"op": "xgroup_createconsumer",
+                              "key": "plain", "group": "g",
+                              "consumer": "c1", "seen_ms": 2000})
+        self.assertEqual(result["status"],
+                         "xgroup_createconsumer_failed", result)
+        self.assertEqual(result["reason"], "wrongtype", result)
+        for bad in ({"group": ""}, {"group": 3},
+                    {"consumer": ""}, {"consumer": 3},
+                    {"seen_ms": None}, {"seen_ms": -1},
+                    {"seen_ms": "2000"}, {"seen_ms": True}):
+            cmd = {"op": "xgroup_createconsumer", "key": "s",
+                   "group": "g", "consumer": "c9", "seen_ms": 2000}
+            cmd.update(bad)
+            with self.assertRaises(ValueError, msg=bad):
+                store.apply(cmd)
+
+    def test_createconsumer_after_delconsumer_recreates(self):
+        """A consumer dropped by DELCONSUMER can be created again:
+        the create answers 1 and XINFO lists it fresh, pending 0
+        with an idle from its new creation stamp."""
+        store = _seed_store()
+        result = store.apply({"op": "xgroup_delconsumer", "key": "s",
+                              "group": "g", "consumer": "c1"})
+        self.assertEqual(result["xgroup_delconsumer"], 2, result)
+        result = store.apply({"op": "xgroup_createconsumer",
+                              "key": "s", "group": "g",
+                              "consumer": "c1", "seen_ms": 2000})
+        self.assertEqual(result["status"], "ok", result)
+        self.assertEqual(result["xgroup_createconsumer"], 1, result)
+        consumers = store.xinfo_consumers("s", "g", 2600)
+        self.assertEqual(
+            [c for c in consumers if c["name"] == "c1"],
+            [{"name": "c1", "pending": 0, "idle": 600, "lag": None}])
+
+    def test_createconsumer_holding_pending_without_sighting(self):
+        """A consumer holding pending entries but with no sighting
+        — its deliveries all came from replays of pre-v0.70.0 log
+        entries, which carry no stamp — already exists, so a
+        create answers 0 and writes nothing: no record is made
+        for it, and its idle stays unprovable."""
+        store = _seed_store()
+        # The seed read carried no seen_ms, so c1 holds two
+        # pending entries and no consumer record.
+        self.assertEqual(store.xpending("s", "g")["consumers"],
+                         [["c1", 2]])
+        before = store.get("s")
+        result = store.apply({"op": "xgroup_createconsumer",
+                              "key": "s", "group": "g",
+                              "consumer": "c1", "seen_ms": 2000})
+        self.assertEqual(result["status"], "ok", result)
+        self.assertEqual(result["xgroup_createconsumer"], 0, result)
+        self.assertEqual(store.get("s"), before)
+        consumers = store.xinfo_consumers("s", "g", 2500)
+        self.assertEqual(
+            [c for c in consumers if c["name"] == "c1"],
+            [{"name": "c1", "pending": 2, "idle": None, "lag": None}])
+
     def test_manage_ops_survive_snapshot_load(self):
-        """A SETID with ENTRIESREAD and a DELCONSUMER ride in the
-        blob, so a snapshot load rebuilds the moved read position,
-        the entries-read count, and the surviving pending list."""
+        """A SETID with ENTRIESREAD, a DELCONSUMER, and a
+        CREATECONSUMER ride in the blob, so a snapshot load
+        rebuilds the moved read position, the entries-read count,
+        the surviving pending list, and the created consumer with
+        its creation stamp."""
         store = _seed_store()
         store.apply({"op": "xreadgroup", "key": "s", "group": "g",
                      "consumer": "c2", "id": ">"})
@@ -423,6 +564,9 @@ class TestXGroupManageStore(unittest.TestCase):
                      "id": "100-5", "entries_read": 9})
         store.apply({"op": "xgroup_delconsumer", "key": "s",
                      "group": "g", "consumer": "c1"})
+        store.apply({"op": "xgroup_createconsumer", "key": "s",
+                     "group": "g", "consumer": "c3",
+                     "seen_ms": 1700000002000})
         loaded = KVStore()
         loaded.load(store.items())
         group = groups_of(loaded.get("s"))["g"]
@@ -432,6 +576,10 @@ class TestXGroupManageStore(unittest.TestCase):
                          {"pending": 1, "min_id": "101-0",
                           "max_id": "101-0",
                           "consumers": [["c2", 1]]})
+        consumers = loaded.xinfo_consumers("s", "g", 1700000002500)
+        self.assertEqual(
+            [c for c in consumers if c["name"] == "c3"],
+            [{"name": "c3", "pending": 0, "idle": 500, "lag": None}])
         result = loaded.apply({"op": "xreadgroup", "key": "s",
                                "group": "g", "consumer": "c2",
                                "id": ">"})
@@ -461,6 +609,34 @@ class TestXGroupManageCluster(unittest.TestCase):
             resp = xreadgroup(addr, consumer="c2")
             self.assertEqual([e[0] for e in resp.get("entries")],
                              ["101-0"])
+            # Create a consumer without handing it anything: it
+            # shows up in XINFO CONSUMERS at once, pending 0 with
+            # a lag of None, and a second create answers 0.
+            resp = xgroup_createconsumer(addr, consumer="c3")
+            self.assertEqual(resp.get("status"), "ok", resp)
+            self.assertEqual(resp.get("xgroup_createconsumer"), 1,
+                             resp)
+            resp = xgroup_createconsumer(addr, consumer="c3")
+            self.assertEqual(resp.get("xgroup_createconsumer"), 0,
+                             resp)
+            resp = xinfo_consumers(addr)
+            self.assertEqual(resp.get("status"), "ok", resp)
+            by_name = {c["name"]: c for c in resp.get("consumers")}
+            self.assertEqual(sorted(by_name), ["c1", "c2", "c3"],
+                             resp)
+            self.assertEqual(by_name["c3"]["pending"], 0, resp)
+            self.assertIsNotNone(by_name["c3"]["idle"], resp)
+            self.assertIsNone(by_name["c3"]["lag"], resp)
+            for node_id in cluster.live:
+                self.assertTrue(
+                    wait_for_key(cluster.nodes[node_id], "events",
+                                 cluster.nodes[leader.id].sm.get(
+                                     "events")))
+                self.assertEqual(
+                    groups_of(cluster.nodes[node_id].sm.get("events"))
+                    ["workers"]["consumers"]["c3"]["last_seen_ms"],
+                    groups_of(leader.sm.get("events"))
+                    ["workers"]["consumers"]["c3"]["last_seen_ms"])
             # Rewind the group: the next ">" read re-hands the
             # entries after the new position.
             resp = xgroup_setid(addr, id="100-5", entries_read=2)
@@ -499,9 +675,9 @@ class TestXGroupManageCluster(unittest.TestCase):
             cluster.stop_all()
 
     def test_manage_retry_returns_first_result(self):
-        """A retried SETID / DESTROY / DELCONSUMER returns the
-        first attempt's result and appends no second log entry —
-        so a retry after a successful destroy answers 0, the
+        """A retried SETID / DESTROY / DELCONSUMER / CREATECONSUMER
+        returns the first attempt's result and appends no second log
+        entry — so a retry after a successful destroy answers 0, the
         group already gone, instead of destroying it twice."""
         cluster = Cluster(3)
         try:
@@ -525,6 +701,22 @@ class TestXGroupManageCluster(unittest.TestCase):
             self.assertEqual(
                 groups_of(leader.sm.get("events"))["workers"]
                 ["last_delivered"], "100-5")
+            first = xgroup_createconsumer(addr, consumer="c9",
+                                          client_id="c1",
+                                          request_id="cc1")
+            self.assertEqual(first.get("xgroup_createconsumer"), 1,
+                             first)
+            second = xgroup_createconsumer(addr, consumer="c9",
+                                           client_id="c1",
+                                           request_id="cc1")
+            self.assertEqual(second.get("xgroup_createconsumer"), 1,
+                             second)
+            self.assertEqual(count_entries(leader, "cc1"), 1)
+            # A fresh create now answers 0: the consumer is
+            # already there.
+            third = xgroup_createconsumer(addr, consumer="c9")
+            self.assertEqual(third.get("xgroup_createconsumer"), 0,
+                             third)
             first = xgroup_delconsumer(addr, consumer="c1",
                                        client_id="c1",
                                        request_id="d1")
@@ -568,6 +760,9 @@ class TestXGroupManageCluster(unittest.TestCase):
             resp = xgroup_delconsumer(addr, key="plain")
             self.assertEqual(resp.get("status"),
                              "xgroup_delconsumer_failed", resp)
+            resp = xgroup_createconsumer(addr, key="plain")
+            self.assertEqual(resp.get("status"),
+                             "xgroup_createconsumer_failed", resp)
             # Bad arguments are client errors with no log entry.
             for msg in (
                     {"type": "client", "op": "xgroup_setid",
@@ -587,11 +782,15 @@ class TestXGroupManageCluster(unittest.TestCase):
                     {"type": "client", "op": "xgroup_delconsumer",
                      "key": "events", "group": "g", "consumer": ""},
                     {"type": "client", "op": "xgroup_delconsumer",
+                     "key": "events", "group": "", "consumer": "c1"},
+                    {"type": "client", "op": "xgroup_createconsumer",
+                     "key": "events", "group": "g", "consumer": ""},
+                    {"type": "client", "op": "xgroup_createconsumer",
                      "key": "events", "group": "", "consumer": "c1"}):
                 resp = client_request(addr, msg)
                 self.assertEqual(resp.get("status"), "error", (msg,
                                                                 resp))
-            self.assertEqual(len(leader.log), before + 3)
+            self.assertEqual(len(leader.log), before + 4)
         finally:
             cluster.stop_all()
 
@@ -615,6 +814,15 @@ class TestXGroupManageCluster(unittest.TestCase):
                 resp = session.xgroup_setid("events", "workers", "0")
                 self.assertEqual(resp.get("status"), "ok", resp)
                 self.assertEqual(resp.get("xgroup_setid"), 1, resp)
+                resp = session.xgroup_createconsumer("events",
+                                                     "workers", "c2")
+                self.assertEqual(resp.get("status"), "ok", resp)
+                self.assertEqual(resp.get("xgroup_createconsumer"), 1,
+                                 resp)
+                resp = session.xgroup_createconsumer("events",
+                                                     "workers", "c2")
+                self.assertEqual(resp.get("xgroup_createconsumer"), 0,
+                                 resp)
                 resp = session.xgroup_delconsumer("events", "workers",
                                                   "c1")
                 self.assertEqual(resp.get("xgroup_delconsumer"), 1,
@@ -628,6 +836,12 @@ class TestXGroupManageCluster(unittest.TestCase):
                 self.assertEqual(resp.get("status"), "error", resp)
                 resp = session.xgroup_delconsumer("events", "workers",
                                                   "")
+                self.assertEqual(resp.get("status"), "error", resp)
+                resp = session.xgroup_createconsumer("events",
+                                                     "workers", "")
+                self.assertEqual(resp.get("status"), "error", resp)
+                resp = session.xgroup_createconsumer("events", "",
+                                                     "c2")
                 self.assertEqual(resp.get("status"), "error", resp)
         finally:
             cluster.stop_all()
@@ -657,6 +871,18 @@ class TestXGroupManageCluster(unittest.TestCase):
                                     "workers", "0").get("status"),
                 "ok")
             self.assertEqual(
+                client_xgroup_createconsumer(follower_addr, "events",
+                                             "workers",
+                                             "c2").get(
+                                                 "xgroup_createconsumer"),
+                1)
+            self.assertEqual(
+                client_xgroup_createconsumer(follower_addr, "events",
+                                             "workers",
+                                             "c2").get(
+                                                 "xgroup_createconsumer"),
+                0)
+            self.assertEqual(
                 client_xgroup_delconsumer(follower_addr, "events",
                                           "workers",
                                           "c1").get(
@@ -676,6 +902,14 @@ class TestXGroupManageCluster(unittest.TestCase):
             self.assertEqual(
                 client_xgroup_delconsumer(follower_addr, "events",
                                           "workers", "")
+                .get("status"), "error")
+            self.assertEqual(
+                client_xgroup_createconsumer(follower_addr, "events",
+                                             "workers", "")
+                .get("status"), "error")
+            self.assertEqual(
+                client_xgroup_createconsumer(follower_addr, "events",
+                                             "", "c2")
                 .get("status"), "error")
         finally:
             cluster.stop_all()
@@ -702,6 +936,8 @@ class TestXGroupManageCluster(unittest.TestCase):
                     [["100-5", {"a": "1"}],
                      ["100-6", {"a": "2"}]])
                 replies = session.pipeline([
+                    {"op": "xgroup_createconsumer", "key": "events",
+                     "group": "workers", "consumer": "c9"},
                     {"op": "xgroup_setid", "key": "events",
                      "group": "workers", "id": "100-5",
                      "entries_read": 2},
@@ -712,33 +948,40 @@ class TestXGroupManageCluster(unittest.TestCase):
                     {"op": "xgroup_destroy", "key": "events",
                      "group": "workers"},
                 ])
-                self.assertEqual(len(replies), 4, replies)
-                self.assertEqual(replies[0].get("xgroup_setid"), 1,
-                                 replies[0])
+                self.assertEqual(len(replies), 5, replies)
                 self.assertEqual(
-                    replies[1].get("xgroup_delconsumer"), 2,
-                    replies[1])
-                self.assertEqual(replies[2].get("xgroup_destroy"), 1,
-                                 replies[2])
-                self.assertEqual(replies[3].get("xgroup_destroy"), 0,
+                    replies[0].get("xgroup_createconsumer"), 1,
+                    replies[0])
+                self.assertEqual(replies[1].get("xgroup_setid"), 1,
+                                 replies[1])
+                self.assertEqual(
+                    replies[2].get("xgroup_delconsumer"), 2,
+                    replies[2])
+                self.assertEqual(replies[3].get("xgroup_destroy"), 1,
                                  replies[3])
+                self.assertEqual(replies[4].get("xgroup_destroy"), 0,
+                                 replies[4])
                 # A malformed manage op in a pipeline is an error
                 # in position, and the ops around it still run.
                 replies = session.pipeline([
                     {"op": "xgroup_create", "key": "events",
                      "group": "workers", "start_id": "0"},
+                    {"op": "xgroup_createconsumer", "key": "events",
+                     "group": "workers", "consumer": ""},
                     {"op": "xgroup_setid", "key": "events",
                      "group": "", "id": "0"},
                     {"op": "xgroup_destroy", "key": "events",
                      "group": "workers"},
                 ])
-                self.assertEqual(len(replies), 3, replies)
+                self.assertEqual(len(replies), 4, replies)
                 self.assertEqual(replies[0].get("status"), "ok",
                                  replies[0])
                 self.assertEqual(replies[1].get("status"), "error",
                                  replies[1])
-                self.assertEqual(replies[2].get("xgroup_destroy"), 1,
+                self.assertEqual(replies[2].get("status"), "error",
                                  replies[2])
+                self.assertEqual(replies[3].get("xgroup_destroy"), 1,
+                                 replies[3])
         finally:
             cluster.stop_all()
 
@@ -758,6 +1001,11 @@ class TestXGroupManageCluster(unittest.TestCase):
             self.assertEqual(
                 xgroup_setid(addr, id="0",
                              entries_read=4).get("status"), "ok")
+            self.assertEqual(
+                xgroup_createconsumer(addr,
+                                      consumer="c2").get(
+                                          "xgroup_createconsumer"),
+                1)
             # Enough writes to compact the log past the group ops.
             for i in range(10):
                 self.assertEqual(
@@ -776,6 +1024,15 @@ class TestXGroupManageCluster(unittest.TestCase):
             group = groups_of(new_leader.sm.get("events"))["workers"]
             self.assertEqual(group["last_delivered"], "0-0")
             self.assertEqual(group["entries_read"], 4)
+            # The created consumer survived too, with its
+            # creation stamp: pending 0, a measurable idle, and
+            # no lag.
+            resp = xinfo_consumers(addr)
+            self.assertEqual(resp.get("status"), "ok", resp)
+            by_name = {c["name"]: c for c in resp.get("consumers")}
+            self.assertEqual(by_name["c2"]["pending"], 0, resp)
+            self.assertIsNotNone(by_name["c2"]["idle"], resp)
+            self.assertIsNone(by_name["c2"]["lag"], resp)
             resp = xgroup_delconsumer(addr, consumer="c1")
             self.assertEqual(resp.get("xgroup_delconsumer"), 1, resp)
             resp = xpending(addr)
@@ -784,10 +1041,12 @@ class TestXGroupManageCluster(unittest.TestCase):
             cluster.stop_all()
 
     def test_watch_events_for_manage_ops(self):
-        """A SETID that moves the read position, a destroy, and a
-        delete that drops pending entries each fire one `set`
-        watch event with the new blob — a no-op SETID and a delete
-        of a consumer holding nothing fire nothing."""
+        """A SETID that moves the read position, a destroy, a
+        delete that drops pending entries, and a create that adds
+        a consumer each fire one `set` watch event with the new
+        blob — a no-op SETID, a delete of a consumer holding
+        nothing, and a create of a consumer already there fire
+        nothing."""
         cluster = Cluster(3)
         try:
             cluster.start_all()
@@ -801,37 +1060,49 @@ class TestXGroupManageCluster(unittest.TestCase):
             self.assertTrue(log.wait_for(2))
             xreadgroup(addr, consumer="c1")
             self.assertTrue(log.wait_for(3))
+            # Creating a consumer fires once.
+            self.assertEqual(
+                xgroup_createconsumer(addr, consumer="c2")
+                .get("xgroup_createconsumer"), 1)
+            self.assertTrue(log.wait_for(4))
+            self.assertEqual(log.events[-1]["op"], "set")
+            # Creating it again fires nothing.
+            self.assertEqual(
+                xgroup_createconsumer(addr, consumer="c2")
+                .get("xgroup_createconsumer"), 0)
+            time.sleep(0.3)
+            self.assertEqual(len(log.events), 4)
             # A SETID to the same ID fires nothing.
             self.assertEqual(
                 xgroup_setid(addr, id="100-5").get("status"), "ok")
             time.sleep(0.3)
-            self.assertEqual(len(log.events), 3)
+            self.assertEqual(len(log.events), 4)
             # A SETID that moves fires once.
             self.assertEqual(
                 xgroup_setid(addr, id="0").get("status"), "ok")
-            self.assertTrue(log.wait_for(4))
+            self.assertTrue(log.wait_for(5))
             self.assertEqual(log.events[-1]["op"], "set")
             # Deleting a consumer holding nothing fires nothing.
             self.assertEqual(
                 xgroup_delconsumer(addr, consumer="ghost")
                 .get("xgroup_delconsumer"), 0)
             time.sleep(0.3)
-            self.assertEqual(len(log.events), 4)
+            self.assertEqual(len(log.events), 5)
             # Deleting the consumer holding the entry fires once.
             self.assertEqual(
                 xgroup_delconsumer(addr, consumer="c1")
                 .get("xgroup_delconsumer"), 1)
-            self.assertTrue(log.wait_for(5))
+            self.assertTrue(log.wait_for(6))
             # Destroying the group fires once.
             self.assertEqual(
                 xgroup_destroy(addr).get("xgroup_destroy"), 1)
-            self.assertTrue(log.wait_for(6))
+            self.assertTrue(log.wait_for(7))
             self.assertEqual(log.events[-1]["op"], "set")
             # A destroy of a group that is not there fires nothing.
             self.assertEqual(
                 xgroup_destroy(addr).get("xgroup_destroy"), 0)
             time.sleep(0.3)
-            self.assertEqual(len(log.events), 6)
+            self.assertEqual(len(log.events), 7)
         finally:
             cluster.stop_all()
 
@@ -860,6 +1131,18 @@ class TestXGroupManageCluster(unittest.TestCase):
             self.assertEqual(rc, 0, out.getvalue())
             self.assertEqual(json.loads(out.getvalue()),
                              [["100-5", {"a": "1"}]])
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "xgroup_createconsumer",
+                                  "events", "workers", "c9"])
+            self.assertEqual(rc, 0, out.getvalue())
+            self.assertEqual(out.getvalue().strip(), "1")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "xgroup_createconsumer",
+                                  "events", "workers", "c9"])
+            self.assertEqual(rc, 0, out.getvalue())
+            self.assertEqual(out.getvalue().strip(), "0")
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 rc = client_main(["--node", node, "xgroup_setid",
