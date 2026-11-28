@@ -274,6 +274,10 @@ XADD_MAX_FIELDS = 1000
 # entry grow without limit — the same scale as the xadd cap, for
 # the same reason.
 XACK_MAX_IDS = 1000
+
+# Largest number of IDs one ``xdel`` may carry, for the same
+# reason: the IDs ride in one log entry and one frame.
+XDEL_MAX_IDS = 1000
 XREADGROUP_MULTI_MAX_STREAMS = 1000
 
 # How many pending entries one ``xautoclaim`` examines when the
@@ -939,7 +943,7 @@ class KVStore:
         state at apply time — currently "set", "cas", "expire", "expireat",
         "pexpireat", "incr", "incrbyfloat", "setnx", "getset", "append", "getdel",
         "setrange", "getex", "setbit", "bitop", "pfadd", "hset", "hdel",
-        "geoadd", "xadd", "xtrim", "xgroup_create", "xreadgroup",
+        "geoadd", "xadd", "xtrim", "xdel", "xgroup_create", "xreadgroup",
         "xreadgroup_multi", "xack",
         "xclaim", "xautoclaim", "xgroup_setid", "xgroup_destroy", and
         "xgroup_delconsumer" —
@@ -2232,6 +2236,81 @@ class KVStore:
             self._data[key] = _stream_value(stream)
             return {"type": "client_response", "status": "ok",
                     "xtrim": removed}
+        elif op == "xdel":
+            # Delete named entries from a stream, Redis XDEL: every
+            # ID in ``ids`` that is in the stream goes, and the reply
+            # carries ``xdel`` — how many actually went. An ID that
+            # is not in the stream simply does not count, and one
+            # named twice counts once — the second naming finds
+            # nothing left to delete. A missing key answers 0 and
+            # writes nothing, like an expire on a missing key — the
+            # entry still committed, it just had nothing to delete.
+            # A key holding a plain string fails with WRONGTYPE, like
+            # an xadd — an xdel must not parse bytes as entries —
+            # and writes nothing at all. The outcome is decided here,
+            # at this exact point in the log, like a CAS, so a retry
+            # with the same session id returns the first attempt's
+            # count instead of deleting twice. Unlike an xtrim that
+            # empties the stream, an xdel that takes the last entry
+            # leaves the key behind as an empty stream — Redis keeps
+            # it too, with its top ID remembered, so an xadd after a
+            # full delete still refuses an ID at or below the old top
+            # — and the groups stay, their pending lists pruned of
+            # the entries that went, like Redis dropping a deleted
+            # entry from the PEL: a deleted entry stops being pending
+            # in every group, so XPENDING agrees with the stream. A
+            # successful xdel keeps the key's deadline, like an xadd:
+            # it is an update of the value, not a fresh set. The IDs
+            # were validated on the leader before the entry was logged
+            # (a non-empty list of at most 1000 explicit "ms-seq" IDs
+            # greater than 0-0), so by apply time they are
+            # well-formed — a hand-built log entry with a bad ID list
+            # still raises rather than silently deleting nonsense.
+            key = command["key"]
+            ids = command.get("ids")
+            if (not isinstance(ids, list) or not ids
+                    or len(ids) > XDEL_MAX_IDS
+                    or any(not isinstance(i, str) for i in ids)):
+                raise ValueError(
+                    "xdel ids must be a list of 1 to 1000 stream IDs")
+            for entry_id in ids:
+                ms, seq = parse_stream_id(entry_id)
+                if not isinstance(ms, int) or seq is None:
+                    raise ValueError(
+                        "xdel ids must be explicit \"ms-seq\" stream "
+                        "IDs greater than 0-0")
+            current = self._data.get(key)
+            if current is None:
+                return {"type": "client_response", "status": "ok",
+                        "xdel": 0}
+            if not is_stream(current):
+                return {"type": "client_response",
+                        "status": "xdel_failed",
+                        "reason": "wrongtype",
+                        "current": current,
+                        "error": "xdel failed: value of "
+                                 f"{key!r} is not a stream"}
+            stream = _stream_data(current)
+            entries = stream["entries"]
+            wanted = set(ids)
+            gone = {entry_id for entry_id, _f in entries
+                    if entry_id in wanted}
+            removed = len(gone)
+            if removed:
+                # A deleted entry stops being pending in every
+                # group, like a trimmed entry under DELREF: the
+                # pending record names an entry that no longer
+                # exists, so it goes with it.
+                stream["entries"] = [e for e in entries
+                                     if e[0] not in gone]
+                for group in stream.get("groups", {}).values():
+                    pending = group["pending"]
+                    for entry_id in list(pending):
+                        if entry_id in gone:
+                            del pending[entry_id]
+                self._data[key] = _stream_value(stream)
+            return {"type": "client_response", "status": "ok",
+                    "xdel": removed}
         elif op == "xgroup_create":
             # Create a consumer group on a stream, Redis XGROUP
             # CREATE: the group starts reading from ``start_id``

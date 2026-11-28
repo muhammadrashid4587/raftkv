@@ -142,6 +142,7 @@ class Session:
                     "bitop_failed",
                     "pfadd_failed", "hset_failed", "hdel_failed",
                     "geoadd_failed", "xadd_failed", "xtrim_failed",
+                    "xdel_failed",
                     "xgroup_create_failed", "xreadgroup_failed",
                     "xack_failed")
                 and resp.get("index") is not None):
@@ -1088,6 +1089,49 @@ class Session:
         if mode is not None:
             msg["mode"] = mode.upper()
         return self._write(msg)
+
+    def xdel(self, key: str, *ids: str) -> dict:
+        """Delete named entries from the stream at ``key``, Redis
+        XDEL: every ID in ``ids`` that is in the stream goes, and
+        the reply carries ``xdel`` — how many actually went, 0
+        when none of them was in the stream. An ID that is not in
+        the stream simply does not count, and one named twice
+        counts once. A missing key answers 0, like an xtrim on a
+        missing key, and a plain string value fails with
+        ``xdel_failed`` and reason ``wrongtype`` instead of
+        writing. Unlike an xtrim that empties the stream, an xdel
+        that takes the last entry leaves the key behind as an
+        empty stream — Redis keeps it too, with its top ID
+        remembered, so an xadd after a full delete still refuses
+        an ID at or below the old top — and the deleted entries
+        stop being pending in every group, so XPENDING agrees
+        with the stream. A bad ID list never goes on the wire and
+        returns the server's error shape instead. The outcome is
+        decided at apply time, at the entry's position in the log,
+        so a retry with the same session id returns the first
+        attempt's count instead of deleting twice, and a
+        successful xdel keeps the key's TTL deadline, like an
+        xadd. A successful xdel advances the write watermark from
+        the reply's index, like any other write — and so does a
+        failed one, since it still committed its entry."""
+        if (not ids or len(ids) > 1000
+                or any(not isinstance(i, str) for i in ids)):
+            return {"type": "client_response", "status": "error",
+                    "error": "xdel ids must be a list of 1 to 1000 "
+                             "stream IDs"}
+        for entry_id in ids:
+            parts = entry_id.split("-")
+            if (len(parts) != 2 or not parts[0].isdigit()
+                    or not parts[1].isdigit()
+                    or int(parts[0]) > 2 ** 64 - 1
+                    or int(parts[1]) > 2 ** 64 - 1
+                    or (int(parts[0]) == 0 and int(parts[1]) == 0)):
+                return {"type": "client_response", "status": "error",
+                        "error": "xdel ids must be explicit "
+                                 "\"ms-seq\" stream IDs greater "
+                                 "than 0-0"}
+        return self._write({"type": "client", "op": "xdel",
+                            "key": key, "ids": list(ids)})
 
     def xgroup_create(self, key: str, group: str,
                       start_id: str = "$",
@@ -2585,6 +2629,8 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
     a range bound can parse ("-", "+", a bare millisecond, or
     "ms-seq") for MINID — plus an optional ``approximate`` flag
     and an optional ``mode`` that is KEEPREF, DELREF, or ACKED,
+    ``xdel`` a string key and a non-empty list of at most 1000
+    explicit "ms-seq" stream IDs greater than 0-0,
     ``xgroup_create`` a string key, a non-empty string group, and
     a start ID — "$" (only entries appended after the group is
     created), "0" (from the very first entry), a bare millisecond,
@@ -2622,7 +2668,7 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
                     "setnx", "getset",
                     "append", "getdel", "getex", "setrange", "setbit",
                     "bitop",
-                    "pfadd", "geoadd", "xadd", "xtrim",
+                    "pfadd", "geoadd", "xadd", "xtrim", "xdel",
                     "xgroup_create", "xreadgroup", "xack",
                     "xclaim", "xautoclaim",
                     "xgroup_setid", "xgroup_destroy",
@@ -2635,8 +2681,9 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
                       "error": "pipeline op must be set, del, cas, "
                                "incr, incrbyfloat, setnx, getset, append, "
                                "getdel, getex, setrange, setbit, bitop, "
-                               "pfadd, geoadd, xadd, xtrim, xgroup_create, "
-                               "xreadgroup, xack, xclaim, xautoclaim, "
+                               "pfadd, geoadd, xadd, xtrim, xdel, "
+                               "xgroup_create, xreadgroup, xack, xclaim, "
+                               "xautoclaim, "
                                "xgroup_setid, "
                                "xgroup_destroy, xgroup_delconsumer, hset, "
                                "hdel, setex, expireat, or "
@@ -3010,6 +3057,31 @@ def _pipeline_op_message(op) -> tuple[dict | None, dict | None]:
                                        "\"KEEPREF\", \"DELREF\", or "
                                        "\"ACKED\""}
             msg["mode"] = mode.upper()
+    if name == "xdel":
+        # ``ids`` rides along with a pipelined xdel, validated here
+        # so a malformed one never goes on the wire: a non-empty
+        # list of at most 1000 explicit "ms-seq" IDs greater than
+        # 0-0 — the same shapes the server enforces.
+        ids = op.get("ids")
+        if (not isinstance(ids, list) or not ids
+                or len(ids) > 1000
+                or any(not isinstance(i, str) for i in ids)):
+            return None, {"type": "client_response", "status": "error",
+                          "error": "pipeline xdel ids must be a list "
+                                   "of 1 to 1000 stream IDs"}
+        for entry_id in ids:
+            parts = entry_id.split("-")
+            if (len(parts) != 2 or not parts[0].isdigit()
+                    or not parts[1].isdigit()
+                    or int(parts[0]) > 2 ** 64 - 1
+                    or int(parts[1]) > 2 ** 64 - 1
+                    or (int(parts[0]) == 0 and int(parts[1]) == 0)):
+                return None, {"type": "client_response",
+                              "status": "error",
+                              "error": "pipeline xdel ids must be "
+                                       "explicit \"ms-seq\" stream IDs "
+                                       "greater than 0-0"}
+        msg["ids"] = list(ids)
     if name == "xgroup_create":
         # ``group``, ``start_id``, and ``mkstream`` ride along
         # with a pipelined xgroup_create, validated here so a
@@ -4212,6 +4284,44 @@ def xtrim(node_addr: tuple[str, int], key: str, strategy: str,
     if mode is not None:
         msg["mode"] = mode.upper()
     return request(node_addr, msg, timeout=timeout)
+
+
+def xdel(node_addr: tuple[str, int], key: str, *ids: str,
+         timeout: float = 12.0) -> dict:
+    """Delete named entries from the stream at ``key``, following
+    leader redirects like ``request`` — Redis XDEL.
+
+    One request deletes the named entries, so the count it returns
+    is decided at the entry's position in the log: the reply is the
+    plain xdel response (``status`` ``ok`` with ``xdel`` — how many
+    entries actually went, 0 when none of them was in the stream
+    or the key does not exist — or ``xdel_failed`` with reason
+    ``wrongtype`` when the current value is a plain string). An ID
+    that is not in the stream simply does not count, and one named
+    twice counts once. Unlike an xtrim that empties the stream, an
+    xdel that takes the last entry leaves the key behind as an
+    empty stream, with its top ID remembered, and the deleted
+    entries stop being pending in every group. A bad ID list never
+    goes on the wire and returns the server's error shape
+    instead."""
+    if (not ids or len(ids) > 1000
+            or any(not isinstance(i, str) for i in ids)):
+        return {"type": "client_response", "status": "error",
+                "error": "xdel ids must be a list of 1 to 1000 "
+                         "stream IDs"}
+    for entry_id in ids:
+        parts = entry_id.split("-")
+        if (len(parts) != 2 or not parts[0].isdigit()
+                or not parts[1].isdigit()
+                or int(parts[0]) > 2 ** 64 - 1
+                or int(parts[1]) > 2 ** 64 - 1
+                or (int(parts[0]) == 0 and int(parts[1]) == 0)):
+            return {"type": "client_response", "status": "error",
+                    "error": "xdel ids must be explicit \"ms-seq\" "
+                             "stream IDs greater than 0-0"}
+    return request(node_addr, {"type": "client", "op": "xdel",
+                               "key": key, "ids": list(ids)},
+                   timeout=timeout)
 
 
 def xgroup_create(node_addr: tuple[str, int], key: str, group: str,
@@ -5888,6 +5998,22 @@ def main(argv: list[str] | None = None) -> int:
                              "twice")
     p_xtrim.add_argument("--request-id", default=None,
                         help="id of this write within the client session")
+    p_xdel = sub.add_parser(
+        "xdel",
+        help="delete named entries from the stream at key and print "
+             "how many actually went (0 when none of them was in "
+             "the stream or the key does not exist)")
+    p_xdel.add_argument("key")
+    p_xdel.add_argument("ids", nargs="+",
+                        help="the entry IDs to delete: "
+                             "ms-seq ms-seq ... (at most 1000)")
+    p_xdel.add_argument("--client-id", default=None,
+                        help="session id for at-most-once writes: a retry "
+                             "with the same client id + request id returns "
+                             "the first attempt's result instead of writing "
+                             "twice")
+    p_xdel.add_argument("--request-id", default=None,
+                        help="id of this write within the client session")
     p_xgroup_create = sub.add_parser(
         "xgroup_create",
         help="create a consumer group on the stream at key and "
@@ -6385,7 +6511,7 @@ def main(argv: list[str] | None = None) -> int:
               "pfadd", "pfcount", "hset", "hget", "hdel", "hgetall",
               "hlen", "hexists", "hkeys", "hvals", "hmget", "hscan",
               "geoadd", "geodist",
-              "xadd", "xtrim", "xlen", "xrange",
+              "xadd", "xtrim", "xdel", "xlen", "xrange",
               "xgroup_create", "xreadgroup", "xack", "xclaim",
               "xautoclaim",
               "xpending",
@@ -6548,6 +6674,8 @@ def main(argv: list[str] | None = None) -> int:
         msg["strategy"] = args.strategy
         if args.mode is not None:
             msg["mode"] = args.mode
+    if op == "xdel":
+        msg["ids"] = args.ids
     if op == "xgroup_create":
         msg["group"] = args.group
         msg["start_id"] = args.start_id
@@ -6661,7 +6789,7 @@ def main(argv: list[str] | None = None) -> int:
               "setbit", "bitop", "pfadd", "geoadd", "hset", "hdel",
               "setex",
               "expireat",
-              "pexpireat", "xadd", "xtrim", "xgroup_create",
+              "pexpireat", "xadd", "xtrim", "xdel", "xgroup_create",
               "xreadgroup", "xreadgroup_multi", "xack", "xclaim",
               "xautoclaim",
               "xgroup_setid",
@@ -6757,6 +6885,8 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(resp.get("streams")))
         elif op == "xtrim":
             print(resp.get("xtrim"))
+        elif op == "xdel":
+            print(resp.get("xdel"))
         elif op == "xreadgroup":
             print(json.dumps(resp.get("entries")))
         elif op == "xreadgroup_multi":

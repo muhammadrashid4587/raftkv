@@ -1501,7 +1501,7 @@ class RaftNode:
                 # expireat, pexpireat, incr, incrbyfloat, setnx,
                 # getset, append, getdel, setrange, getex, setbit,
                 # bitop, pfadd, hset, hdel, geoadd, xadd, xtrim,
-                # xgroup_create, xreadgroup, xreadgroup_multi,
+                # xdel, xgroup_create, xreadgroup, xreadgroup_multi,
                 # xack, xclaim,
                 # xautoclaim, xgroup_setid,
                 # xgroup_destroy, and xgroup_delconsumer:
@@ -1758,6 +1758,23 @@ class RaftNode:
                             self.sm.get(entry["command"]["key"]),
                             "set",
                             index=self.last_applied)
+                elif (op == "xdel" and result is not None
+                        and result.get("status") == "ok"
+                        and result.get("xdel", 0) > 0):
+                    # An xdel that removed entries fires like a set,
+                    # with the new (stream blob) value: it changed
+                    # the entries and the pending lists, so a watcher
+                    # sees the change — and an xdel that removed
+                    # nothing changed nothing, so it fires nothing,
+                    # like a failed xadd — and a failed xdel wrote
+                    # nothing either. The key stays even when the
+                    # stream is empty, so there is no ``del`` case
+                    # here, unlike an xtrim that took the key with
+                    # it.
+                    self.watch.notify(entry["command"]["key"],
+                                      self.sm.get(entry["command"]["key"]),
+                                      "set",
+                                      index=self.last_applied)
                 elif (op == "xgroup_create" and result is not None
                         and result.get("status") == "ok"):
                     # A successful group create fires like a set,
@@ -1899,7 +1916,8 @@ class RaftNode:
                            "incr", "incrbyfloat", "setnx", "getset",
                            "append", "getdel", "setrange", "getex",
                            "setbit", "bitop", "pfadd", "hset", "hdel",
-                           "geoadd", "xadd", "xtrim", "xgroup_create",
+                           "geoadd", "xadd", "xtrim", "xdel",
+                           "xgroup_create",
                            "xreadgroup", "xreadgroup_multi", "xack",
                            "xgroup_setid",
                            "xgroup_destroy", "xgroup_delconsumer",
@@ -1917,7 +1935,8 @@ class RaftNode:
                     # index alone. Set, CAS, expire, expireat, pexpireat,
                     # incr, incrbyfloat, setnx, getset, append,
                     # getdel, setrange, getex, setbit, bitop, pfadd, hset, and
-                    # geoadd, xadd, xtrim, xgroup_create, xreadgroup,
+                    # geoadd, xadd, xtrim, xdel, xgroup_create,
+                    # xreadgroup,
                     # xreadgroup_multi, xack,
                     # xgroup_setid, xgroup_destroy, and xgroup_delconsumer are
                     # the ops whose apply returns a result — a del
@@ -1960,7 +1979,7 @@ class RaftNode:
         for CAS, expire, expireat,
         pexpireat, incr, incrbyfloat, setnx,
         getset, append, getdel, setrange, getex, setbit, bitop,
-        pfadd, hset, hdel, geoadd, xadd, and xtrim
+        pfadd, hset, hdel, geoadd, xadd, xtrim, and xdel
         it is the
         apply-time outcome (success, mismatch, or missing key for a
         CAS; 1 or 0 for an expire; 1 or 0 for an expireat /
@@ -1978,7 +1997,8 @@ class RaftNode:
         of removed fields, or wrongtype for an hdel; the count of
         newly added members, or wrongtype for a geoadd; the entry
         ID, or wrongtype / id_not_greater for an xadd; the count
-        of removed entries, or wrongtype for an xtrim; 1, or
+        of removed entries, or wrongtype for an xtrim; the count
+        of removed entries, or wrongtype for an xdel; 1, or
         group_exists / no_group / wrongtype for an xgroup_create;
         the entries, or no_group / wrongtype for an xreadgroup;
         the count of acked entries, or no_group / wrongtype for
@@ -2925,7 +2945,7 @@ class RaftNode:
                       "hlen", "hexists", "hkeys", "hvals", "hmget",
                       "hscan",
                       "geoadd", "geodist",
-                      "xadd", "xtrim", "xlen", "xrange",
+                      "xadd", "xtrim", "xdel", "xlen", "xrange",
                       "xgroup_create", "xreadgroup",
                       "xreadgroup_multi", "xack",
                       "xclaim", "xautoclaim",
@@ -2946,7 +2966,7 @@ class RaftNode:
                              "pfadd/pfcount/hset/hget/hdel/hgetall/"
                              "hlen/hexists/hkeys/hvals/hmget/hscan/"
                              "geoadd/geodist/"
-                             "xadd/xtrim/xlen/xrange/"
+                             "xadd/xtrim/xdel/xlen/xrange/"
                              "xgroup_create/xreadgroup/"
                              "xreadgroup_multi/xack/"
                              "xclaim/xautoclaim/"
@@ -3811,6 +3831,34 @@ class RaftNode:
                             "error": "xtrim mode must be \"KEEPREF\", "
                                      "\"DELREF\", or \"ACKED\""}
                 command["mode"] = mode.upper()
+        if op == "xdel":
+            # Delete named entries from a stream, Redis XDEL: the
+            # IDs are a non-empty list of at most 1000 explicit
+            # "ms-seq" IDs greater than 0-0 — a malformed ID list is
+            # a client error, not a log entry. Whether the key holds
+            # a stream (and how many of the IDs are in it) is decided
+            # at apply time, like a CAS, not here.
+            ids = msg.get("ids")
+            if (not isinstance(ids, list) or not ids
+                    or len(ids) > 1000
+                    or any(not isinstance(i, str) for i in ids)):
+                return {"type": "client_response", "status": "error",
+                        "error": "xdel ids must be a list of 1 to "
+                                 "1000 stream IDs"}
+            for entry_id in ids:
+                parts = entry_id.split("-")
+                if (len(parts) != 2 or not parts[0].isdigit()
+                        or not parts[1].isdigit()
+                        or int(parts[0]) > STREAM_ID_MAX
+                        or int(parts[1]) > STREAM_ID_MAX
+                        or (int(parts[0]) == 0
+                            and int(parts[1]) == 0)):
+                    return {"type": "client_response",
+                            "status": "error",
+                            "error": "xdel ids must be explicit "
+                                     "\"ms-seq\" stream IDs greater "
+                                     "than 0-0"}
+            command["ids"] = list(ids)
         if op == "xgroup_create":
             # Create a consumer group on a stream, Redis XGROUP
             # CREATE: the group name must be a non-empty string,

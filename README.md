@@ -4708,7 +4708,57 @@ entries left in `log.jsonl` are dropped by their index on reload.
   time, instead of waking the moment an entry becomes claimable,
   like Redis 8.4's wakeup does. The roadmap is exhausted again, so
   the next real thing is a new roadmap item grounded in this
-  project's purpose, proposed by the next run — candidate:
-  multi-stream XREAD, one call reading across several streams
-  without a consumer group, which is the remaining gap between this
-  store's stream reads and Redis's.
+  project's purpose, proposed by the next run — candidate: XDEL,
+  deleting named entries from a stream, which is the remaining gap
+  between this store's stream writes and Redis's. (The earlier
+  roadmap note's other candidate, multi-stream XREAD, is not a gap
+  at all: XREAD has read across several streams since v0.65.0.)
+- **Streams (XDEL)** — since v0.80.0 `xdel key id [id ...]`
+  (`Session.xdel(k, *ids)`, `client.xdel(addr, k, *ids)`, `xdel
+  key id ...` on the CLI) deletes named entries from the stream at
+  the key and answers with how many actually went — Redis XDEL.
+  An ID that is not in the stream simply does not count, and one
+  named twice counts once, since the second naming finds nothing
+  left to delete. A missing key answers 0 and writes nothing, like
+  an expire on a missing key, and a plain string value fails with
+  `xdel_failed` and reason `wrongtype` instead of writing. Unlike
+  an xtrim that empties the stream, an xdel that takes the last
+  entry leaves the key behind as an empty stream — Redis keeps it
+  too, with its top ID remembered, so an xadd after a full delete
+  still refuses an ID at or below the old top — and the groups
+  stay, their pending lists pruned of the entries that went, like
+  Redis dropping a deleted entry from the PEL, so XPENDING agrees
+  with the stream. The outcome is decided at apply time, at the
+  entry's exact position in the log, like a CAS: a retry with the
+  same session id returns the first attempt's count instead of
+  deleting twice. At most 1000 IDs per call, like an xack batch, so
+  one entry never carries an unbounded list, and a bad ID — not an
+  explicit "ms-seq" greater than 0-0 — is a client error and
+  appends no log entry. A successful xdel keeps the key's TTL
+  deadline, like an xadd, and fires a `set` watch event with the
+  new blob value when it removed anything, nothing when it removed
+  nothing. It rides the same write path as any other stream write
+  — group-commit batching, dedup, the response's log index
+  advancing a session's watermark — and `{"op": "xdel", "key": k,
+  "ids": [...]}` is a pipeline op too.
+  `tests/test_streams.py` (TestXdel) proves it: store-level the
+  deletion of middle entries with the count and the top ID
+  untouched, unknown and duplicate IDs not counting, a full
+  delete leaving an empty stream whose top is still remembered,
+  a missing key answering 0, wrongtype, bad ID lists raising,
+  pending entries dropped from every group with XPENDING agreeing,
+  the TTL deadline kept, and snapshot-load survival; and
+  cluster-level the delete replicated to every node, the pending
+  drop on every node, a dedup retry deleting once, bad arguments
+  as client errors with no log entry, a pipelined xdel, snapshot +
+  restart survival, the module function from a follower, watch
+  events firing only when entries went, and the CLI end to end.
+  The honest limit is the same growth as xadd: the whole stream is
+  still one blob, so deleting one entry rewrites the blob whole —
+  there is no per-entry storage — and an xdel never rewinds the
+  stream: the top ID stays, so a deleted ID can never be reused.
+  The roadmap is exhausted again, so the next real thing is a new
+  roadmap item grounded in this project's purpose, proposed by the
+  next run — candidate: XREVRANGE, reading a stream's entries
+  newest-first, the remaining gap between this store's range reads
+  and Redis's.

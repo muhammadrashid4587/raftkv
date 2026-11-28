@@ -19,6 +19,9 @@ exactly like any other value. XTRIM (v0.66.0) trims entries from
 the front — MAXLEN keeps at most N, MINID drops every entry below
 an ID — and the top ID never moves when entries are trimmed, so
 an xadd after a trim still refuses an ID at or below the old top.
+XDEL (v0.80.0) deletes named entries — the count it returns, the
+empty stream it leaves behind with its top ID remembered, and the
+pending entries it drops from every group.
 There is no XREADGROUP yet, so the only way to read entries back
 is XRANGE / XLEN / XREAD. These spin up
 real nodes (real TCP, real threads, real disk) on localhost, like
@@ -36,6 +39,7 @@ import unittest
 from harness import Cluster, client_request, wait_for_key
 from raftkv.client import Session, main as client_main
 from raftkv.client import xadd as client_xadd
+from raftkv.client import xdel as client_xdel
 from raftkv.client import xlen as client_xlen
 from raftkv.client import xrange as client_xrange
 from raftkv.client import xread as client_xread
@@ -89,6 +93,17 @@ def xtrim(addr, key="events", strategy="MAXLEN", threshold=0,
         msg["approximate"] = approximate
     if mode is not None:
         msg["mode"] = mode
+    if client_id is not None:
+        msg["client_id"] = client_id
+    if request_id is not None:
+        msg["request_id"] = request_id
+    return client_request(addr, msg)
+
+
+def xdel(addr, key="events", ids=("100-1",), client_id=None,
+         request_id=None):
+    msg = {"type": "client", "op": "xdel", "key": key,
+           "ids": list(ids)}
     if client_id is not None:
         msg["client_id"] = client_id
     if request_id is not None:
@@ -1845,6 +1860,460 @@ class TestXtrim(unittest.TestCase):
                     client_main(["--node", node, "xtrim", "events",
                                  "MAXLEN", "1", "--mode", "BOGUS"])
             self.assertEqual(cm.exception.code, 2)
+        finally:
+            cluster.stop_all()
+class TestXdel(unittest.TestCase):
+    def _five(self, store=None):
+        """A stream with five entries, 100-1 through 100-5."""
+        store = store or KVStore()
+        for i in range(1, 6):
+            store.apply({"op": "xadd", "key": "events",
+                         "pairs": [["n", str(i)]],
+                         "id": f"100-{i}"})
+        return store
+
+    def test_xdel_deletes_named_entries_and_counts_them(self):
+        """An xdel removes exactly the entries it names — middle
+        ones included — and answers how many went; the entries
+        around them and the top ID are untouched."""
+        store = self._five()
+        result = store.apply({"op": "xdel", "key": "events",
+                              "ids": ["100-2", "100-4"]})
+        self.assertEqual(result, {"type": "client_response",
+                                  "status": "ok", "xdel": 2})
+        self.assertEqual(entries_of(store.get("events")),
+                         [("100-1", {"n": "1"}),
+                          ("100-3", {"n": "3"}),
+                          ("100-5", {"n": "5"})])
+        self.assertEqual(store.stream_top("events"), "100-5")
+
+    def test_xdel_unknown_and_duplicate_ids_do_not_count(self):
+        """An ID that is not in the stream does not count, and one
+        named twice counts once — the second naming finds nothing
+        left to delete."""
+        store = self._five()
+        result = store.apply({"op": "xdel", "key": "events",
+                              "ids": ["100-2", "100-9", "100-2"]})
+        self.assertEqual(result["xdel"], 1)
+        self.assertEqual([e[0] for e in entries_of(
+            store.get("events"))],
+            ["100-1", "100-3", "100-4", "100-5"])
+        # Deleting the same ID again now counts nothing.
+        result = store.apply({"op": "xdel", "key": "events",
+                              "ids": ["100-2"]})
+        self.assertEqual(result["xdel"], 0)
+
+    def test_xdel_to_empty_keeps_key_and_top(self):
+        """Deleting the last entry leaves the key behind as an
+        empty stream — Redis keeps it too — with its top ID
+        remembered, so an xadd at or below the old top still fails
+        after a full delete, unlike an xtrim that took the key."""
+        store = self._five()
+        result = store.apply({"op": "xdel", "key": "events",
+                              "ids": ["100-1", "100-2", "100-3",
+                                      "100-4", "100-5"]})
+        self.assertEqual(result["xdel"], 5)
+        self.assertNotIn("deleted", result)
+        self.assertIsNotNone(store.get("events"))
+        self.assertEqual(store.xlen("events"), 0)
+        self.assertEqual(store.stream_top("events"), "100-5")
+        result = store.apply({"op": "xadd", "key": "events",
+                             "pairs": [["n", "x"]], "id": "100-5"})
+        self.assertEqual(result["status"], "xadd_failed")
+        self.assertEqual(result["reason"], "id_not_greater")
+        result = store.apply({"op": "xadd", "key": "events",
+                             "pairs": [["n", "6"]], "id": "100-6"})
+        self.assertEqual(result["xadd"], "100-6")
+        self.assertEqual(entries_of(store.get("events")),
+                         [("100-6", {"n": "6"})])
+
+    def test_xdel_missing_key_answers_zero(self):
+        """An xdel on a missing key answers 0 and writes nothing,
+        like an expire on a missing key."""
+        store = KVStore()
+        result = store.apply({"op": "xdel", "key": "nope",
+                              "ids": ["1-0"]})
+        self.assertEqual(result["xdel"], 0)
+        self.assertIsNone(store.get("nope"))
+
+    def test_xdel_wrongtype(self):
+        """An xdel on a plain string fails with wrongtype and
+        leaves the value untouched, like an xadd."""
+        store = KVStore()
+        store.apply({"op": "set", "key": "plain", "value": "v"})
+        result = store.apply({"op": "xdel", "key": "plain",
+                              "ids": ["1-0"]})
+        self.assertEqual(result["status"], "xdel_failed")
+        self.assertEqual(result["reason"], "wrongtype")
+        self.assertEqual(store.get("plain"), "v")
+
+    def test_xdel_bad_ids_raise(self):
+        """A hand-built log entry with a bad ID list raises rather
+        than silently deleting nonsense."""
+        store = self._five()
+        for command in (
+                {"op": "xdel", "key": "events", "ids": []},
+                {"op": "xdel", "key": "events",
+                 "ids": ["1-0"] * 1001},
+                {"op": "xdel", "key": "events", "ids": [5]},
+                {"op": "xdel", "key": "events", "ids": ["bogus"]},
+                {"op": "xdel", "key": "events", "ids": ["0-0"]},
+                {"op": "xdel", "key": "events", "ids": ["*"]},
+                {"op": "xdel", "key": "events", "ids": ["100-*"]},
+                {"op": "xdel", "key": "events",
+                 "ids": ["100-3-4"]}):
+            with self.assertRaises(ValueError, msg=str(command)):
+                store.apply(command)
+        self.assertEqual(len(entries_of(store.get("events"))), 5)
+
+    def test_xdel_drops_pending_entries(self):
+        """A deleted entry stops being pending in every group, so
+        XPENDING agrees with the stream — the entry is gone, not
+        merely unreadable."""
+        store = self._five()
+        store.apply({"op": "xgroup_create", "key": "events",
+                     "group": "g", "start_id": "0"})
+        result = store.apply({"op": "xreadgroup", "key": "events",
+                              "group": "g", "consumer": "c1",
+                              "id": ">"})
+        self.assertEqual([e[0] for e in result["entries"]],
+                         ["100-1", "100-2", "100-3", "100-4",
+                          "100-5"])
+        self.assertEqual(store.xpending("events", "g")["pending"], 5)
+        result = store.apply({"op": "xdel", "key": "events",
+                              "ids": ["100-2", "100-4"]})
+        self.assertEqual(result["xdel"], 2)
+        pending = store.xpending("events", "g")
+        self.assertEqual(pending["pending"], 3, pending)
+        self.assertEqual(pending["min_id"], "100-1", pending)
+        self.assertEqual(pending["max_id"], "100-5", pending)
+        self.assertEqual(pending["consumers"], [["c1", 3]], pending)
+
+    def test_xdel_keeps_ttl_deadline(self):
+        """An xdel is an update, not a fresh set: the deadline
+        survives it, even when it takes the last entry — the key
+        stays, so the deadline has something to hang on."""
+        store = KVStore()
+        store.apply({"op": "xadd", "key": "s",
+                     "pairs": [["a", "1"]], "id": "1-0"}, index=10)
+        store.apply({"op": "xadd", "key": "s",
+                     "pairs": [["a", "2"]], "id": "2-0"}, index=11)
+        store.apply({"op": "expire", "key": "s",
+                     "ttl_entries": 10}, index=12)
+        self.assertEqual(store.expiries(), {"s": 22})
+        result = store.apply({"op": "xdel", "key": "s",
+                              "ids": ["1-0"]}, index=13)
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(store.expiries(), {"s": 22})
+        result = store.apply({"op": "xdel", "key": "s",
+                              "ids": ["2-0"]}, index=14)
+        self.assertEqual(result["xdel"], 1)
+        self.assertEqual(store.expiries(), {"s": 22})
+        self.assertIsNotNone(store.get("s"))
+
+    def test_xdel_survives_snapshot_load(self):
+        """A stream with entries deleted is a plain string in the
+        store, so a snapshot load rebuilds the same entries and the
+        same top ID — and an ID at or below the top still fails
+        after the load."""
+        store = self._five()
+        store.apply({"op": "xdel", "key": "events",
+                     "ids": ["100-2", "100-4"]})
+        loaded = KVStore()
+        loaded.load(store.items())
+        self.assertEqual(entries_of(loaded.get("events")),
+                         [("100-1", {"n": "1"}),
+                          ("100-3", {"n": "3"}),
+                          ("100-5", {"n": "5"})])
+        self.assertEqual(loaded.stream_top("events"), "100-5")
+        result = loaded.apply({"op": "xadd", "key": "events",
+                              "pairs": [["n", "x"]], "id": "100-3"})
+        self.assertEqual(result["status"], "xadd_failed")
+        self.assertEqual(result["reason"], "id_not_greater")
+
+    def test_xdel_replicates(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            with Session(addr) as session:
+                for i in range(1, 6):
+                    resp = session.xadd("events", {"n": str(i)},
+                                        id=f"100-{i}")
+                    self.assertEqual(resp.get("status"), "ok", resp)
+                resp = session.xdel("events", "100-2", "100-4")
+                self.assertEqual(resp.get("status"), "ok", resp)
+                self.assertEqual(resp.get("xdel"), 2, resp)
+                # A session read after its own delete sees it.
+                resp = session.xlen("events")
+                self.assertEqual(resp.get("xlen"), 3, resp)
+            for node_id in cluster.live:
+                self.assertTrue(
+                    wait_for_key(cluster.nodes[node_id], "events",
+                                 cluster.nodes[leader.id].sm.get(
+                                     "events")))
+                self.assertEqual(
+                    [e[0] for e in entries_of(
+                        cluster.nodes[node_id].sm.get("events"))],
+                    ["100-1", "100-3", "100-5"])
+        finally:
+            cluster.stop_all()
+
+    def test_xdel_module_function_from_follower(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            follower = next(n for n in cluster.live
+                            if n != leader.id)
+            addr = cluster.addrs[leader.id]
+            for i in range(1, 6):
+                self.assertEqual(
+                    xadd(addr, id=f"100-{i}").get("status"), "ok")
+            # The module function follows the leader redirect.
+            resp = client_xdel(cluster.addrs[follower], "events",
+                               "100-2", "100-4", "100-9")
+            self.assertEqual(resp.get("status"), "ok", resp)
+            self.assertEqual(resp.get("xdel"), 2, resp)
+            self.assertEqual(
+                [e[0] for e in entries_of(
+                    cluster.nodes[leader.id].sm.get("events"))],
+                ["100-1", "100-3", "100-5"])
+        finally:
+            cluster.stop_all()
+
+    def test_xdel_wrongtype_and_bad_args(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            self.assertEqual(write(addr, key="plain").get("status"),
+                             "ok")
+            resp = xdel(addr, key="plain")
+            self.assertEqual(resp.get("status"), "xdel_failed", resp)
+            self.assertEqual(resp.get("reason"), "wrongtype", resp)
+            self.assertEqual(
+                client_request(addr, {"type": "client", "op": "get",
+                                      "key": "plain"}).get("value"),
+                "old")
+            # Bad arguments are client errors with no log entry.
+            before = len(leader.log)
+            for msg in (
+                    {"ids": []},
+                    {"ids": ["1-0"] * 1001},
+                    {"ids": [5]},
+                    {"ids": ["bogus"]},
+                    {"ids": ["0-0"]},
+                    {"ids": ["*"]},
+                    {"ids": ["100-*"]}):
+                resp = client_request(
+                    addr, {"type": "client", "op": "xdel",
+                           "key": "events", **msg})
+                self.assertEqual(resp.get("status"), "error", resp)
+            self.assertEqual(len(leader.log), before)
+            # A missing key answers 0, like an expire on one.
+            resp = xdel(addr, key="nope")
+            self.assertEqual(resp.get("status"), "ok", resp)
+            self.assertEqual(resp.get("xdel"), 0, resp)
+        finally:
+            cluster.stop_all()
+
+    def test_xdel_dedup_retry(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            for i in range(1, 6):
+                self.assertEqual(
+                    xadd(addr, id=f"100-{i}").get("status"), "ok")
+            resp = xdel(addr, ids=("100-2", "100-4"), client_id="c1",
+                        request_id="d1")
+            self.assertEqual(resp.get("status"), "ok", resp)
+            self.assertEqual(resp.get("xdel"), 2, resp)
+            # The retry returns the first attempt's count instead
+            # of deleting twice — and logs one entry, not two.
+            resp = xdel(addr, ids=("100-2", "100-4"), client_id="c1",
+                        request_id="d1")
+            self.assertEqual(resp.get("status"), "ok", resp)
+            self.assertEqual(resp.get("xdel"), 2, resp)
+            self.assertEqual(count_entries(leader, "d1"), 1)
+            self.assertEqual(len(entries_of(
+                leader.sm.get("events"))), 3)
+        finally:
+            cluster.stop_all()
+
+    def test_xdel_drops_pending_on_every_node(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            with Session(addr) as session:
+                for i in range(1, 6):
+                    resp = session.xadd("events", {"n": str(i)},
+                                        id=f"100-{i}")
+                    self.assertEqual(resp.get("status"), "ok", resp)
+                resp = session.xgroup_create("events", "g", "0")
+                self.assertEqual(resp.get("status"), "ok", resp)
+                resp = session.xreadgroup("events", "g", "c1", ">")
+                self.assertEqual(len(resp.get("entries", [])), 5,
+                                 resp)
+                resp = session.xdel("events", "100-2", "100-4")
+                self.assertEqual(resp.get("xdel"), 2, resp)
+                resp = session.xpending("events", "g")
+                self.assertEqual(resp.get("pending"), 3, resp)
+            for node_id in cluster.live:
+                self.assertTrue(
+                    wait_for_key(cluster.nodes[node_id], "events",
+                                 cluster.nodes[leader.id].sm.get(
+                                     "events")))
+                self.assertEqual(
+                    cluster.nodes[node_id].sm.xpending(
+                        "events", "g")["pending"], 3)
+        finally:
+            cluster.stop_all()
+
+    def test_xdel_fires_watch_events(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            for i in range(1, 4):
+                self.assertEqual(
+                    xadd(addr, id=f"100-{i}").get("status"), "ok")
+            events = []
+            leader.watch.watch("events", events.append)
+            resp = xdel(addr, ids=("100-2",))
+            self.assertEqual(resp.get("xdel"), 1, resp)
+            deadline = time.monotonic() + 5.0
+            while len(events) < 1 and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertEqual(len(events), 1, events)
+            self.assertEqual(events[0]["key"], "events", events)
+            self.assertEqual(events[0]["op"], "set", events)
+            self.assertEqual(events[0]["value"],
+                             leader.sm.get("events"), events)
+            # An xdel that removes nothing fires nothing.
+            resp = xdel(addr, ids=("100-2",))
+            self.assertEqual(resp.get("xdel"), 0, resp)
+            time.sleep(0.3)
+            self.assertEqual(len(events), 1, events)
+        finally:
+            cluster.stop_all()
+
+    def test_pipeline_xdel_ops(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            with Session(addr) as session:
+                for i in range(1, 4):
+                    resp = session.xadd("events", {"n": str(i)},
+                                        id=f"100-{i}")
+                    self.assertEqual(resp.get("status"), "ok", resp)
+                replies = session.pipeline([
+                    {"op": "xdel", "key": "events",
+                     "ids": ["100-2"]},
+                    {"op": "xdel", "key": "events",
+                     "ids": ["100-1", "100-9"]},
+                    {"op": "xdel", "key": "events", "ids": []},
+                    {"op": "xdel", "key": "events",
+                     "ids": ["bogus"]},
+                    {"op": "xdel", "key": "nope",
+                     "ids": ["1-0"]},
+                ])
+            self.assertEqual(len(replies), 5, replies)
+            self.assertEqual(replies[0].get("xdel"), 1, replies)
+            self.assertEqual(replies[1].get("xdel"), 1, replies)
+            self.assertEqual(replies[2].get("status"), "error",
+                             replies)
+            self.assertEqual(replies[3].get("status"), "error",
+                             replies)
+            self.assertEqual(replies[4].get("xdel"), 0, replies)
+            self.assertEqual(
+                [e[0] for e in entries_of(leader.sm.get("events"))],
+                ["100-3"])
+        finally:
+            cluster.stop_all()
+
+    def test_xdel_survives_snapshot_and_restart(self):
+        cluster = Cluster(3, snapshot_threshold=5)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            addr = cluster.addrs[leader.id]
+            for i in range(1, 6):
+                self.assertEqual(
+                    xadd(addr, id=f"100-{i}").get("status"), "ok")
+            resp = xdel(addr, ids=("100-2", "100-4"))
+            self.assertEqual(resp.get("xdel"), 2, resp)
+            # Enough writes to compact the log past the delete.
+            for i in range(10):
+                self.assertEqual(
+                    write(addr, key=f"pad{i}", value="x").get("status"),
+                    "ok")
+            self.assertEqual(
+                [e[0] for e in entries_of(leader.sm.get("events"))],
+                ["100-1", "100-3", "100-5"])
+            cluster.stop_node(leader.id)
+            cluster.restart_node(leader.id)
+            new_leader = cluster.wait_for_leader()
+            addr = cluster.addrs[new_leader.id]
+            # The deleted entries stayed deleted through the
+            # snapshot + restart, and the top is still remembered.
+            self.assertEqual(
+                [e[0] for e in entries_of(
+                    new_leader.sm.get("events"))],
+                ["100-1", "100-3", "100-5"])
+            resp = xadd(addr, id="100-4")
+            self.assertEqual(resp.get("status"), "xadd_failed", resp)
+            self.assertEqual(resp.get("reason"), "id_not_greater",
+                             resp)
+            resp = xadd(addr, id="100-6")
+            self.assertEqual(resp.get("xadd"), "100-6", resp)
+        finally:
+            cluster.stop_all()
+
+    def test_xdel_cli(self):
+        cluster = Cluster(3)
+        try:
+            cluster.start_all()
+            leader = cluster.wait_for_leader()
+            host, port = cluster.addrs[leader.id]
+            node = f"{host}:{port}"
+            for i in range(1, 4):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    rc = client_main(["--node", node, "xadd", "events",
+                                      f"100-{i}", "n", str(i)])
+                self.assertEqual(rc, 0)
+            # XDEL prints the number of entries removed.
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "xdel", "events",
+                                  "100-2"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(out.getvalue().strip(), "1")
+            # An unknown ID prints 0.
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = client_main(["--node", node, "xdel", "events",
+                                  "100-9"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(out.getvalue().strip(), "0")
+            # A bad ID fails: rc 1, and the error names the
+            # problem.
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = client_main(["--node", node, "xdel", "events",
+                                  "bogus"])
+            self.assertEqual(rc, 1)
+            self.assertIn("ids", err.getvalue())
         finally:
             cluster.stop_all()
 
